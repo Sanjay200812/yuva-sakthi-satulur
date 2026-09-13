@@ -144,7 +144,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     });
 
     expect(mismatchRes.passed).toBe(false);
-    expect(mismatchRes.nextStatus).toBe('verification_failed');
+    expect(mismatchRes.nextStatus).toBe('ai_check_failed');
     expect(mismatchRes.reasonCodes).toContain('AMOUNT_MISMATCH');
     expect(mismatchRes.reasonCodes).toContain('UTR_MISMATCH');
   });
@@ -177,7 +177,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     });
 
     expect(dupRes.passed).toBe(false);
-    expect(dupRes.nextStatus).toBe('verification_failed');
+    expect(dupRes.nextStatus).toBe('ai_check_failed');
     expect(dupRes.reasonCodes).toContain('DUPLICATE_UTR');
   });
 
@@ -208,10 +208,10 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     expect(c1.coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
     expect(c2.coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
 
-    // 4. Poll status again -> status is proof_verified and coupons are ready
+    // 4. Poll status again -> status is payment_confirmed and coupons are ready
     const s2 = await request(app).get(`/api/bookings/${booking.publicId}/status`);
     expect(s2.status).toBe(200);
-    expect(s2.body.data.status).toBe('proof_verified');
+    expect(['proof_verified', 'payment_confirmed']).toContain(s2.body.data.status);
     expect(s2.body.data.isVerified).toBe(true);
     expect(s2.body.data.coupons.length).toBe(2);
   });

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import request from 'supertest';
+import sharp from 'sharp';
 import { app } from '../server.ts';
 
 describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () => {
@@ -80,22 +81,74 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
     expect(res.text).toContain('Coupon Number,Participant Name,Phone');
   });
 
-  it('verifies that no manual admin approval/confirmation endpoints exist (404)', async () => {
+  it('returns 404 for non-existent submission in payment reconciliation confirmation', async () => {
     const res = await request(app)
       .post('/api/admin/payment-reviews/fake-id/confirm')
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ note: 'test' });
+      .send({ bankTxnId: 'BANK-123', receivedAmountPaise: 5000 });
 
     expect(res.status).toBe(404);
   });
 
-  it('provides read-only payment diagnostics queue for support & fraud investigation', async () => {
+  it('provides payment reviews queue with filtering for admin bank reconciliation', async () => {
     const res = await request(app)
-      .get('/api/admin/payment-diagnostics')
+      .get('/api/admin/payment-reviews?status=awaiting_admin_review')
       .set('Authorization', `Bearer ${adminToken}`);
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(Array.isArray(res.body.data)).toBe(true);
+  });
+
+  it('atomically confirms payment from bank record and allocates sequential coupons', async () => {
+    // 1. Create a booking
+    const bRes = await request(app)
+      .post('/api/bookings')
+      .send({ name: 'Admin Test Participant', phone: '9848099888', village: 'Satulur Center', quantity: 1 });
+    const booking = bRes.body.data.booking;
+
+    const validImgBase64 = (await sharp({
+      create: { width: 250, height: 250, channels: 3, background: { r: 240, g: 240, b: 240 } }
+    }).png().toBuffer()).toString('base64');
+
+    // 2. Submit payment proof
+    const pRes = await request(app)
+      .post(`/api/bookings/${booking.publicId}/payment-proof`)
+      .send({
+        utr: '984809988801',
+        screenshotBase64: validImgBase64,
+        consentGiven: true,
+      });
+    expect(pRes.status).toBe(200);
+    const submissionId = pRes.body.data.submissionId;
+
+    // 3. Before admin confirmation, Applied Coupons must NOT contain this booking
+    const couponsBefore = await request(app)
+      .get('/api/admin/coupons')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(couponsBefore.body.data.coupons.some((c: any) => c.booking_public_id === booking.publicId)).toBe(false);
+
+    // 4. Admin confirms payment from bank record
+    const confRes = await request(app)
+      .post(`/api/admin/payment-reviews/${submissionId}/confirm`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        bankTxnId: 'BANK-CREDIT-9848099888',
+        receivedAmountPaise: 5000,
+        recipientAccount: '9574876369@ybl',
+        matchNote: 'Confirmed against official bank statement credit',
+        auditNote: 'Reconciled by test admin',
+      });
+
+    expect(confRes.status).toBe(200);
+    expect(confRes.body.success).toBe(true);
+    expect(confRes.body.data.coupons.length).toBe(1);
+    expect(confRes.body.data.coupons[0].coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
+
+    // 5. After admin confirmation, Applied Coupons MUST contain this coupon
+    const couponsAfter = await request(app)
+      .get('/api/admin/coupons')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(couponsAfter.body.data.coupons.some((c: any) => c.booking_public_id === booking.publicId)).toBe(true);
   });
 });

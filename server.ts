@@ -12,6 +12,7 @@ import { processPaymentScreenshot } from './server/upi/imageProcessor.ts';
 import { analyzePaymentScreenshotWithGemini } from './server/upi/geminiAnalyzer.ts';
 import { performDeterministicComparison, normalizeUtr } from './server/upi/deterministicMatcher.ts';
 import { finalizeVerifiedSubmission } from './server/upi/automatedFinalizer.ts';
+import { confirmPaymentFromBankRecord } from './server/upi/adminReconciliation.ts';
 import { allocateCouponsForBooking } from './server/services/couponAllocator.ts';
 import {
   renderTicketPdf,
@@ -353,42 +354,41 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     );
 
     if (match.passed) {
-      // Step 6: Idempotent atomic automatic finalization and coupon issuance
-      const finalResult = await finalizeVerifiedSubmission({
-        submissionId,
-        bookingId: booking.id,
-        decisionVersion: 'v1-gemini-deterministic-auto',
-      });
+      // Transition to awaiting_admin_review (Coupons issued strictly on admin bank reconciliation)
+      await db.query(
+        'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
+        ['awaiting_admin_review', new Date().toISOString(), booking.id]
+      );
 
       return res.json({
         success: true,
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: 'proof_verified',
-          message: 'Payment proof verified, coupons ready.',
-          coupons: finalResult.coupons,
+          status: 'awaiting_admin_review',
+          reviewStatus: 'ai_check_passed',
+          message: 'Details matched, awaiting bank confirmation',
           details: match.details,
         },
       });
     } else {
-      // Step 5 Fail-Closed: mark booking verification_failed
+      // Step 5 Fail-Closed: mark booking ai_check_failed
       await db.query(
         'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
-        ['verification_failed', new Date().toISOString(), booking.id]
+        ['ai_check_failed', new Date().toISOString(), booking.id]
       );
 
       return res.status(400).json({
         success: false,
         error: {
-          code: 'VERIFICATION_FAILED',
+          code: 'AI_CHECK_FAILED',
           message: match.userMessage,
           reasonCodes: match.reasonCodes,
         },
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: 'verification_failed',
+          status: 'ai_check_failed',
           message: match.userMessage,
           details: match.details,
         },
@@ -415,9 +415,9 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
 
     const booking = bookingRes.rows[0];
 
-    const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
+    const isConfirmed = booking.status === 'payment_confirmed';
     let coupons: any[] = [];
-    if (isVerified) {
+    if (isConfirmed) {
       const couponsRes = await db.query(
         'SELECT coupon_number, holder_name, phone, village, ticket_index, total_quantity, issued_at FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
         [booking.id]
@@ -435,27 +435,33 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
     let userMessage = 'Payment not yet submitted';
     if (booking.status === 'ai_checking' || booking.status === 'proof_submitted') {
       userMessage = 'Checking uploaded proof...';
-    } else if (isVerified) {
-      userMessage = 'Payment proof verified, coupons ready.';
-    } else if (booking.status === 'verification_failed') {
+    } else if (booking.status === 'awaiting_admin_review') {
+      userMessage = 'Details matched, awaiting bank confirmation';
+    } else if (isConfirmed) {
+      userMessage = 'Payment confirmed, coupons ready';
+    } else if (booking.status === 'ai_check_failed' || booking.status === 'verification_failed') {
       userMessage = latestSub?.reason_codes?.length
         ? `Verification failed: ${latestSub.reason_codes.join(', ')}. Please correct and resubmit.`
         : 'Verification failed, correct the highlighted issue and resubmit.';
+    } else if (booking.status === 'payment_rejected') {
+      userMessage = latestSub?.admin_review_note
+        ? `Payment rejected: ${latestSub.admin_review_note}`
+        : 'Payment rejected. Please contact helpline.';
     }
 
     res.json({
       success: true,
       data: {
         publicId: booking.public_id,
-        status: isVerified ? 'proof_verified' : booking.status,
-        isConfirmed: isVerified,
-        isVerified,
+        status: booking.status,
+        isConfirmed,
+        isVerified: isConfirmed,
         quantity: booking.quantity,
         totalAmount: booking.total_amount_paise / 100,
-        paidAt: booking.verified_at || booking.paid_at,
+        paidAt: booking.paid_at || booking.verified_at,
         message: userMessage,
         coupons,
-        downloadUrl: isVerified ? `/api/bookings/${booking.public_id}/download-all` : null,
+        downloadUrl: isConfirmed ? `/api/bookings/${booking.public_id}/download-all` : null,
       },
     });
   } catch (error: any) {
@@ -474,9 +480,9 @@ app.get('/api/bookings/:publicId/coupons', async (req: Request, res: Response) =
     }
 
     const booking = bookingRes.rows[0];
-    const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
-    if (!isVerified) {
-      return res.status(403).json({ success: false, error: { message: 'Payment proof not verified yet.' } });
+    const isConfirmed = booking.status === 'payment_confirmed';
+    if (!isConfirmed) {
+      return res.status(403).json({ success: false, error: { message: 'Payment not yet confirmed by administrator.' } });
     }
 
     const couponsRes = await db.query(
@@ -660,12 +666,15 @@ app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate
 
     if (!targetBookingId) {
       // Find latest unverified booking
-      const latestB = await db.query('SELECT id FROM bookings WHERE status != $1 ORDER BY created_at DESC LIMIT 1', ['proof_verified']);
+      const latestB = await db.query('SELECT id FROM bookings WHERE status != $1 ORDER BY created_at DESC LIMIT 1', ['payment_confirmed']);
       if (latestB.rows.length > 0) targetBookingId = latestB.rows[0].id;
     }
 
     if (!targetSubId && targetBookingId) {
-      const sRes = await db.query('SELECT id FROM payment_submissions WHERE booking_id = $1 LIMIT 1', [targetBookingId]);
+      const bData = await db.query('SELECT total_amount_paise FROM bookings WHERE id = $1', [targetBookingId]);
+      const expectedAmount = bData.rows[0]?.total_amount_paise || 5000;
+
+      const sRes = await db.query('SELECT id, expected_amount_paise FROM payment_submissions WHERE booking_id = $1 LIMIT 1', [targetBookingId]);
       if (sRes.rows.length > 0) {
         targetSubId = sRes.rows[0].id;
       } else {
@@ -676,7 +685,7 @@ app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate
             id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
             expected_payee_name, expected_amount_paise, payer_utr_hash, status
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [targetSubId, targetBookingId, 'YSYS-SIM-REF', 'phonepe', config.PAYEE_UPI_ID, config.PAYEE_DISPLAY_NAME, 5000, simUtrHash, 'proof_submitted']
+          [targetSubId, targetBookingId, 'YSYS-SIM-REF', 'phonepe', config.PAYEE_UPI_ID, config.PAYEE_DISPLAY_NAME, expectedAmount, simUtrHash, 'awaiting_admin_review']
         );
       }
     }
@@ -685,10 +694,19 @@ app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate
       return res.status(400).json({ error: 'No booking or submission found to verify.' });
     }
 
-    const result = await finalizeVerifiedSubmission({
+    const subData = await db.query('SELECT expected_amount_paise FROM payment_submissions WHERE id = $1', [targetSubId]);
+    const requiredAmount = subData.rows[0]?.expected_amount_paise || 5000;
+
+    const result = await confirmPaymentFromBankRecord({
       submissionId: targetSubId,
-      bookingId: targetBookingId,
-      decisionVersion: 'test-mode-simulation',
+      adminUserId: '00000000-0000-0000-0000-000000000001',
+      bankRecordMatch: {
+        bankTxnId: 'SIM-BANK-TXN-123456',
+        receivedAmountPaise: requiredAmount,
+        recipientAccount: config.PAYEE_UPI_ID,
+        matchNote: 'Simulated bank match in test mode',
+      },
+      auditNote: 'Simulated test bank confirmation',
     });
 
     res.json({ success: true, data: result });

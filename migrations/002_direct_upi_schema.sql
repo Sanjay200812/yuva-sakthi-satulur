@@ -20,8 +20,8 @@ BEGIN
     'proof_required',
     'proof_submitted',
     'ai_checking',
-    'proof_verified',
-    'verification_failed',
+    'ai_check_failed',
+    'awaiting_admin_review',
     'payment_confirmed',
     'payment_rejected',
     'expired',
@@ -51,11 +51,12 @@ CREATE TABLE IF NOT EXISTS payment_submissions (
   status TEXT NOT NULL CHECK (status IN (
     'proof_submitted',
     'ai_checking',
-    'proof_verified',
-    'verification_failed',
-    'superseded',
+    'ai_check_passed',
+    'ai_check_failed',
+    'awaiting_admin_review',
     'admin_confirmed',
     'admin_rejected',
+    'superseded',
     'expired'
   )),
   gemini_extraction JSONB,
@@ -63,19 +64,19 @@ CREATE TABLE IF NOT EXISTS payment_submissions (
   risk_score INTEGER NOT NULL DEFAULT 0,
   reason_codes TEXT[] NOT NULL DEFAULT '{}',
   ai_model_version TEXT,
-  automated_decision_version TEXT,
-  finalized_at TIMESTAMPTZ,
-  idempotency_key TEXT,
   admin_reviewer_id UUID REFERENCES admin_users(id),
   admin_review_note TEXT,
+  bank_record_match JSONB,
+  reviewed_at TIMESTAMPTZ,
+  idempotency_key TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Partial unique index: A verified UTR cannot finalize another booking
-CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_submissions_verified_utr 
+-- Partial unique index: An admin-confirmed UTR cannot finalize another booking
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_submissions_confirmed_utr 
   ON payment_submissions(payer_utr_hash) 
-  WHERE status = 'proof_verified';
+  WHERE status = 'admin_confirmed';
 
 CREATE INDEX IF NOT EXISTS idx_payment_submissions_booking_id ON payment_submissions(booking_id);
 CREATE INDEX IF NOT EXISTS idx_payment_submissions_status ON payment_submissions(status);

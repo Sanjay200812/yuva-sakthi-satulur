@@ -132,12 +132,26 @@ class MemoryDB implements TransactionalDB {
       const id = params[params.length - 1];
       const b = this.bookings.get(id);
       if (b) {
-        if (trimmed.includes("status = 'proof_verified'")) {
+        if (trimmed.includes("status = 'payment_confirmed'")) {
+          b.status = 'payment_confirmed';
+        } else if (trimmed.includes("status = 'payment_rejected'")) {
+          b.status = 'payment_rejected';
+        } else if (trimmed.includes("status = 'proof_required'")) {
+          b.status = 'proof_required';
+        } else if (trimmed.includes("status = 'awaiting_admin_review'")) {
+          b.status = 'awaiting_admin_review';
+        } else if (trimmed.includes("status = 'ai_check_failed'")) {
+          b.status = 'ai_check_failed';
+        } else if (trimmed.includes("status = 'proof_verified'")) {
           b.status = 'proof_verified';
         } else if (trimmed.includes('status = $1')) {
           b.status = params[0];
         }
-        if (trimmed.includes('verified_at = $1')) {
+
+        if (trimmed.includes('paid_at = $1')) {
+          b.paid_at = params[0];
+          b.verified_at = params[0];
+        } else if (trimmed.includes('verified_at = $1')) {
           b.verified_at = params[0];
           b.paid_at = params[0];
         } else if (trimmed.includes('paid_at = $2')) {
@@ -177,7 +191,12 @@ class MemoryDB implements TransactionalDB {
       // Check unique payer_utr_hash
       if (record.payer_utr_hash) {
         const duplicate = Array.from(this.paymentSubmissions.values()).find(
-          (s) => s.payer_utr_hash === record.payer_utr_hash && s.booking_id !== record.booking_id && s.status !== 'admin_rejected' && s.status !== 'verification_failed'
+          (s) =>
+            s.payer_utr_hash === record.payer_utr_hash &&
+            s.booking_id !== record.booking_id &&
+            s.status !== 'admin_rejected' &&
+            s.status !== 'verification_failed' &&
+            s.status !== 'ai_check_failed'
         );
         if (duplicate) {
           const err = new Error('duplicate key value violates unique constraint "payment_submissions_payer_utr_hash_key"');
@@ -195,14 +214,17 @@ class MemoryDB implements TransactionalDB {
     // 7. Check UTR duplicate
     if (trimmed.includes('FROM payment_submissions') && trimmed.includes('payer_utr_hash = $1')) {
       const bookingIdToExclude = trimmed.includes('booking_id != $2') ? params[1] : null;
+      const requireConfirmed = trimmed.includes("status = 'admin_confirmed'");
       const requireVerified = trimmed.includes("status = 'proof_verified'");
       const found = Array.from(this.paymentSubmissions.values()).find(
         (s) =>
           s.payer_utr_hash === params[0] &&
           (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) &&
+          (!requireConfirmed || s.status === 'admin_confirmed') &&
           (!requireVerified || s.status === 'proof_verified') &&
           s.status !== 'admin_rejected' &&
-          s.status !== 'verification_failed'
+          s.status !== 'verification_failed' &&
+          s.status !== 'ai_check_failed'
       );
       return { rows: (found ? [found] : []) as any, rowCount: found ? 1 : 0 };
     }
@@ -215,7 +237,8 @@ class MemoryDB implements TransactionalDB {
           s.screenshot_sha256 === params[0] &&
           (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) &&
           s.status !== 'admin_rejected' &&
-          s.status !== 'verification_failed'
+          s.status !== 'verification_failed' &&
+          s.status !== 'ai_check_failed'
       );
       return { rows: (found ? [found] : []) as any, rowCount: found ? 1 : 0 };
     }
@@ -224,6 +247,25 @@ class MemoryDB implements TransactionalDB {
     if (trimmed.includes('FROM payment_submissions') && trimmed.includes('id = $1')) {
       const found = this.paymentSubmissions.get(params[0]);
       return { rows: (found ? [found] : []) as any, rowCount: found ? 1 : 0 };
+    }
+
+    // 9.5 Join payment submissions with bookings (Payment Reviews / Diagnostics)
+    if (trimmed.includes('FROM payment_submissions') && trimmed.includes('JOIN bookings')) {
+      let list = Array.from(this.paymentSubmissions.values()).map((ps) => {
+        const b = this.bookings.get(ps.booking_id);
+        return {
+          ...ps,
+          booking_public_id: b?.public_id,
+          participant_name: b?.participant_name,
+          phone: b?.phone,
+          village: b?.village,
+          quantity: b?.quantity,
+          total_amount_paise: b?.total_amount_paise,
+          booking_status: b?.status,
+        };
+      });
+      list.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      return { rows: list as any, rowCount: list.length };
     }
 
     // 10. Find submission by booking_id
@@ -237,21 +279,59 @@ class MemoryDB implements TransactionalDB {
       const id = params[params.length - 1];
       const s = this.paymentSubmissions.get(id);
       if (s) {
-        if (trimmed.includes("status = 'proof_verified'")) {
+        if (trimmed.includes("status = 'admin_confirmed'")) {
+          s.status = 'admin_confirmed';
+        } else if (trimmed.includes("status = 'admin_rejected'")) {
+          s.status = 'admin_rejected';
+        } else if (trimmed.includes("status = 'superseded'")) {
+          s.status = 'superseded';
+        } else if (trimmed.includes("status = 'proof_verified'")) {
           s.status = 'proof_verified';
         } else if (trimmed.includes('status = $1')) {
           s.status = params[0];
         }
-        if (trimmed.includes('admin_reviewer_id = $2')) {
+
+        if (trimmed.includes('admin_reviewer_id = $1')) {
+          s.admin_reviewer_id = params[0];
+        } else if (trimmed.includes('admin_reviewer_id = $2')) {
           s.admin_reviewer_id = params[1];
         }
-        if (trimmed.includes('admin_review_note = $3')) {
+
+        if (trimmed.includes('admin_review_note = $2')) {
+          s.admin_review_note = params[1];
+        } else if (trimmed.includes('admin_review_note = $3')) {
           s.admin_review_note = params[2];
         }
+
+        if (trimmed.includes('bank_record_match = $3')) {
+          s.bank_record_match = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
+        }
+
+        if (trimmed.includes('reviewed_at = $4')) {
+          s.reviewed_at = params[3];
+        } else if (trimmed.includes('reviewed_at = $3')) {
+          s.reviewed_at = params[2];
+        }
+
         s.updated_at = new Date().toISOString();
         return { rows: [s] as any, rowCount: 1 };
       }
       return { rows: [] as any, rowCount: 0 };
+    }
+
+    // 11.5 Insert Admin Audit Logs
+    if (trimmed.startsWith('INSERT INTO admin_audit_logs')) {
+      const [id, admin_user_id, action, entity_type, entity_id, metadata, created_at] = params;
+      const log = {
+        id: id || crypto.randomUUID(),
+        admin_user_id,
+        action,
+        entity_type,
+        entity_id,
+        metadata: typeof metadata === 'string' ? JSON.parse(metadata) : metadata,
+        created_at: created_at || new Date().toISOString(),
+      };
+      return { rows: [log] as any, rowCount: 1 };
     }
 
     // 12. Insert verification run
@@ -433,58 +513,61 @@ class MemoryDB implements TransactionalDB {
       return { rows: [user] as any, rowCount: 1 };
     }
 
-    // 17. Admin Dashboard Metrics (Only Proof Verified & Valid Coupons!)
+    // 17. Admin Dashboard Metrics (Confirmed Bookings & Valid Coupons)
     if (trimmed.includes('admin_metrics')) {
-      const verifiedBookings = Array.from(this.bookings.values()).filter(
-        (b) => b.status === 'proof_verified' || b.status === 'payment_confirmed'
+      const confirmedBookings = Array.from(this.bookings.values()).filter(
+        (b) => b.status === 'payment_confirmed' || b.status === 'proof_verified'
       );
       const validCoupons = Array.from(this.coupons.values()).filter((c) => c.status === 'valid');
-      const totalRevenuePaise = verifiedBookings.reduce((sum, b) => sum + (b.total_amount_paise || 0), 0);
+      const totalRevenuePaise = confirmedBookings.reduce((sum, b) => sum + (b.total_amount_paise || 0), 0);
 
       const today = new Date().toISOString().slice(0, 10);
-      const bookingsToday = verifiedBookings.filter((b) => (b.verified_at || b.created_at)?.startsWith(today)).length;
+      const bookingsToday = confirmedBookings.filter((b) => (b.paid_at || b.verified_at || b.created_at)?.startsWith(today)).length;
       const couponsToday = validCoupons.filter((c) => c.issued_at?.startsWith(today)).length;
 
       const submissions = Array.from(this.paymentSubmissions.values());
-      const failedCount = submissions.filter((s) => s.status === 'verification_failed' || s.status === 'ai_check_failed').length;
-      const pendingCount = submissions.filter((s) => s.status === 'proof_submitted' || s.status === 'ai_checking').length;
+      const failedCount = submissions.filter((s) => s.status === 'verification_failed' || s.status === 'ai_check_failed' || s.status === 'admin_rejected').length;
+      const awaitingReviewCount = submissions.filter((s) => s.status === 'awaiting_admin_review' || s.status === 'proof_submitted' || s.status === 'ai_checking').length;
 
-      const lastPaid = verifiedBookings.sort((a, b) => ((b.verified_at || b.paid_at || '')).localeCompare(a.verified_at || a.paid_at || ''))[0];
+      const lastPaid = confirmedBookings.sort((a, b) => ((b.paid_at || b.verified_at || '')).localeCompare(a.paid_at || a.verified_at || ''))[0];
 
       return {
         rows: [{
-          confirmedBookingsCount: verifiedBookings.length,
+          confirmedBookingsCount: confirmedBookings.length,
           validCouponsCount: validCoupons.length,
           totalRevenueInr: totalRevenuePaise / 100,
           bookingsToday,
           couponsToday,
-          failedOrPendingAttempts: failedCount + pendingCount,
-          lastPaymentAt: lastPaid?.verified_at || lastPaid?.paid_at || null,
+          failedOrPendingAttempts: failedCount + awaitingReviewCount,
+          awaitingReviewCount,
+          lastPaymentAt: lastPaid?.paid_at || lastPaid?.verified_at || null,
         }] as any,
         rowCount: 1,
       };
     }
 
-    // 18. Admin Applied Coupons List (STRICTLY proof_verified & valid ONLY)
+    // 18. Admin Applied Coupons List (STRICTLY payment_confirmed & valid ONLY)
     if (trimmed.includes('FROM coupons') && trimmed.includes('JOIN bookings')) {
       let list = Array.from(this.coupons.values())
         .map((c) => {
           const b = this.bookings.get(c.booking_id);
           const sub = Array.from(this.paymentSubmissions.values()).find(
-            (s) => s.booking_id === c.booking_id && (s.status === 'proof_verified' || s.status === 'admin_confirmed')
+            (s) => s.booking_id === c.booking_id && (s.status === 'admin_confirmed' || s.status === 'proof_verified')
           );
           return {
             ...c,
             booking_public_id: b?.public_id,
             booking_status: b?.status,
-            paid_at: b?.verified_at || b?.paid_at,
-            amount_paise: b?.unit_price_paise,
-            provider_payment_id: sub?.payer_utr_hash ? `UTR-${sub.payer_utr_hash.slice(0, 8)}` : 'PROOF_VERIFIED',
-            utr_display: sub ? `UTR: ${sub.payer_utr_hash.slice(0, 6)}...` : 'Automated Verified',
-            verification_method: 'Automated Proof Verification (Gemini OCR + Deterministic)',
+            paid_at: b?.paid_at || b?.verified_at,
+            amount_paise: b?.total_amount_paise || (c.total_quantity * 5000),
+            provider_payment_id: sub?.payer_utr_hash ? `UTR-${sub.payer_utr_hash.slice(0, 8)}` : 'BANK_CONFIRMED',
+            utr_display: sub ? `UTR: ${sub.payer_utr_hash.slice(0, 6)}...` : 'Bank Confirmed',
+            verification_method: sub?.status === 'admin_confirmed' ? 'Admin Bank Reconciliation' : 'Automated Proof Verification',
+            confirming_admin: sub?.admin_reviewer_id || null,
+            confirmed_at: sub?.reviewed_at || b?.paid_at || null,
           };
         })
-        .filter((c) => (c.booking_status === 'proof_verified' || c.booking_status === 'payment_confirmed') && c.status === 'valid');
+        .filter((c) => (c.booking_status === 'payment_confirmed' || c.booking_status === 'proof_verified') && c.status === 'valid');
 
       // Filtering by search term
       const search = params[0];

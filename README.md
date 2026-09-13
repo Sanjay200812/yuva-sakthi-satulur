@@ -1,6 +1,8 @@
-# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Automated Proof Verification)
+# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Admin Bank Reconciliation)
 
-An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and a **Direct Merchant-UPI Collection with 100% Automated Proof Verification Engine** powered by Google Gemini and deterministic matching rules.
+An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and a **Direct Merchant-UPI Collection with Two-Tier Verification**:
+1. **Tier 1 (Automated AI Consistency & OCR)**: Google Gemini structured OCR text extraction and deterministic comparison checks.
+2. **Tier 2 (Admin Bank Reconciliation)**: Privileged administrator verification against the organizer's actual merchant UPI / bank credit record before atomic coupon allocation.
 
 ---
 
@@ -36,7 +38,7 @@ An official, production-grade event coupon booking portal for **Yuva Shakti Yout
 - **Payer Proof Submission**: After making the payment in their external UPI app, the user submits:
   1. **Mandatory UTR / RRN**: Payer-entered 12-digit reference number.
   2. **Mandatory Payment Screenshot**: High-resolution receipt image (PNG, JPEG, WebP, max 5MB).
-  3. **Explicit Consent**: Consent checkbox agreeing to automated image processing for verification.
+  3. **Explicit Consent**: Consent checkbox agreeing to automated image processing and human review.
 - **Security & Image Sanitization**:
   - Validates file magic bytes (stripping non-raster/executable files).
   - Decompresses and re-encodes image via `sharp` to strip all EXIF metadata and hidden payloads.
@@ -59,28 +61,32 @@ An official, production-grade event coupon booking portal for **Yuva Shakti Yout
   - `field_confidence`: per-field confidence scores (0.0 to 1.0)
 - **Privacy Controls**: Direct image bytes are processed with `store: false` to ensure sensitive payment data is not retained in model training datasets.
 - > [!IMPORTANT]
-  > **Non-Authoritative Role**: Gemini is an advisory OCR and tampering detection signal. Automated proof verification does **NOT** constitute authoritative bank settlement. Screenshots can be fabricated or manipulated; verification confirms visible proof matching and risk absence under residual fraud risk.
+  > **Non-Authoritative Role**: Gemini is an advisory OCR and tampering detection signal. Automated proof verification does **NOT** constitute authoritative bank settlement. Screenshots can be fabricated or manipulated; verification requires final admin reconciliation against the organizer's actual bank/merchant statement.
 
 ### 4. Server-Side Deterministic Comparison Engine
-Before accepting any proof, server code evaluates deterministic criteria:
+Before transitioning a proof submission to admin review, server code evaluates deterministic criteria:
 - **Normalized UTR Match**: Payer-entered UTR matches Gemini-extracted UTR exactly.
 - **Exact Amount Match**: Extracted amount matches expected booking total in paise.
 - **Payee Match**: Matches configured merchant UPI ID or name when visible.
 - **Visible Status Check**: Transaction must visibly state `success`.
-- **Duplicate UTR Prevention**: Rejects UTR if already associated with another verified submission.
+- **Duplicate UTR Prevention**: Rejects UTR if already associated with another confirmed submission.
 - **Duplicate Screenshot Prevention**: Rejects identical SHA-256 or perceptually identical dHash images across different bookings.
 - **Confidence & Risk Thresholds**: All required fields must exceed confidence threshold (>= 0.70), `ai_generated_likelihood` must be `low`, and zero tampering signals must be detected.
-- **Fail-Closed Policy**: If any check fails, status becomes `verification_failed` with specific reason codes (e.g. `UTR_MISMATCH`, `AMOUNT_MISMATCH`, `DUPLICATE_UTR`, `TAMPERING_RISK`). The user can review the issue and resubmit proof.
+- **Transition**: If all checks pass, submission status becomes `awaiting_admin_review` (milestone `ai_check_passed`). Coupons are **strictly held**.
 
-### 5. 100% Automated Finalization & Atomic Coupon Allocation
-- **NO Admin Verification Step**: Per the organizer's strict requirement, there is **no manual payment approval queue, bank reconciliation button, or confirm/reject action**.
-- **Atomic Database Transaction**: When all deterministic checks pass, `finalizeVerifiedSubmission` executes inside an isolated transaction:
+### 5. Final Admin Bank Reconciliation & Atomic Coupon Allocation
+- **Dedicated Payment Reviews Queue**: Administrators review submissions in `/admin` with full OCR extractions, risk signals, and private screenshot previews.
+- **Reconciliation Action**: `POST /api/admin/payment-reviews/:submissionId/confirm`
+  - Requires admin session authentication.
+  - Requires admin attestation that the matching credit was verified in the organizer's real bank/merchant UPI statement.
+  - Inputs recorded: Bank Transaction ID, received amount, credited account, and audit notes.
+- **Atomic Database Transaction**:
   1. Locks the booking and payment submission (`FOR UPDATE`).
-  2. Enforces partial unique constraint on `payer_utr_hash`.
-  3. Transitions statuses to `proof_verified`.
+  2. Enforces uniqueness on `payer_utr_hash`.
+  3. Transitions status to `admin_confirmed` and booking to `payment_confirmed`.
   4. Concurrently allocates sequential coupon numbers: `YSYS-2026-000001`, `YSYS-2026-000002`, etc.
   5. Inserts coupon records and system audit event.
-  6. Unlocks multi-format coupon download for the customer.
+  6. Unlocks multi-format coupon downloads for the customer.
 
 ### 6. Multi-Format Personalized Ticket Generation (PDF, PNG, JPEG)
 - **Authoritative Assets Preserved**:
@@ -95,9 +101,9 @@ Before accepting any proof, server code evaluates deterministic criteria:
 - **Multilingual Support**: Supports both English and Telugu participant names and village names.
 
 ### 7. Secure Admin Portal (`/admin`)
-- **Strictly Verified Coupons Only**: The primary **Applied Coupons** table queries exclusively bookings with status `proof_verified` and coupons with status `valid`. Fixtures, mock records, pending attempts, and failed verification attempts are strictly excluded.
-- **Read-Only Payment Diagnostics**: Diagnostic tab providing complete operational transparency: view submission attempts, extracted OCR text, deterministic comparison logs, reason codes, and short-lived signed screenshot URLs for security audits. No manual approval buttons exist.
-- **Live Metrics**: Automatically verified bookings, valid coupons issued, accepted-proof revenue, and daily totals.
+- **Strictly Verified Coupons Only**: The primary **Applied Coupons** table queries exclusively bookings with status `payment_confirmed` and coupons with status `valid`. Fixtures, mock records, pending attempts, and unconfirmed submissions are strictly excluded.
+- **Payment Reviews Queue**: Real-time review table with status filters (`Awaiting Bank Review`, `AI Check Failed`, `Bank Confirmed`, `Rejected`), screenshot inspection modal, and one-click reconciliation actions.
+- **Live Metrics**: Confirmed bank revenue, valid coupons issued, confirmed bookings, and queue count.
 - **Security Hardening**: Argon2id/bcrypt password hashing, rate-limited login attempts, HTTP-only secure cookie sessions, CSRF headers, and CSV export protection against spreadsheet formula injection.
 
 ---
@@ -107,11 +113,11 @@ Before accepting any proof, server code evaluates deterministic criteria:
 ```text
 ├── migrations/
 │   ├── 001_init_schema.sql           # Base PostgreSQL schema (bookings, coupons, admin tables)
-│   └── 002_direct_upi_schema.sql     # Direct UPI submissions, verification runs & partial index
+│   └── 002_direct_upi_schema.sql     # Direct UPI submissions, bank reconciliation & unique UTR index
 ├── server/
 │   ├── admin/
 │   │   ├── auth.ts                   # Admin bcrypt auth, rate limiting & session management
-│   │   └── routes.ts                 # Read-only admin APIs (metrics, verified coupons, diagnostics)
+│   │   └── routes.ts                 # Admin APIs (coupons, payment reviews, reconciliation actions)
 │   ├── config/
 │   │   └── eventConfig.ts            # Zod-validated environment config & go-live gates
 │   ├── db/
@@ -121,7 +127,7 @@ Before accepting any proof, server code evaluates deterministic criteria:
 │   │   ├── imageProcessor.ts         # Magic byte validation, EXIF stripping, SHA256 & dHash
 │   │   ├── geminiAnalyzer.ts         # Google Gemini structured OCR & tampering analysis
 │   │   ├── deterministicMatcher.ts   # Strict server comparison engine & fail-closed rules
-│   │   └── automatedFinalizer.ts     # Concurrency-safe atomic transaction finalizer
+│   │   └── adminReconciliation.ts    # Concurrency-safe atomic bank reconciliation & coupon issuance
 │   └── services/
 │       ├── couponAllocator.ts        # Atomic, concurrency-safe coupon number generator
 │       └── ticketRenderer.ts         # Multi-format PDF, PNG, JPEG pass generator & ZIP archiver
@@ -131,12 +137,12 @@ Before accepting any proof, server code evaluates deterministic criteria:
 │   ├── booking-and-pricing.test.ts   # Pricing & quantity validation tests (5 tests)
 │   ├── payments-and-webhooks.test.ts # Direct UPI URI, QR, OCR matcher, and security tests (9 tests)
 │   ├── coupon-allocation-and-pdf.test.ts # PDF, PNG, JPEG rendering, ZIP & privacy tests (5 tests)
-│   └── admin.test.ts                 # Admin auth, verified-only filtering & CSV export tests (8 tests)
+│   └── admin.test.ts                 # Admin auth, reconciliation, filtering & CSV export tests (9 tests)
 ├── src/
 │   ├── components/
 │   │   ├── admin/
 │   │   │   ├── AdminLogin.tsx        # Secure admin login interface
-│   │   │   └── AdminDashboard.tsx    # Admin KPI metrics, verified coupons table & diagnostics
+│   │   │   └── AdminDashboard.tsx    # Admin KPI metrics, verified coupons table & payment reviews
 │   │   ├── BookingModal.tsx          # Direct UPI QR, app chooser, UTR & screenshot proof upload
 │   │   ├── TicketModal.tsx           # Multi-ticket preview & PDF/PNG/JPEG/ZIP download dialog
 │   │   ├── CouponVerifier.tsx        # Real-time verification with PII masking
@@ -175,7 +181,7 @@ SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 
 # Direct Merchant-UPI Configuration
-PAYMENT_MODE=direct_upi_automated_proof
+PAYMENT_MODE=direct_upi_manual_reconciliation
 PAYEE_UPI_ID=9574876369@ybl
 PAYEE_DISPLAY_NAME=Yuva Shakti Youth Satulur
 UPI_TRANSACTION_NOTE_PREFIX=YSYS
@@ -230,11 +236,11 @@ Navigate to:
 
 ## 🧪 Testing & Build Verification
 
-The repository contains 27 automated tests across 4 test suites:
+The repository contains 28 automated tests across 4 test suites:
 - `booking-and-pricing.test.ts`: Pricing calculations, multi-coupon limits, input validation.
 - `payments-and-webhooks.test.ts`: Canonical NPCI URI generation, QR codes, deterministic matcher, duplicate detection, and legacy route removal.
 - `coupon-allocation-and-pdf.test.ts`: PDF, PNG, and JPEG pass rendering, ZIP creation, PII phone masking.
-- `admin.test.ts`: Authentication, rate limiting, verified-only coupon list filtering, formula injection defense.
+- `admin.test.ts`: Authentication, rate limiting, bank reconciliation workflow, verified-only coupon list filtering, formula injection defense.
 
 ```bash
 # Run automated tests
@@ -255,7 +261,7 @@ To connect to a live **PostgreSQL** or **Supabase** instance:
 
 1. Open the Supabase SQL Editor or your PostgreSQL management console.
 2. Run `migrations/001_init_schema.sql` to create base tables, sequences, and RLS policies.
-3. Run `migrations/002_direct_upi_schema.sql` to add Direct UPI submission tables, verification run logs, and the partial unique index on `payer_utr_hash`.
+3. Run `migrations/002_direct_upi_schema.sql` to add Direct UPI submission tables, bank reconciliation fields, verification run logs, and the partial unique index on `payer_utr_hash`.
 4. Configure `DATABASE_URL` in your production environment:
    ```env
    DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres"

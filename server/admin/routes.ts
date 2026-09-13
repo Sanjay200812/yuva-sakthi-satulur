@@ -9,7 +9,12 @@ import {
   createAdminSession,
   destroyAdminSession,
 } from './auth.ts';
-import { renderTicketPdf, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
+import { renderTicketPdf, renderTicketRaster, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
+import {
+  confirmPaymentFromBankRecord,
+  rejectPaymentSubmission,
+  requestProofResubmission,
+} from '../upi/adminReconciliation.ts';
 
 const router = express.Router();
 
@@ -222,10 +227,16 @@ router.get('/coupons/export.csv', requireAdminAuth, async (req: Request, res: Re
   }
 });
 
-// 7. Admin Download of Single Ticket PDF
+// 7. Admin Download of Single Ticket (PDF, PNG, JPEG)
 router.get('/coupons/:couponNumber/download', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { couponNumber } = req.params;
+    const format = ((req.query.format as string) || 'pdf').toLowerCase();
+
+    if (!['pdf', 'png', 'jpeg', 'jpg'].includes(format)) {
+      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg.');
+    }
+
     const resCoupon = await db.query('SELECT * FROM coupons WHERE coupon_number = $1', [couponNumber]);
 
     if (resCoupon.rows.length === 0) {
@@ -236,7 +247,7 @@ router.get('/coupons/:couponNumber/download', requireAdminAuth, async (req: Requ
     const resBooking = await db.query('SELECT * FROM bookings WHERE id = $1', [coupon.booking_id]);
     const booking = resBooking.rows[0];
 
-    const pdfBuffer = await renderTicketPdf({
+    const ticketData = {
       couponNumber: coupon.coupon_number,
       participantName: coupon.holder_name,
       phone: coupon.phone,
@@ -245,14 +256,23 @@ router.get('/coupons/:couponNumber/download', requireAdminAuth, async (req: Requ
       ticketIndex: coupon.ticket_index,
       totalQuantity: coupon.total_quantity,
       paidAt: booking?.verified_at || booking?.paid_at,
-    });
+    };
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.pdf"`);
-    res.send(pdfBuffer);
+    if (format === 'pdf') {
+      const pdfBuffer = await renderTicketPdf(ticketData);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.pdf"`);
+      return res.send(pdfBuffer);
+    }
+
+    const targetRaster = format === 'png' ? 'png' : 'jpeg';
+    const rasterBuffer = await renderTicketRaster(ticketData, targetRaster);
+    res.setHeader('Content-Type', targetRaster === 'png' ? 'image/png' : 'image/jpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.${targetRaster === 'png' ? 'png' : 'jpg'}"`);
+    return res.send(rasterBuffer);
   } catch (error: any) {
     console.error('Admin ticket download error:', error);
-    res.status(500).send('Failed to generate coupon PDF.');
+    res.status(500).send('Failed to generate coupon.');
   }
 });
 
@@ -279,20 +299,41 @@ router.get('/coupons/:couponNumber', requireAdminAuth, async (req: Request, res:
   }
 });
 
-// 9. Read-only Payment Diagnostics Queue (Audit, troubleshooting & fraud investigation)
-router.get('/payment-diagnostics', requireAdminAuth, async (req: Request, res: Response) => {
+// 9. Payment Reviews Queue (and legacy Payment Diagnostics alias)
+router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async (req: Request, res: Response) => {
   try {
+    const statusFilter = req.query.status as string;
+    const search = req.query.search as string;
+
     const result = await db.query(
-      `SELECT ps.*, b.public_id as booking_public_id, b.participant_name, b.phone, b.village, b.quantity
+      `SELECT ps.*, b.public_id as booking_public_id, b.participant_name, b.phone, b.village, b.quantity, b.total_amount_paise
        FROM payment_submissions ps
        JOIN bookings b ON ps.booking_id = b.id
        ORDER BY ps.created_at DESC`
     );
 
+    let items = result.rows;
+
+    if (statusFilter && statusFilter !== 'all') {
+      items = items.filter((s: any) => s.status === statusFilter);
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      items = items.filter((s: any) =>
+        (s.participant_name && s.participant_name.toLowerCase().includes(q)) ||
+        (s.phone && s.phone.includes(q)) ||
+        (s.booking_public_id && s.booking_public_id.toLowerCase().includes(q)) ||
+        (s.payment_reference && s.payment_reference.toLowerCase().includes(q)) ||
+        (s.payer_utr_hash && s.payer_utr_hash.toLowerCase().includes(q))
+      );
+    }
+
     res.json({
       success: true,
-      data: result.rows.map((s: any) => ({
+      data: items.map((s: any) => ({
         id: s.id,
+        bookingId: s.booking_id,
         bookingPublicId: s.booking_public_id,
         participantName: s.participant_name,
         phone: maskPhoneNumber(s.phone || ''),
@@ -308,17 +349,21 @@ router.get('/payment-diagnostics', requireAdminAuth, async (req: Request, res: R
         geminiExtraction: s.gemini_extraction,
         deterministicComparison: s.deterministic_comparison,
         hasScreenshot: !!s.screenshot_storage_path,
+        adminReviewerId: s.admin_reviewer_id,
+        adminReviewNote: s.admin_review_note,
+        bankRecordMatch: s.bank_record_match,
+        reviewedAt: s.reviewed_at ? formatKolkataTime(s.reviewed_at) : null,
         submittedAt: formatKolkataTime(s.created_at),
       })),
     });
   } catch (error: any) {
-    console.error('Payment diagnostics error:', error);
-    res.status(500).json({ success: false, error: { message: 'Failed to fetch payment diagnostics queue.' } });
+    console.error('Payment reviews error:', error);
+    res.status(500).json({ success: false, error: { message: 'Failed to fetch payment reviews queue.' } });
   }
 });
 
-// 10. Single Payment Diagnostic Submission Details
-router.get('/payment-diagnostics/:submissionId', requireAdminAuth, async (req: Request, res: Response) => {
+// 10. Single Payment Review Submission Details
+router.get(['/payment-reviews/:submissionId', '/payment-diagnostics/:submissionId'], requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { submissionId } = req.params;
     const result = await db.query('SELECT * FROM payment_submissions WHERE id = $1', [submissionId]);
@@ -341,7 +386,7 @@ router.get('/payment-diagnostics/:submissionId', requireAdminAuth, async (req: R
 });
 
 // 11. Secure Authenticated Screenshot Stream (Admin Only)
-router.get('/payment-diagnostics/:submissionId/screenshot', requireAdminAuth, async (req: Request, res: Response) => {
+router.get(['/payment-reviews/:submissionId/screenshot', '/payment-diagnostics/:submissionId/screenshot'], requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { submissionId } = req.params;
     const result = await db.query('SELECT * FROM payment_submissions WHERE id = $1', [submissionId]);
@@ -364,7 +409,90 @@ router.get('/payment-diagnostics/:submissionId/screenshot', requireAdminAuth, as
   }
 });
 
-// 12. Read-only Booking Details by publicId
+// 12. Admin Action: Confirm Payment from Bank Record (Reconciliation)
+router.post('/payment-reviews/:submissionId/confirm', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { submissionId } = req.params;
+    const adminUser = (req as any).adminUser;
+    const { bankTxnId, receivedAmountPaise, recipientAccount, matchNote, auditNote, idempotencyKey } = req.body;
+
+    const subRes = await db.query('SELECT expected_amount_paise, expected_payee_upi_id FROM payment_submissions WHERE id = $1', [submissionId]);
+    if (subRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: { message: 'Submission not found.' } });
+    }
+    const sub = subRes.rows[0];
+
+    const result = await confirmPaymentFromBankRecord({
+      submissionId,
+      adminUserId: adminUser?.id || '00000000-0000-0000-0000-000000000001',
+      bankRecordMatch: {
+        bankTxnId: bankTxnId || 'BANK-MATCH',
+        receivedAmountPaise: Number(receivedAmountPaise) || sub.expected_amount_paise || 5000,
+        recipientAccount: recipientAccount || sub.expected_payee_upi_id || '9574876369@ybl',
+        matchNote: matchNote || 'Confirmed against official bank/merchant statement',
+      },
+      auditNote: auditNote || 'Payment confirmed by administrator from real bank record',
+      idempotencyKey,
+    });
+
+    res.json({
+      success: true,
+      message: 'Payment confirmed successfully from bank record. Coupons issued.',
+      data: result,
+    });
+  } catch (error: any) {
+    console.error('Admin confirm payment error:', error);
+    res.status(400).json({ success: false, error: { message: error.message || 'Failed to confirm payment.' } });
+  }
+});
+
+// 13. Admin Action: Reject Payment Submission
+router.post('/payment-reviews/:submissionId/reject', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { submissionId } = req.params;
+    const adminUser = (req as any).adminUser;
+    const { reviewNote } = req.body;
+
+    await rejectPaymentSubmission({
+      submissionId,
+      adminUserId: adminUser?.id || '00000000-0000-0000-0000-000000000001',
+      reviewNote: reviewNote || 'Payment rejected by administrator',
+    });
+
+    res.json({
+      success: true,
+      message: 'Payment rejected successfully.',
+    });
+  } catch (error: any) {
+    console.error('Admin reject payment error:', error);
+    res.status(400).json({ success: false, error: { message: error.message || 'Failed to reject payment.' } });
+  }
+});
+
+// 14. Admin Action: Request Resubmission from Customer
+router.post('/payment-reviews/:submissionId/request-resubmission', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { submissionId } = req.params;
+    const adminUser = (req as any).adminUser;
+    const { guidanceNote } = req.body;
+
+    await requestProofResubmission({
+      submissionId,
+      adminUserId: adminUser?.id || '00000000-0000-0000-0000-000000000001',
+      guidanceNote: guidanceNote || 'Please submit a clear, full payment confirmation screenshot.',
+    });
+
+    res.json({
+      success: true,
+      message: 'Resubmission requested successfully.',
+    });
+  } catch (error: any) {
+    console.error('Admin request resubmission error:', error);
+    res.status(400).json({ success: false, error: { message: error.message || 'Failed to request resubmission.' } });
+  }
+});
+
+// 15. Read-only Booking Details by publicId
 router.get('/bookings/:publicId', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;

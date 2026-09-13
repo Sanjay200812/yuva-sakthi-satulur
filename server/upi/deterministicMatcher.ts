@@ -16,7 +16,8 @@ export interface MatchResult {
   passed: boolean;
   riskScore: number;
   reasonCodes: string[];
-  nextStatus: 'proof_verified' | 'verification_failed';
+  nextStatus: 'awaiting_admin_review' | 'ai_check_failed';
+  reviewStatus: 'ai_check_passed' | 'ai_check_failed' | 'awaiting_admin_review';
   userMessage: string;
   details: {
     utrMatched: boolean | null;
@@ -188,7 +189,8 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
       passed: false,
       riskScore,
       reasonCodes,
-      nextStatus: 'verification_failed',
+      nextStatus: 'ai_check_failed',
+      reviewStatus: 'ai_check_failed',
       userMessage: failMessage,
       details,
     };
@@ -198,8 +200,9 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     passed: true,
     riskScore,
     reasonCodes,
-    nextStatus: 'proof_verified',
-    userMessage: 'Payment proof verified, coupons ready.',
+    nextStatus: 'awaiting_admin_review',
+    reviewStatus: 'ai_check_passed',
+    userMessage: 'Details matched. Awaiting bank confirmation.',
     details,
   };
 }
