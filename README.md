@@ -1,50 +1,104 @@
-# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Production Edition)
+# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Automated Proof Verification)
 
-An official, enterprise-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and **VyaparGateway UPI**.
+An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and a **Direct Merchant-UPI Collection with 100% Automated Proof Verification Engine** powered by Google Gemini and deterministic matching rules.
 
 ---
 
 ## 📌 Event Overview
 
-- **Event**: Yuva Shakti Youth Lucky Draw
+- **Event**: Yuva Shakti Youth Satulur Lucky Draw
+- **Organizer**: Yuva Shakti Youth, Satulur
 - **1st Prize**: 🏆 **20 KG Maha Laddu**
-- **Coupon Price**: **₹50 per ticket** (stored server-side as `5000` paise)
-- **Series Available**: Serial numbers allocated atomically upon confirmed payment
-- **Location**: Satulur Center, Guntur District, Andhra Pradesh
+- **Coupon Price**: **₹50 per ticket** (stored server-side as `5000` integer paise)
+- **Venue**: Satulur Center, Guntur District, Andhra Pradesh
 - **Helpline**: +91 95748 76369
 - **Timezone**: `Asia/Kolkata`
+- **Coupon Prefix**: `YSYS` (e.g. `YSYS-2026-000001`)
 
 ---
 
-## 🏗️ Architecture & Core Upgrades
+## 🏗️ Architecture & Core System Design
 
-### 1. Payment Gateway: VyaparGateway (`vyapargateway.com`)
-- **Complete Razorpay Removal**: Razorpay SDK, scripts, routes, and credentials have been completely eradicated.
-- **Provider Abstraction**: Decoupled `PaymentProvider` interface supporting `VyaparGatewayProvider` and `MockPaymentProvider` (forbidden in production).
-- **Dynamic UPI QR & Intent**: Desktop displays dynamic UPI QR code with live polling; mobile devices render direct UPI Intent buttons (`upi://pay?...`).
-- **Signed HMAC SHA-256 Webhooks**: Registered at `POST /api/payments/vyapar-gateway/webhook` using raw request bytes, 5-minute timestamp tolerance, and constant-time signature verification.
+### 1. Direct Merchant-UPI Collection Workflow
+- **Complete Legacy Gateway Removal**: Razorpay, VyaparGateway, and all old third-party hosted payment gateways, SDKs, scripts, and webhook endpoints have been completely removed.
+- **Server-Generated Payment Sessions**: When a participant books coupons, the server validates input and calculates the exact amount at ₹50/ticket. It generates a unique booking public ID, payment reference, and expiring session (default: 20 minutes).
+- **Canonical NPCI UPI URI**: The backend builds a canonical `upi://pay` URI conforming strictly to NPCI standards with URL-encoded parameters:
+  - Payee VPA (`pa`): `PAYEE_UPI_ID` (e.g. `9574876369@ybl`)
+  - Payee Display Name (`pn`): `PAYEE_DISPLAY_NAME`
+  - Transaction Reference (`tr`): Server-generated unique reference (e.g. `YSYS-...`)
+  - Transaction Note (`tn`): `YSYS Lucky Draw Entry`
+  - Amount (`am`): Exact calculated amount (e.g. `50.00` or `100.00`)
+  - Currency (`cu`): `INR`
+- **Dynamic QR Code**: Rendered server-side using `qrcode` with high error correction and returned directly to the client.
+- **Deep Intent App Launch**: Mobile users can launch PhonePe, Google Pay, Paytm, or FamApp via official universal links / intents (`upi://pay`), with an automatic chooser fallback and desktop QR display.
 
-### 2. Concurrency-Safe Database Persistence (PostgreSQL / Supabase)
-- **Single Source of Truth**: All bookings, payment attempts, issued coupons, and audit logs persist in PostgreSQL (with Supabase RLS policies).
-- **Atomic Serial Allocation**: Coupon numbers (e.g. `YSYS-2026-000001`) are allocated inside isolated database transactions (`SERIALIZABLE` / `coupon_serial_seq`).
-- **Idempotency & Replay Defense**: Replayed or duplicate webhooks create **zero** extra coupons. Failed or pending payments receive no serial numbers.
+### 2. Mandatory UTR & Payment Screenshot Proof
+- **Payer Proof Submission**: After making the payment in their external UPI app, the user submits:
+  1. **Mandatory UTR / RRN**: Payer-entered 12-digit reference number.
+  2. **Mandatory Payment Screenshot**: High-resolution receipt image (PNG, JPEG, WebP, max 5MB).
+  3. **Explicit Consent**: Consent checkbox agreeing to automated image processing for verification.
+- **Security & Image Sanitization**:
+  - Validates file magic bytes (stripping non-raster/executable files).
+  - Decompresses and re-encodes image via `sharp` to strip all EXIF metadata and hidden payloads.
+  - Generates SHA-256 and perceptual difference hash (dHash) to detect identical or visually near-duplicate screenshots.
+  - Stores sanitized proof in private object storage (`payment-proofs`). Never exposes permanent public URLs.
 
-### 3. Server-Side Ticket PDF & Verification
-- **High-Resolution Vector PDF**: Rendered server-side using `pdf-lib` incorporating the official Lord Ganesha emblem (`logo.jpeg`), gold foil borders, and dynamic QR codes.
-- **Privacy & PII Protection**: Phone numbers are masked (`XXXXXX1234`) on public verification passes.
-- **Bulk Downloads**: Multi-ticket bookings can be downloaded as a combined multi-page pass or as a ZIP archive of individual tickets.
+### 3. Gemini-Assisted OCR & Tampering Risk Analysis
+- **Server-Side GenAI Client**: Uses the official Google GenAI SDK (`@google/genai`) strictly on the server (`GEMINI_API_KEY` is never exposed to the browser).
+- **Strict Structured JSON Schema**: Extracts key visible fields without hallucination:
+  - `looks_like_payment_screen`: boolean
+  - `visible_payment_status`: `success` | `pending` | `failed` | `unknown`
+  - `app_name`: `phonepe` | `google_pay` | `paytm` | `fam` | `other` | `unknown`
+  - `amount`: string
+  - `currency`: `INR`
+  - `utr_or_rrn`: string
+  - `payee_name`: string | null
+  - `payee_upi_id`: string | null
+  - `obvious_editing_signals`: array of strings
+  - `ai_generated_likelihood`: `low` | `medium` | `high` | `unknown`
+  - `field_confidence`: per-field confidence scores (0.0 to 1.0)
+- **Privacy Controls**: Direct image bytes are processed with `store: false` to ensure sensitive payment data is not retained in model training datasets.
+- > [!IMPORTANT]
+  > **Non-Authoritative Role**: Gemini is an advisory OCR and tampering detection signal. Automated proof verification does **NOT** constitute authoritative bank settlement. Screenshots can be fabricated or manipulated; verification confirms visible proof matching and risk absence under residual fraud risk.
 
-### 4. Secure Admin Panel (`/admin`)
-- **Strictly Confirmed Coupons**: The main **Applied Coupons** list fetches exclusively genuine, successfully paid bookings (`payment_confirmed` + `valid`). No fixtures, mock records, pending attempts, or simulator rows appear there.
-- **Metrics Dashboard**: Live KPIs including Confirmed Bookings, Total Valid Coupons, Confirmed Revenue, Today's Bookings, and Diagnostics.
-- **CSV Export**: Includes formula injection sanitization (stripping leading `=`, `+`, `-`, `@`).
-- **Authentication**: Bcrypt password hashing, rate-limited login attempts, HTTP-only secure cookie sessions, and Bearer token fallback.
+### 4. Server-Side Deterministic Comparison Engine
+Before accepting any proof, server code evaluates deterministic criteria:
+- **Normalized UTR Match**: Payer-entered UTR matches Gemini-extracted UTR exactly.
+- **Exact Amount Match**: Extracted amount matches expected booking total in paise.
+- **Payee Match**: Matches configured merchant UPI ID or name when visible.
+- **Visible Status Check**: Transaction must visibly state `success`.
+- **Duplicate UTR Prevention**: Rejects UTR if already associated with another verified submission.
+- **Duplicate Screenshot Prevention**: Rejects identical SHA-256 or perceptually identical dHash images across different bookings.
+- **Confidence & Risk Thresholds**: All required fields must exceed confidence threshold (>= 0.70), `ai_generated_likelihood` must be `low`, and zero tampering signals must be detected.
+- **Fail-Closed Policy**: If any check fails, status becomes `verification_failed` with specific reason codes (e.g. `UTR_MISMATCH`, `AMOUNT_MISMATCH`, `DUPLICATE_UTR`, `TAMPERING_RISK`). The user can review the issue and resubmit proof.
 
-### 5. Go-Live Legal Gate
-Payments and bookings remain fail-closed until legal confirmation is enabled via environment variables:
-- `BOOKING_OPEN=true`
-- `PAYMENTS_ENABLED=true`
-- `LEGAL_APPROVAL_CONFIRMED=true`
+### 5. 100% Automated Finalization & Atomic Coupon Allocation
+- **NO Admin Verification Step**: Per the organizer's strict requirement, there is **no manual payment approval queue, bank reconciliation button, or confirm/reject action**.
+- **Atomic Database Transaction**: When all deterministic checks pass, `finalizeVerifiedSubmission` executes inside an isolated transaction:
+  1. Locks the booking and payment submission (`FOR UPDATE`).
+  2. Enforces partial unique constraint on `payer_utr_hash`.
+  3. Transitions statuses to `proof_verified`.
+  4. Concurrently allocates sequential coupon numbers: `YSYS-2026-000001`, `YSYS-2026-000002`, etc.
+  5. Inserts coupon records and system audit event.
+  6. Unlocks multi-format coupon download for the customer.
+
+### 6. Multi-Format Personalized Ticket Generation (PDF, PNG, JPEG)
+- **Authoritative Assets Preserved**:
+  - Official Logo: `src/assets/logo.jpeg`
+  - Official Coupon Template: `public/coupon-template.png`
+- **Universal Coordinate Mapping**: Field coordinates, fonts, and dimensions are maintained in `server/services/ticketRenderer.ts` ensuring pixel-identical alignment across all formats.
+- **Supported Formats**:
+  - **PDF**: Vector-sharp printable pass rendered via `pdf-lib` with embedded fonts, official logo, and dynamic verification QR code.
+  - **PNG**: Lossless, high-resolution raster pass rendered via `sharp`.
+  - **JPEG**: Crisp, 95-quality sRGB image for mobile saving and sharing.
+  - **ZIP Archive**: Multi-coupon purchases can be downloaded at once as a single ZIP bundle containing all tickets in PDF, PNG, and JPEG formats.
+- **Multilingual Support**: Supports both English and Telugu participant names and village names.
+
+### 7. Secure Admin Portal (`/admin`)
+- **Strictly Verified Coupons Only**: The primary **Applied Coupons** table queries exclusively bookings with status `proof_verified` and coupons with status `valid`. Fixtures, mock records, pending attempts, and failed verification attempts are strictly excluded.
+- **Read-Only Payment Diagnostics**: Diagnostic tab providing complete operational transparency: view submission attempts, extracted OCR text, deterministic comparison logs, reason codes, and short-lived signed screenshot URLs for security audits. No manual approval buttons exist.
+- **Live Metrics**: Automatically verified bookings, valid coupons issued, accepted-proof revenue, and daily totals.
+- **Security Hardening**: Argon2id/bcrypt password hashing, rate-limited login attempts, HTTP-only secure cookie sessions, CSRF headers, and CSV export protection against spreadsheet formula injection.
 
 ---
 
@@ -52,39 +106,41 @@ Payments and bookings remain fail-closed until legal confirmation is enabled via
 
 ```text
 ├── migrations/
-│   └── 001_init_schema.sql           # Complete PostgreSQL DDL schema & constraints
+│   ├── 001_init_schema.sql           # Base PostgreSQL schema (bookings, coupons, admin tables)
+│   └── 002_direct_upi_schema.sql     # Direct UPI submissions, verification runs & partial index
 ├── server/
 │   ├── admin/
 │   │   ├── auth.ts                   # Admin bcrypt auth, rate limiting & session management
-│   │   └── routes.ts                 # Protected admin APIs (metrics, coupons list, CSV export)
+│   │   └── routes.ts                 # Read-only admin APIs (metrics, verified coupons, diagnostics)
 │   ├── config/
-│   │   └── eventConfig.ts            # Zod-validated environment config & legal go-live gate
+│   │   └── eventConfig.ts            # Zod-validated environment config & go-live gates
 │   ├── db/
 │   │   └── client.ts                 # PostgreSQL connection pool & transactional memory store
-│   ├── payments/
-│   │   ├── provider.ts               # PaymentProvider interface
-│   │   ├── vyaparGateway.ts          # VyaparGateway API integration & HMAC webhook verification
-│   │   ├── mockProvider.ts           # Development-only mock provider (forbidden in production)
-│   │   └── index.ts                  # Provider factory
+│   ├── upi/
+│   │   ├── upiUri.ts                 # Canonical NPCI UPI URI and dynamic QR generation
+│   │   ├── imageProcessor.ts         # Magic byte validation, EXIF stripping, SHA256 & dHash
+│   │   ├── geminiAnalyzer.ts         # Google Gemini structured OCR & tampering analysis
+│   │   ├── deterministicMatcher.ts   # Strict server comparison engine & fail-closed rules
+│   │   └── automatedFinalizer.ts     # Concurrency-safe atomic transaction finalizer
 │   └── services/
 │       ├── couponAllocator.ts        # Atomic, concurrency-safe coupon number generator
-│       └── ticketRenderer.ts         # High-res PDF pass generator & ZIP archiver
+│       └── ticketRenderer.ts         # Multi-format PDF, PNG, JPEG pass generator & ZIP archiver
 ├── scripts/
-│   └── seed-admin.ts                 # Admin bootstrap script
+│   └── seed-admin.ts                 # Administrator bootstrap script
 ├── tests/
-│   ├── booking-and-pricing.test.ts   # Pricing & quantity validation tests
-│   ├── payments-and-webhooks.test.ts # Webhook signature, timestamp tolerance & payment tests
-│   ├── coupon-allocation-and-pdf.test.ts # PDF rendering, ZIP archive & PII masking tests
-│   └── admin.test.ts                 # Admin auth, confirmed-only filtering & CSV export tests
+│   ├── booking-and-pricing.test.ts   # Pricing & quantity validation tests (5 tests)
+│   ├── payments-and-webhooks.test.ts # Direct UPI URI, QR, OCR matcher, and security tests (9 tests)
+│   ├── coupon-allocation-and-pdf.test.ts # PDF, PNG, JPEG rendering, ZIP & privacy tests (5 tests)
+│   └── admin.test.ts                 # Admin auth, verified-only filtering & CSV export tests (8 tests)
 ├── src/
 │   ├── components/
 │   │   ├── admin/
 │   │   │   ├── AdminLogin.tsx        # Secure admin login interface
-│   │   │   └── AdminDashboard.tsx    # Admin KPI metrics, applied coupons table & export
-│   │   ├── BookingModal.tsx          # Dynamic QR & UPI Intent checkout modal
-│   │   ├── TicketModal.tsx           # Multi-ticket preview & PDF/ZIP download dialog
+│   │   │   └── AdminDashboard.tsx    # Admin KPI metrics, verified coupons table & diagnostics
+│   │   ├── BookingModal.tsx          # Direct UPI QR, app chooser, UTR & screenshot proof upload
+│   │   ├── TicketModal.tsx           # Multi-ticket preview & PDF/PNG/JPEG/ZIP download dialog
 │   │   ├── CouponVerifier.tsx        # Real-time verification with PII masking
-│   │   └── ...                       # Public UI components (Navbar, Hero, Prize, etc.)
+│   │   └── ...                       # Public UI components (Navbar, Hero, Prize, Countdown)
 │   └── App.tsx                       # Main router with public portal & /admin route
 ├── server.ts                         # Main Express server & API endpoints
 └── package.json                      # Dependencies & NPM scripts
@@ -95,7 +151,7 @@ Payments and bookings remain fail-closed until legal confirmation is enabled via
 ## 🚀 Quickstart & Local Development
 
 ### Prerequisites
-- Node.js 18+ (tested on Node 20 & 24)
+- Node.js 18+ (tested on Node 20 & 22)
 - npm or yarn
 
 ### 1. Installation
@@ -103,37 +159,54 @@ Payments and bookings remain fail-closed until legal confirmation is enabled via
 npm install
 ```
 
-### 2. Configuration (`.env`)
-Copy the template configuration:
-```bash
-cp .env.example .env
-```
+### 2. Environment Configuration (`.env`)
+Create a `.env` file from the template below:
 
-Key environment variables:
 ```env
-# Server
+# Server & Runtime
 NODE_ENV=development
 PORT=3000
 APP_URL=http://localhost:3000
-SESSION_SECRET=replace_with_a_secure_random_64_character_hex_secret
+SESSION_SECRET=a_very_strong_random_secret_at_least_32_characters_long
 
 # Database (Leave blank to use the built-in isolated in-memory transactional store)
 DATABASE_URL=
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 
-# Payments
-PAYMENT_PROVIDER=vyapar_gateway
-PAYMENT_MODE=test
-VYAPAR_GATEWAY_BASE_URL=https://vyapargateway.com/api/v1/
-VYAPAR_GATEWAY_API_KEY=
-VYAPAR_GATEWAY_WEBHOOK_SECRET=
-VYAPAR_GATEWAY_MERCHANT_ID=
+# Direct Merchant-UPI Configuration
+PAYMENT_MODE=direct_upi_automated_proof
+PAYEE_UPI_ID=9574876369@ybl
+PAYEE_DISPLAY_NAME=Yuva Shakti Youth Satulur
+UPI_TRANSACTION_NOTE_PREFIX=YSYS
+PAYMENT_SESSION_MINUTES=20
+PAYMENT_SCREENSHOT_MAX_BYTES=5242880
+PAYMENT_PROOF_BUCKET=payment-proofs
+FIELD_ENCRYPTION_KEY=c9b68a3f81e9b2512a8848db92ea91bc310dc2e811c7fae98f0601931889c02b
 
-# Go-Live Controls
+# Google Gemini API Configuration (Server-Side Only)
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_STORE_INTERACTIONS=false
+
+# Event Configuration
+EVENT_NAME=Yuva Shakti Youth Satulur Lucky Draw
+EVENT_ORGANIZER=Yuva Shakti Youth, Satulur
+EVENT_PRIZE=20 KG Laddu
+EVENT_VENUE=Satulur Center, Guntur District, Andhra Pradesh
+EVENT_HELPLINE=+91 95748 76369
+EVENT_DRAW_AT=2026-10-19T18:30:00+05:30
+EVENT_TIMEZONE=Asia/Kolkata
+EVENT_COUPON_PREFIX=YSYS
+EVENT_COUPON_PRICE_PAISE=5000
+EVENT_MAX_COUPONS_PER_BOOKING=20
+
+# Go-Live Legal Gate (Fail closed by default in production)
 BOOKING_OPEN=true
-PAYMENTS_ENABLED=false
-LEGAL_APPROVAL_CONFIRMED=false
+PAYMENTS_ENABLED=true
+LEGAL_APPROVAL_CONFIRMED=true
+LOTTERY_LICENCE_NUMBER=
+LOTTERY_LICENCE_DATE=
 ```
 
 ### 3. Bootstrap Administrator Account
@@ -150,80 +223,61 @@ npm run seed:admin
 npm run dev
 ```
 Navigate to:
-- Public Portal: [http://localhost:3000](http://localhost:3000)
-- Admin Portal: [http://localhost:3000/admin](http://localhost:3000/admin)
+- **Public Portal**: [http://localhost:3000](http://localhost:3000)
+- **Admin Portal**: [http://localhost:3000/admin](http://localhost:3000/admin)
 
 ---
 
 ## 🧪 Testing & Build Verification
 
-The repository includes a comprehensive automated test suite covering booking logic, pricing, HMAC webhook signatures, timestamp tolerances, replay prevention, PDF ticket generation, and admin security.
+The repository contains 27 automated tests across 4 test suites:
+- `booking-and-pricing.test.ts`: Pricing calculations, multi-coupon limits, input validation.
+- `payments-and-webhooks.test.ts`: Canonical NPCI URI generation, QR codes, deterministic matcher, duplicate detection, and legacy route removal.
+- `coupon-allocation-and-pdf.test.ts`: PDF, PNG, and JPEG pass rendering, ZIP creation, PII phone masking.
+- `admin.test.ts`: Authentication, rate limiting, verified-only coupon list filtering, formula injection defense.
 
-### Run Automated Tests
 ```bash
+# Run automated tests
 npm test
-```
-*Outputs:*
-```text
-Test Files  4 passed (4)
-     Tests  18 passed (18)
-```
 
-### Run Type Checking & Build
-```bash
+# Run TypeScript type check
 npm run lint
+
+# Build client and server bundles
 npm run build
 ```
 
 ---
 
-## 🗄️ Database Setup & Migration Instructions
+## 🗄️ Database Setup & Supabase Migrations
 
 To connect to a live **PostgreSQL** or **Supabase** instance:
 
-1. Open your database console or Supabase SQL Editor.
-2. Execute the migration script located at `migrations/001_init_schema.sql`.
-3. Set `DATABASE_URL` in your `.env`:
+1. Open the Supabase SQL Editor or your PostgreSQL management console.
+2. Run `migrations/001_init_schema.sql` to create base tables, sequences, and RLS policies.
+3. Run `migrations/002_direct_upi_schema.sql` to add Direct UPI submission tables, verification run logs, and the partial unique index on `payer_utr_hash`.
+4. Configure `DATABASE_URL` in your production environment:
    ```env
-   DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[REF].supabase.co:5432/postgres"
+   DATABASE_URL="postgresql://postgres:[PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres"
    ```
-4. Run `npm run seed:admin` to create your initial administrator account.
-
----
-
-## 💳 VyaparGateway Webhook Registration
-
-In your [VyaparGateway Merchant Dashboard](https://vyapargateway.com):
-
-1. Navigate to **Developer Settings** -> **Webhooks**.
-2. Set the Webhook URL to:
-   ```text
-   https://[YOUR_PRODUCTION_DOMAIN]/api/payments/vyapar-gateway/webhook
-   ```
-3. Copy your **API Key** and **Webhook Secret** into `.env`:
-   ```env
-   VYAPAR_GATEWAY_API_KEY=your_live_api_key
-   VYAPAR_GATEWAY_WEBHOOK_SECRET=your_live_webhook_secret
-   VYAPAR_GATEWAY_MERCHANT_ID=your_merchant_id
-   ```
-4. Set `PAYMENT_MODE=live` when ready for production.
+5. Run `npm run seed:admin` to create your initial administrator account.
 
 ---
 
 ## 🛡️ Production Go-Live Checklist
 
-Before accepting real public payments:
-1. [ ] Confirm legal and entertainment-lottery permissions for Andhra Pradesh.
-2. [ ] Enter `LOTTERY_LICENCE_NUMBER` and `LOTTERY_LICENCE_DATE` in `.env` if applicable.
-3. [ ] Set `LEGAL_APPROVAL_CONFIRMED=true` in `.env`.
-4. [ ] Set `PAYMENTS_ENABLED=true` in `.env`.
-5. [ ] Ensure `PAYMENT_MODE=live` and `PAYMENT_PROVIDER=vyapar_gateway`.
-6. [ ] Seed production admin with a strong custom password (`ADMIN_PASSWORD=... npm run seed:admin`).
-7. [ ] Confirm the webhook URL is registered in VyaparGateway merchant dashboard.
+Before opening public bookings and real UPI collections:
+1. [ ] Confirm written permission/legal confirmation for Andhra Pradesh entertainment-lottery regulations.
+2. [ ] Enter `LOTTERY_LICENCE_NUMBER` and `LOTTERY_LICENCE_DATE` in `.env` if required.
+3. [ ] Verify that the payee UPI ID (`PAYEE_UPI_ID`) is a verified merchant account.
+4. [ ] Set `LEGAL_APPROVAL_CONFIRMED=true` in production environment.
+5. [ ] Set `PAYMENTS_ENABLED=true` and `BOOKING_OPEN=true`.
+6. [ ] Seed production administrator with a strong custom password (`ADMIN_PASSWORD=... npm run seed:admin`).
+7. [ ] Verify Google Gemini API quota and billing in Google Cloud Console.
 
 ---
 
-## 📞 Support & Contacts
+## 📞 Support & Organizer Contact
 
 Organized by **Yuva Shakti Youth, Satulur**  
 - **Helpline**: +91 95748 76369  

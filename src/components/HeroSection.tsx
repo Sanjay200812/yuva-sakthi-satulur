@@ -151,7 +151,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onOpenBooking, onExplo
             >
               <div className="flex items-center gap-1.5 text-[11px] sm:text-xs text-slate-400">
                 <CreditCard className="w-4 h-4 text-amber-400 shrink-0" />
-                <span>VyaparGateway UPI</span>
+                <span>Direct Merchant UPI</span>
               </div>
               <div className="flex items-center gap-1.5 text-[11px] sm:text-xs text-slate-400">
                 <Calendar className="w-4 h-4 text-emerald-400 shrink-0" />

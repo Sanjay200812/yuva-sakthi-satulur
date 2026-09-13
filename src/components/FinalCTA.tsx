@@ -43,7 +43,7 @@ export const FinalCTA: React.FC<FinalCTAProps> = ({ onOpenBooking }) => {
           </div>
 
           <p className="text-xs sm:text-sm text-slate-400 max-w-lg mx-auto">
-            Book your digital lucky draw ticket in seconds via secure <strong>VyaparGateway UPI</strong> (GPay, PhonePe, Paytm). Instant verified pass generated immediately.
+            Book your digital lucky draw ticket in seconds via direct <strong>Merchant UPI</strong> (PhonePe, GPay, Paytm, FamApp). Instant verified pass generated upon automated proof verification.
           </p>
 
           {/* Big Glowing CTA Button */}
@@ -71,7 +71,7 @@ export const FinalCTA: React.FC<FinalCTAProps> = ({ onOpenBooking }) => {
             </span>
             <span className="flex items-center gap-1.5 text-purple-300 font-medium">
               <CreditCard className="w-4 h-4" />
-              VyaparGateway Secured Gateway
+              Direct Merchant UPI & Automated Verification
             </span>
           </div>
         </div>

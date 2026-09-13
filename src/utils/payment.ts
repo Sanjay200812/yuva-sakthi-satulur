@@ -5,10 +5,12 @@ export interface BookingCreationParams {
   phone: string;
   village: string;
   quantity: number;
+  selectedApp?: string;
 }
 
 export interface BookingCreationResponse {
   booking: {
+    id: string;
     publicId: string;
     name: string;
     phone: string;
@@ -19,18 +21,50 @@ export interface BookingCreationResponse {
   };
   payment: {
     clientTxnId: string;
-    orderId?: string;
-    checkoutUrl?: string;
-    qrData?: string;
-    upiIntentUri?: string;
+    orderId: string;
+    qrDataUrl: string;
+    canonicalUri: string;
+    payeeUpiId: string;
+    rawPayeeUpiId: string;
+    payeeDisplayName: string;
+    amountInr: string;
+    totalAmount: number;
     expiresAt: string;
     statusToken: string;
-    isTestMode: boolean;
+    appIntents: {
+      phonepe: string;
+      google_pay: string;
+      paytm: string;
+      fam: string;
+      standard: string;
+    };
+  };
+}
+
+export interface PaymentProofParams {
+  publicId: string;
+  utr: string;
+  screenshotBase64: string;
+  selectedApp: string;
+  consentGiven: boolean;
+}
+
+export interface PaymentProofResponse {
+  submissionId: string;
+  publicId: string;
+  status: string;
+  message: string;
+  coupons?: any[];
+  details: {
+    utrMatched: boolean | null;
+    amountMatched: boolean | null;
+    statusMatched: boolean | null;
+    payeeMatched: boolean | null;
   };
 }
 
 /**
- * Creates a genuine booking record on the server and initiates a VyaparGateway payment session.
+ * Creates a genuine booking record on the server and generates a Direct UPI payment session.
  */
 export async function createBooking(params: BookingCreationParams): Promise<BookingCreationResponse> {
   const response = await fetch('/api/bookings', {
@@ -51,75 +85,87 @@ export async function createBooking(params: BookingCreationParams): Promise<Book
 }
 
 /**
+ * Submits mandatory payment proof (UTR, payment screenshot, and user consent) for verification.
+ */
+export async function submitPaymentProof(params: PaymentProofParams): Promise<PaymentProofResponse> {
+  const response = await fetch(`/api/bookings/${params.publicId}/payment-proof`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      utr: params.utr,
+      screenshotBase64: params.screenshotBase64,
+      selectedApp: params.selectedApp,
+      consentGiven: params.consentGiven,
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || !data.success) {
+    throw new Error(data.error?.message || 'Failed to submit payment proof.');
+  }
+
+  return data.data;
+}
+
+/**
  * Polls the backend status endpoint until payment is confirmed, failed, or timed out.
  */
-export async function pollPaymentStatus(
+export function pollPaymentStatus(
   publicId: string,
-  statusToken: string,
-  onConfirmed: (booking: CouponBooking) => void,
-  onError: (msg: string) => void,
-  maxAttempts = 60,
+  onStatusChange: (status: string, message: string, booking?: CouponBooking) => void,
   intervalMs = 3000
-): Promise<() => void> {
-  let attempts = 0;
+): () => void {
   let isCancelled = false;
 
   const check = async () => {
     if (isCancelled) return;
-    attempts++;
 
     try {
-      const res = await fetch(`/api/bookings/${publicId}/status?token=${encodeURIComponent(statusToken)}`);
-      if (!res.ok) {
-        if (attempts >= maxAttempts) {
-          onError('Payment status check timed out. Please verify with helpline.');
-        }
-        return;
-      }
+      const res = await fetch(`/api/bookings/${publicId}/status`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.data) {
+          const b = json.data;
 
-      const json = await res.json();
-      if (json.success && json.data) {
-        const b = json.data;
-        if (b.status === 'payment_confirmed') {
-          const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
-          const confirmedBooking: CouponBooking = {
-            id: b.publicId,
-            ticketNumbers: couponNumbers,
-            name: b.coupons?.[0]?.holder_name || 'Participant',
-            phone: b.coupons?.[0]?.phone || '',
-            village: b.coupons?.[0]?.village || 'Satulur',
-            quantity: b.quantity,
-            totalAmount: b.totalAmount,
-            bookedAt: new Date(b.paidAt || Date.now()).toLocaleDateString('en-IN', {
-              day: 'numeric',
-              month: 'short',
-              hour: '2-digit',
-              minute: '2-digit',
-            }),
-            status: 'confirmed',
-            transactionRef: 'VYAPAR_UPI_VERIFIED',
-            paymentGateway: 'VyaparGateway UPI',
-            downloadUrl: b.downloadUrl,
-          };
-          onConfirmed(confirmedBooking);
-          return;
-        } else if (b.status === 'payment_failed' || b.status === 'expired') {
-          onError('Payment was not completed or expired. Please try again.');
-          return;
+          if (b.status === 'proof_verified' || b.status === 'payment_confirmed') {
+            const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
+            const confirmedBooking: CouponBooking = {
+              id: b.publicId,
+              ticketNumbers: couponNumbers,
+              name: b.coupons?.[0]?.holder_name || 'Participant',
+              phone: b.coupons?.[0]?.phone || '',
+              village: b.coupons?.[0]?.village || 'Satulur',
+              quantity: b.quantity,
+              totalAmount: b.totalAmount,
+              bookedAt: new Date(b.paidAt || Date.now()).toLocaleDateString('en-IN', {
+                day: 'numeric',
+                month: 'short',
+                hour: '2-digit',
+                minute: '2-digit',
+              }),
+              status: 'confirmed',
+              transactionRef: 'AUTOMATED_PROOF_VERIFIED',
+            };
+            onStatusChange('proof_verified', b.message, confirmedBooking);
+            return; // stop polling
+          }
+
+          onStatusChange(b.status, b.message);
         }
       }
     } catch {
       // transient network error, continue polling
     }
 
-    if (attempts < maxAttempts && !isCancelled) {
+    if (!isCancelled) {
       setTimeout(check, intervalMs);
-    } else if (!isCancelled) {
-      onError('Payment verification window timed out. If money was deducted, your ticket will be confirmed shortly.');
     }
   };
 
-  setTimeout(check, intervalMs);
+  check();
 
   return () => {
     isCancelled = true;
@@ -127,14 +173,14 @@ export async function pollPaymentStatus(
 }
 
 /**
- * Test mode helper: Simulates payment confirmation in development only.
+ * Test helper for development / Vitest simulations
  */
-export async function simulateTestPayment(clientTxnId: string): Promise<boolean> {
+export async function simulateAdminBankConfirm(bookingPublicId: string): Promise<boolean> {
   try {
-    const res = await fetch('/api/test-mode/simulate-payment', {
+    const res = await fetch('/api/test-mode/simulate-admin-confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clientTxnId }),
+      body: JSON.stringify({ bookingPublicId }),
     });
     const json = await res.json();
     return json.success === true;
@@ -142,72 +188,3 @@ export async function simulateTestPayment(clientTxnId: string): Promise<boolean>
     return false;
   }
 }
-
-/**
- * Real-time instant status polling targeting /api/payment/status?order_id=... every 2-3 seconds
- */
-export function pollVyaparPaymentStatus(
-  orderId: string,
-  onSuccess: (booking: CouponBooking) => void,
-  onFailed: (errorMessage: string) => void,
-  intervalMs = 2500, // Every 2-3 seconds as specified
-  maxAttempts = 120
-): () => void {
-  let attempts = 0;
-  let isCancelled = false;
-
-  const check = async () => {
-    if (isCancelled) return;
-    attempts++;
-
-    try {
-      const res = await fetch(`/api/payment/status?order_id=${encodeURIComponent(orderId)}`);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.status === 'SUCCESS' && json.booking) {
-          const b = json.booking;
-          const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
-          const confirmedBooking: CouponBooking = {
-            id: b.publicId || b.id || orderId,
-            ticketNumbers: couponNumbers,
-            name: b.name || b.coupons?.[0]?.holder_name || 'Participant',
-            phone: b.phone || b.coupons?.[0]?.phone || '',
-            village: b.village || b.coupons?.[0]?.village || 'Satulur',
-            quantity: b.quantity || 1,
-            totalAmount: b.totalAmount || 50,
-            bookedAt: new Date(b.paidAt || Date.now()).toLocaleDateString('en-IN', {
-              day: 'numeric',
-              month: 'short',
-              hour: '2-digit',
-              minute: '2-digit',
-            }),
-            status: 'confirmed',
-            transactionRef: 'VYAPAR_UPI_VERIFIED',
-            paymentGateway: 'VyaparGateway UPI',
-            downloadUrl: `/api/coupons/${b.publicId || orderId}/download.pdf`,
-          };
-          onSuccess(confirmedBooking);
-          return;
-        } else if (json.status === 'FAILED') {
-          onFailed(json.message || 'Payment was cancelled or failed. Please try again.');
-          return;
-        }
-      }
-    } catch {
-      // transient network error, keep polling
-    }
-
-    if (attempts < maxAttempts && !isCancelled) {
-      setTimeout(check, intervalMs);
-    } else if (!isCancelled) {
-      onFailed('Payment verification window timed out. If money was deducted, your ticket will be confirmed shortly.');
-    }
-  };
-
-  setTimeout(check, intervalMs);
-
-  return () => {
-    isCancelled = true;
-  };
-}
-

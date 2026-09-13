@@ -12,7 +12,7 @@ export const HowItWorks: React.FC<HowItWorksProps> = ({ onOpenBooking }) => {
       number: '01',
       title: 'GET YOUR COUPON',
       subtitle: 'Instant UPI Payment (₹50)',
-      detail: 'Select 1 or more coupons for ₹50 each. Pay securely via VyaparGateway UPI (GPay/PhonePe/Paytm) in seconds.',
+      detail: 'Select 1 or more coupons for ₹50 each. Pay directly via UPI (PhonePe/GPay/Paytm/FamApp) and submit proof for instant automated verification.',
       icon: CreditCard,
       accent: 'from-purple-500 to-indigo-500',
       badge: '₹50 UPI Entry',

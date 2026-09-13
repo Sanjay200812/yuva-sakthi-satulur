@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   unit_price_paise INTEGER NOT NULL CHECK (unit_price_paise > 0),
   total_amount_paise INTEGER NOT NULL CHECK (total_amount_paise > 0),
   status TEXT NOT NULL CHECK (status IN ('created', 'payment_pending', 'payment_confirmed', 'payment_failed', 'expired', 'refunded', 'cancelled')),
-  provider_name TEXT NOT NULL DEFAULT 'vyapar_gateway',
+  provider_name TEXT NOT NULL DEFAULT 'direct_upi',
   download_token_hash TEXT NOT NULL,
   status_token_hash TEXT NOT NULL,
   paid_at TIMESTAMPTZ,

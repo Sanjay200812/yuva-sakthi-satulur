@@ -86,9 +86,9 @@ export default function App() {
                   minute: '2-digit',
                 }),
                 status: 'confirmed',
-                transactionRef: 'VYAPAR_UPI_VERIFIED',
-                paymentGateway: 'VyaparGateway UPI',
-                downloadUrl: `/api/coupons/${b.publicId || targetOrderId}/download.pdf`,
+                transactionRef: 'DIRECT_UPI_PROOF_VERIFIED',
+                paymentGateway: 'Direct UPI (Proof Verified)',
+                downloadUrl: `/api/bookings/${b.publicId || targetOrderId}/download-all`,
               });
             }
           })
@@ -178,7 +178,7 @@ export default function App() {
         {/* 3. 1st Prize – 20 KG Laddu */}
         <PrizeSection onOpenBooking={() => handleOpenBooking()} />
 
-        {/* 4. Coupon Section (SINGLE COUPON ₹50 & VyaparGateway UPI) */}
+        {/* 4. Coupon Section (SINGLE COUPON ₹50 & Direct Merchant UPI) */}
         <CouponSection
           onBookCoupon={handleBookCoupon}
           onOpenBookingModal={handleOpenBooking}

@@ -79,20 +79,21 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
       // Poll status until confirmed
       pollPaymentStatus(
         resp.booking.publicId,
-        resp.payment.statusToken,
-        (confirmedBooking) => {
-          setIsProcessing(false);
-          onBookCoupon(confirmedBooking);
-        },
-        (err) => {
-          setIsProcessing(false);
-          setErrorMessage(err);
+        (status, message, confirmedBooking) => {
+          if (confirmedBooking) {
+            setIsProcessing(false);
+            onBookCoupon(confirmedBooking);
+          } else if (status === 'verification_failed') {
+            setIsProcessing(false);
+            setErrorMessage(message || 'Verification failed. Please check your submission.');
+          }
         }
       );
 
       // If mobile, offer intent URL
-      if (resp.payment.upiIntentUri && /Android|iPhone|iPad/i.test(navigator.userAgent)) {
-        window.location.href = resp.payment.upiIntentUri;
+      const upiUrl = resp.payment.canonicalUri || resp.payment.appIntents?.phonepe;
+      if (upiUrl && /Android|iPhone|iPad/i.test(navigator.userAgent)) {
+        window.location.href = upiUrl;
       }
     } catch (err: any) {
       setIsProcessing(false);
@@ -124,7 +125,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
           >
             <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-purple-500/20 border border-purple-400/40 text-purple-200 text-xs font-bold tracking-widest uppercase shadow-[0_0_15px_rgba(168,85,247,0.2)]">
               <Ticket className="w-4 h-4 text-amber-400" />
-              <span>OFFICIAL COUPON & VYAPARGATEWAY UPI</span>
+              <span>OFFICIAL COUPON & DIRECT MERCHANT UPI</span>
             </span>
 
             <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-300 text-xs font-bold font-mono shadow-[0_0_15px_rgba(245,158,11,0.2)]">
@@ -305,7 +306,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                   </div>
                 </div>
 
-                {/* Payment Method Selector (VyaparGateway vs Direct WhatsApp) */}
+                {/* Payment Method Selector (Direct UPI vs Direct WhatsApp) */}
                 <div className="space-y-2 pt-2">
                   <span className="block text-xs font-bold uppercase tracking-wider text-purple-300">
                     Step 3: Choose Payment Gateway
@@ -325,13 +326,13 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                       </div>
                       <div>
                         <div className="text-xs font-extrabold text-white flex items-center gap-1.5">
-                          <span>VyaparGateway UPI</span>
+                          <span>Direct Merchant UPI</span>
                           <span className="text-[9px] px-1.5 py-0.2 bg-amber-400 text-slate-950 font-black rounded uppercase">
                             0% Fee
                           </span>
                         </div>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          PhonePe, Google Pay, Paytm, BHIM, UPI Apps
+                          PhonePe, Google Pay, Paytm, FamApp, UPI Apps
                         </p>
                       </div>
                     </button>
@@ -383,7 +384,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                   <div className="text-right">
                     <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 bg-emerald-950/40 px-2.5 py-1 rounded-full border border-emerald-500/30">
                       <Lock className="w-3 h-3" />
-                      VyaparGateway SHA-256 Secure
+                      Direct UPI Automated Verification
                     </span>
                   </div>
                 </div>
@@ -537,7 +538,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                     <QrCode className="w-7 h-7 text-slate-950" />
                   </div>
                   <div className="text-[10px] leading-tight">
-                    <span className="block text-white font-semibold">VyaparGateway Verified</span>
+                    <span className="block text-white font-semibold">Automated Proof Verified</span>
                     <span className="text-slate-400">Satulur Series 1501-2250</span>
                   </div>
                 </div>

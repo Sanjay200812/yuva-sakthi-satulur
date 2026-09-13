@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import { app } from '../server.ts';
 
-describe('Phase 11: Admin Panel Authentication & Confirmed Coupons List', () => {
+describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () => {
   let adminToken = '';
 
   it('blocks unauthenticated requests to admin dashboard with 401', async () => {
@@ -37,8 +37,8 @@ describe('Phase 11: Admin Panel Authentication & Confirmed Coupons List', () => 
     adminToken = res.body.data.token;
   });
 
-  it('shows ONLY genuine paid/confirmed coupons in the main Applied Coupons list', async () => {
-    // 1. Create a pending booking (NOT paid)
+  it('shows ONLY genuine proof-verified coupons in the main Applied Coupons list', async () => {
+    // 1. Create an unverified booking
     const pendingRes = await request(app)
       .post('/api/bookings')
       .send({
@@ -63,14 +63,14 @@ describe('Phase 11: Admin Panel Authentication & Confirmed Coupons List', () => 
     const hasPending = coupons.some((c: any) => c.booking_public_id === pendingPublicId);
     expect(hasPending).toBe(false);
 
-    // Verify that all returned records strictly have booking_status = payment_confirmed
+    // Verify that all returned records strictly have booking_status = proof_verified or payment_confirmed
     for (const c of coupons) {
-      expect(c.booking_status).toBe('payment_confirmed');
+      expect(['proof_verified', 'payment_confirmed']).toContain(c.booking_status);
       expect(c.status).toBe('valid');
     }
   });
 
-  it('exports confirmed coupons to CSV with spreadsheet formula injection protection', async () => {
+  it('exports verified coupons to CSV with spreadsheet formula injection protection', async () => {
     const res = await request(app)
       .get('/api/admin/coupons/export.csv')
       .set('Authorization', `Bearer ${adminToken}`);
@@ -78,5 +78,24 @@ describe('Phase 11: Admin Panel Authentication & Confirmed Coupons List', () => 
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toContain('text/csv');
     expect(res.text).toContain('Coupon Number,Participant Name,Phone');
+  });
+
+  it('verifies that no manual admin approval/confirmation endpoints exist (404)', async () => {
+    const res = await request(app)
+      .post('/api/admin/payment-reviews/fake-id/confirm')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ note: 'test' });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('provides read-only payment diagnostics queue for support & fraud investigation', async () => {
+    const res = await request(app)
+      .get('/api/admin/payment-diagnostics')
+      .set('Authorization', `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.data)).toBe(true);
   });
 });

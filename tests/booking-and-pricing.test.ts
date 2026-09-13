@@ -72,7 +72,7 @@ describe('Phase 11: Booking and Pricing Validation', () => {
     // Server must calculate 3 * 50 = 150
     expect(res.body.data.booking.totalAmount).toBe(150);
     expect(res.body.data.booking.quantity).toBe(3);
-    expect(res.body.data.booking.status).toBe('payment_pending');
+    expect(res.body.data.booking.status).toBe('payment_initiated');
   });
 
   it('returns safe public configuration from /api/config', async () => {

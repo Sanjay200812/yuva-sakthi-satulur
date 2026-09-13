@@ -27,15 +27,18 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
-  // Payments Provider
-  PAYMENT_PROVIDER: z.enum(['vyapar_gateway', 'mock']).default('vyapar_gateway'),
-  PAYMENT_MODE: z.enum(['test', 'live']).default('test'),
-  VYAPAR_GATEWAY_BASE_URL: z.string().url().default('https://vyapargateway.com/api/v1/'),
-  VYAPAR_API_KEY: z.string().default(process.env.VYAPAR_API_KEY || process.env.VYAPAR_GATEWAY_API_KEY || ''),
-  VYAPAR_WEBHOOK_SECRET: z.string().default(process.env.VYAPAR_WEBHOOK_SECRET || process.env.VYAPAR_GATEWAY_WEBHOOK_SECRET || ''),
-  VYAPAR_GATEWAY_API_KEY: z.string().default(process.env.VYAPAR_API_KEY || process.env.VYAPAR_GATEWAY_API_KEY || ''),
-  VYAPAR_GATEWAY_WEBHOOK_SECRET: z.string().default(process.env.VYAPAR_WEBHOOK_SECRET || process.env.VYAPAR_GATEWAY_WEBHOOK_SECRET || ''),
-  VYAPAR_GATEWAY_MERCHANT_ID: z.string().default(''),
+  // Direct Merchant-UPI & Gemini Verification Configuration
+  PAYMENT_MODE: z.string().default('direct_upi_manual_reconciliation'),
+  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || '9574876369@ybl'),
+  PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur'),
+  UPI_TRANSACTION_NOTE_PREFIX: z.string().default(process.env.UPI_TRANSACTION_NOTE_PREFIX || 'YSYS'),
+  PAYMENT_SESSION_MINUTES: z.coerce.number().int().positive().default(20),
+  PAYMENT_SCREENSHOT_MAX_BYTES: z.coerce.number().int().positive().default(5242880),
+  PAYMENT_PROOF_BUCKET: z.string().default('payment-proofs'),
+  GEMINI_API_KEY: z.string().default(process.env.GEMINI_API_KEY || ''),
+  GEMINI_MODEL: z.string().default(process.env.GEMINI_MODEL || 'gemini-2.5-flash'),
+  GEMINI_STORE_INTERACTIONS: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(false),
+  FIELD_ENCRYPTION_KEY: z.string().default(process.env.FIELD_ENCRYPTION_KEY || 'c9b68a3f81e9b2512a8848db92ea91bc310dc2e811c7fae98f0601931889c02b'),
 
   // Event Configuration
   EVENT_NAME: z.string().default('Yuva Shakti Youth Satulur Lucky Draw'),
@@ -55,6 +58,7 @@ const envSchema = z.object({
   LEGAL_APPROVAL_CONFIRMED: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(true),
   LOTTERY_LICENCE_NUMBER: z.string().optional().default(''),
   LOTTERY_LICENCE_DATE: z.string().optional().default(''),
+  TEMPLATE_VERSION: z.string().default('v1-official'),
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
@@ -110,7 +114,10 @@ export function getPublicConfig() {
     licenceNumber: config.LOTTERY_LICENCE_NUMBER || null,
     licenceDate: config.LOTTERY_LICENCE_DATE || null,
     paymentMode: config.PAYMENT_MODE,
-    paymentProvider: config.PAYMENT_PROVIDER,
+    payeeUpiId: config.PAYEE_UPI_ID,
+    payeeDisplayName: config.PAYEE_DISPLAY_NAME,
+    sessionMinutes: config.PAYMENT_SESSION_MINUTES,
+    maxScreenshotBytes: config.PAYMENT_SCREENSHOT_MAX_BYTES,
     canBook: paymentGate.allowed,
     unavailableReason: paymentGate.reason || null,
   };

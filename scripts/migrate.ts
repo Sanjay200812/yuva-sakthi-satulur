@@ -22,12 +22,17 @@ async function runMigration() {
 
   const client = await pool.connect();
   try {
-    const sqlPath = path.join(process.cwd(), 'migrations', '001_init_schema.sql');
-    const sql = fs.readFileSync(sqlPath, 'utf8');
+    const migrationsDir = path.join(process.cwd(), 'migrations');
+    const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
 
-    console.log(`📄 Executing migration from ${sqlPath}...`);
-    await client.query(sql);
-    console.log('✅ Database migration applied successfully!');
+    for (const file of files) {
+      const sqlPath = path.join(migrationsDir, file);
+      const sql = fs.readFileSync(sqlPath, 'utf8');
+      console.log(`📄 Executing migration from ${file}...`);
+      await client.query(sql);
+      console.log(`✅ Applied ${file}`);
+    }
+    console.log('🎉 All database migrations applied successfully!');
   } finally {
     client.release();
     await pool.end();

@@ -3,6 +3,7 @@ import path from 'path';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import QRCode from 'qrcode';
 import archiver from 'archiver';
+import sharp from 'sharp';
 import { config } from '../config/eventConfig.ts';
 
 export interface TicketRenderData {
@@ -307,7 +308,104 @@ export async function renderMultiTicketPdf(tickets: TicketRenderData[]): Promise
 }
 
 /**
- * Creates a ZIP archive containing individual PDFs for all purchased tickets
+ * Render high-resolution raster image (PNG or JPEG) for a ticket
+ */
+export async function renderTicketRaster(data: TicketRenderData, format: 'png' | 'jpeg'): Promise<Buffer> {
+  const verifyUrl = `${config.APP_URL}/verify?coupon=${encodeURIComponent(data.couponNumber)}${
+    data.verificationToken ? `&token=${encodeURIComponent(data.verificationToken)}` : ''
+  }`;
+  const qrDataUrl = await QRCode.toDataURL(verifyUrl, {
+    width: 220,
+    margin: 1,
+    color: { dark: '#070B19', light: '#FFFFFF' },
+  });
+
+  const logoPath = fs.existsSync(path.resolve(process.cwd(), 'logo.jpeg'))
+    ? path.resolve(process.cwd(), 'logo.jpeg')
+    : path.resolve(process.cwd(), 'public', 'logo.jpeg');
+  let logoDataUrl = '';
+  if (fs.existsSync(logoPath)) {
+    const logoBytes = fs.readFileSync(logoPath);
+    logoDataUrl = `data:image/jpeg;base64,${logoBytes.toString('base64')}`;
+  }
+
+  const svg = `
+    <svg width="1240" height="680" viewBox="0 0 1240 680" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#070B19" />
+          <stop offset="100%" stop-color="#0F172A" />
+        </linearGradient>
+      </defs>
+      <rect width="1240" height="680" fill="url(#bg)" />
+      <!-- Outer border -->
+      <rect x="30" y="30" width="1180" height="620" rx="20" fill="#0E1530" stroke="#F59E0B" stroke-width="4" />
+      <!-- Inner border -->
+      <rect x="42" y="42" width="1156" height="596" rx="14" fill="none" stroke="#8B5CF6" stroke-width="1.5" stroke-opacity="0.4" />
+      <!-- Header Line -->
+      <line x1="42" y1="130" x2="1198" y2="130" stroke="#F59E0B" stroke-width="2" stroke-opacity="0.6" />
+      <!-- Perforation Line -->
+      <line x1="910" y1="130" x2="910" y2="630" stroke="#A855F7" stroke-width="3" stroke-dasharray="8,8" />
+
+      <!-- Logo -->
+      ${logoDataUrl ? `<image href="${logoDataUrl}" x="60" y="52" width="64" height="64" />` : ''}
+
+      <!-- Header Title -->
+      <text x="${logoDataUrl ? '140' : '60'}" y="88" font-family="Helvetica, Arial, sans-serif" font-size="24" font-weight="bold" fill="#FFFFFF">YUVA SHAKTI YOUTH SATULUR</text>
+      <text x="${logoDataUrl ? '140' : '60'}" y="114" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#FBBF24">OFFICIAL LUCKY DRAW COUPON - Rs.50</text>
+
+      <!-- Series Badge -->
+      <rect x="940" y="58" width="220" height="52" rx="8" fill="#1E1B4B" stroke="#A855F7" stroke-width="1.5" />
+      <text x="1050" y="82" font-family="monospace" font-size="13" font-weight="bold" fill="#C084FC" text-anchor="middle">OFFICIAL SERIES</text>
+      <text x="1050" y="102" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#FBBF24" text-anchor="middle">Pass ${data.ticketIndex} of ${data.totalQuantity}</text>
+
+      <!-- Coupon Number Banner -->
+      <rect x="60" y="156" width="810" height="76" rx="12" fill="#0A0E24" stroke="#F59E0B" stroke-width="2" />
+      <text x="80" y="180" font-family="monospace" font-size="13" font-weight="bold" fill="#94A3B8">OFFICIAL COUPON NUMBER</text>
+      <text x="80" y="218" font-family="monospace" font-size="34" font-weight="bold" fill="#FDE047">${data.couponNumber}</text>
+
+      <!-- Participant Details Grid -->
+      <text x="60" y="270" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">PARTICIPANT NAME</text>
+      <text x="60" y="300" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" fill="#FFFFFF">${data.participantName.toUpperCase()}</text>
+
+      <text x="470" y="270" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">PHONE (VERIFIED)</text>
+      <text x="470" y="300" font-family="monospace" font-size="20" font-weight="bold" fill="#C4B5FD">${maskPhoneNumber(data.phone)}</text>
+
+      <text x="60" y="360" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">VILLAGE / REGION</text>
+      <text x="60" y="390" font-family="Helvetica, Arial, sans-serif" font-size="20" font-weight="bold" fill="#FFFFFF">${data.village.toUpperCase()}</text>
+
+      <text x="470" y="360" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">DRAW DATE &amp; VENUE</text>
+      <text x="470" y="390" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="bold" fill="#FBBF24">19th Sun Evening 6:30 PM - Satulur Center</text>
+
+      <text x="60" y="450" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">BUMPER PRIZE</text>
+      <text x="60" y="480" font-family="Helvetica, Arial, sans-serif" font-size="20" font-weight="bold" fill="#34D399">20 KG LADDU</text>
+
+      <text x="470" y="450" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">BOOKING REFERENCE</text>
+      <text x="470" y="480" font-family="monospace" font-size="18" font-weight="bold" fill="#E2E8F0">${data.bookingPublicId}</text>
+
+      <!-- Footer Info -->
+      <line x1="60" y1="540" x2="870" y2="540" stroke="#334155" stroke-width="1" />
+      <text x="60" y="570" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#94A3B8">Organized by Yuva Shakti Youth, Satulur - Helpline: +91 95748 76369</text>
+      <text x="60" y="596" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#64748B">Keep this official verified pass safe for the live stage draw.</text>
+
+      <!-- QR Code Stub -->
+      <image href="${qrDataUrl}" x="945" y="200" width="220" height="220" />
+      <text x="1055" y="450" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#F59E0B" text-anchor="middle">SCAN TO VERIFY</text>
+      <text x="1055" y="475" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#94A3B8" text-anchor="middle">OFFICIAL COMMITTEE SEAL</text>
+      <text x="1055" y="500" font-family="monospace" font-size="12" fill="#34D399" text-anchor="middle">&#x2713; PROOF VERIFIED</text>
+    </svg>
+  `;
+
+  const svgBuffer = Buffer.from(svg);
+  if (format === 'png') {
+    return await sharp(svgBuffer).png().toBuffer();
+  } else {
+    return await sharp(svgBuffer).flatten({ background: '#070B19' }).jpeg({ quality: 95 }).toBuffer();
+  }
+}
+
+/**
+ * Creates a ZIP archive containing individual PDFs, PNGs, and JPEGs for all purchased tickets
  */
 export function createTicketsZipArchive(tickets: TicketRenderData[]): Promise<Buffer> {
   return new Promise(async (resolve, reject) => {
@@ -320,8 +418,17 @@ export function createTicketsZipArchive(tickets: TicketRenderData[]): Promise<Bu
       archive.on('error', (err) => reject(err));
 
       for (const ticket of tickets) {
+        // 1. PDF pass
         const pdfBuffer = await renderTicketPdf(ticket);
         archive.append(pdfBuffer, { name: `${ticket.couponNumber}.pdf` });
+
+        // 2. PNG pass
+        const pngBuffer = await renderTicketRaster(ticket, 'png');
+        archive.append(pngBuffer, { name: `${ticket.couponNumber}.png` });
+
+        // 3. JPEG pass
+        const jpgBuffer = await renderTicketRaster(ticket, 'jpeg');
+        archive.append(jpgBuffer, { name: `${ticket.couponNumber}.jpg` });
       }
 
       await archive.finalize();
@@ -330,3 +437,4 @@ export function createTicketsZipArchive(tickets: TicketRenderData[]): Promise<Bu
     }
   });
 }
+

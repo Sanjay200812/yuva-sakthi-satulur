@@ -7,11 +7,16 @@ import { createServer as createViteServer } from 'vite';
 
 import { config, getPublicConfig, canAcceptPayments } from './server/config/eventConfig.ts';
 import { db } from './server/db/client.ts';
-import { getPaymentProvider, VyaparGatewayProvider, MockPaymentProvider } from './server/payments/index.ts';
+import { generateUpiPaymentSession } from './server/upi/upiUri.ts';
+import { processPaymentScreenshot } from './server/upi/imageProcessor.ts';
+import { analyzePaymentScreenshotWithGemini } from './server/upi/geminiAnalyzer.ts';
+import { performDeterministicComparison, normalizeUtr } from './server/upi/deterministicMatcher.ts';
+import { finalizeVerifiedSubmission } from './server/upi/automatedFinalizer.ts';
 import { allocateCouponsForBooking } from './server/services/couponAllocator.ts';
 import {
   renderTicketPdf,
   renderMultiTicketPdf,
+  renderTicketRaster,
   createTicketsZipArchive,
   maskPhoneNumber,
   formatKolkataTime,
@@ -31,325 +36,38 @@ app.use(
 
 app.use(cookieParser());
 app.use(express.static(path.join(process.cwd(), 'public')));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// 2. CRITICAL: Raw-body parser for VyaparGateway Webhook BEFORE express.json()
-app.post(
-  ['/api/payment/webhook', '/api/payments/vyapar-gateway/webhook'],
-  express.raw({ type: '*/*' }),
-  async (req: Request, res: Response) => {
-    try {
-      const rawBody = req.body as Buffer;
-      const provider = new VyaparGatewayProvider();
-
-      const hasSignature = !!(
-        req.headers['x-vyapargateway-signature'] ||
-        req.headers['x-signature'] ||
-        req.headers['x-hub-signature']
-      );
-
-      let verification;
-      if (hasSignature || config.PAYMENT_MODE === 'live') {
-        verification = await provider.verifyWebhook({
-          rawBody,
-          headers: req.headers as Record<string, string | string[] | undefined>,
-        });
-
-        if (!verification.isValid) {
-          console.warn('⚠️ Rejected invalid webhook signature:', verification.reason);
-          return res.status(401).json({ success: false, error: verification.reason });
-        }
-      } else {
-        // Direct JSON callback fallback for testing
-        let payload: any = {};
-        try {
-          payload = JSON.parse(rawBody.toString('utf8'));
-        } catch {}
-        const rawStatus = String(payload.status || payload.payment_status || '').toLowerCase();
-        const isSuccess = ['success', 'paid', 'confirmed', 'completed'].includes(rawStatus);
-        const clientTxnId = payload.client_txn_id || payload.order_id || payload.txn_id || '';
-        verification = {
-          isValid: true,
-          providerEventId: payload.event_id || payload.payment_id || `ev_${clientTxnId || Date.now()}`,
-          clientTxnId,
-          providerPaymentId: payload.payment_id || payload.utr || payload.txn_id || 'PROV_PAID',
-          status: isSuccess ? ('confirmed' as const) : ('failed' as const),
-          amountPaise: payload.amount ? Math.round(Number(payload.amount) * 100) : 0,
-          rawPayload: payload,
-        };
-      }
-
-      // Check event idempotency
-      const existingEvent = await db.query(
-        'SELECT id FROM payment_events WHERE provider_event_id = $1',
-        [verification.providerEventId]
-      );
-
-      if (existingEvent.rows.length > 0) {
-        return res.json({ success: true, message: 'Event already processed.', order_id: verification.clientTxnId });
-      }
-
-      // Atomic Transaction to finalize booking and allocate coupons
-      await db.withTransaction(async (client) => {
-        // Find payment attempt
-        const attemptRes = await client.query(
-          'SELECT * FROM payment_attempts WHERE client_txn_id = $1 OR provider_order_id = $1',
-          [verification.clientTxnId]
-        );
-
-        if (attemptRes.rows.length === 0) {
-          throw new Error(`Payment attempt for txn ${verification.clientTxnId} not found`);
-        }
-
-        const attempt = attemptRes.rows[0];
-
-        // Find booking
-        const bookingRes = await client.query(
-          'SELECT * FROM bookings WHERE id = $1',
-          [attempt.booking_id]
-        );
-
-        if (bookingRes.rows.length === 0) {
-          throw new Error(`Booking ${attempt.booking_id} not found`);
-        }
-
-        const booking = bookingRes.rows[0];
-
-        if (verification.status === 'confirmed') {
-          // 1. Update attempt
-          await client.query(
-            'UPDATE payment_attempts SET normalized_status = $1, provider_payment_id = $2 WHERE id = $3',
-            ['confirmed', verification.providerPaymentId || 'PROV_PAID', attempt.id]
-          );
-
-          // 2. Update booking status
-          const paidAt = new Date().toISOString();
-          await client.query(
-            'UPDATE bookings SET status = $1, paid_at = $2 WHERE id = $3',
-            ['payment_confirmed', paidAt, booking.id]
-          );
-
-          // 3. Allocate coupons atomically
-          await allocateCouponsForBooking(client, booking.id, () => db.getNextCouponSerial());
-
-          // 4. Record event
-          await client.query(
-            `INSERT INTO payment_events (
-              id, provider, provider_event_id, event_type, payload, processing_result
-            ) VALUES ($1, $2, $3, $4, $5, $6)`,
-            [
-              crypto.randomUUID(),
-              'vyapar_gateway',
-              verification.providerEventId,
-              'payment.confirmed',
-              verification.rawPayload,
-              'SUCCESS_ALLOCATED',
-            ]
-          );
-        } else {
-          // Payment failed
-          await client.query(
-            'UPDATE payment_attempts SET normalized_status = $1 WHERE id = $2',
-            ['failed', attempt.id]
-          );
-
-          await client.query(
-            'UPDATE bookings SET status = $1 WHERE id = $2',
-            ['payment_failed', booking.id]
-          );
-        }
-      });
-
-      return res.json({
-        success: true,
-        status: verification.status === 'confirmed' ? 'SUCCESS' : 'FAILED',
-        order_id: verification.clientTxnId,
-      });
-    } catch (error: any) {
-      console.error('Webhook processing failure:', error);
-      res.status(500).json({ success: false, error: error.message });
-    }
-  }
-);
-
-// 2b. Real-Time Status Endpoint for Instant Polling (/api/payment/status?order_id=...)
-app.get(['/api/payment/status', '/api/payment/webhook'], async (req: Request, res: Response) => {
-  try {
-    const orderId = (req.query.order_id || req.query.client_txn_id || req.query.id || req.query.public_id) as string;
-    if (!orderId) {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'MISSING_ORDER_ID', message: 'Please provide an order_id or client_txn_id parameter.' },
-      });
-    }
-
-    // 1. Lookup payment attempt
-    const attemptRes = await db.query(
-      'SELECT * FROM payment_attempts WHERE client_txn_id = $1 OR provider_order_id = $1',
-      [orderId]
-    );
-
-    let attempt = attemptRes.rows[0];
-    let booking: any = null;
-
-    if (attempt) {
-      const bRes = await db.query('SELECT * FROM bookings WHERE id = $1', [attempt.booking_id]);
-      booking = bRes.rows[0];
-    } else {
-      // 2. Lookup booking by publicId
-      const bRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [orderId]);
-      booking = bRes.rows[0];
-      if (booking) {
-        const attRes = await db.query('SELECT * FROM payment_attempts WHERE booking_id = $1', [booking.id]);
-        attempt = attRes.rows[0];
-      }
-    }
-
-    if (!booking) {
-      return res.status(404).json({
-        success: false,
-        status: 'FAILED',
-        error: { code: 'NOT_FOUND', message: 'Order / Booking not found.' },
-      });
-    }
-
-    // 3. Check if already confirmed
-    if (booking.status === 'payment_confirmed') {
-      const couponsRes = await db.query(
-        'SELECT coupon_number, holder_name, phone, village, status, issued_at FROM coupons WHERE booking_id = $1',
-        [booking.id]
-      );
-
-      return res.json({
-        success: true,
-        status: 'SUCCESS',
-        order_id: attempt?.client_txn_id || booking.public_id,
-        booking: {
-          publicId: booking.public_id,
-          id: booking.public_id,
-          name: booking.name,
-          phone: booking.phone,
-          village: booking.village,
-          quantity: booking.quantity,
-          totalAmount: Math.round(booking.total_amount_paise / 100),
-          paidAt: booking.paid_at,
-          status: 'confirmed',
-          coupons: couponsRes.rows,
-        },
-      });
-    }
-
-    // 4. Check if failed or expired
-    if (booking.status === 'payment_failed' || booking.status === 'expired' || booking.status === 'cancelled') {
-      return res.json({
-        success: true,
-        status: 'FAILED',
-        order_id: attempt?.client_txn_id || booking.public_id,
-        message: 'Payment was cancelled or failed.',
-      });
-    }
-
-    // 5. If still pending, perform instant real-time status check with VyaparGateway
-    if (config.VYAPAR_API_KEY && attempt && config.PAYMENT_PROVIDER === 'vyapar_gateway') {
-      try {
-        const provider = new VyaparGatewayProvider();
-        const liveStatus = await provider.fetchPaymentStatus({
-          clientTxnId: attempt.client_txn_id,
-          providerOrderId: attempt.provider_order_id,
-        });
-
-        if (liveStatus.status === 'confirmed') {
-          await db.withTransaction(async (client) => {
-            await client.query(
-              'UPDATE payment_attempts SET normalized_status = $1, provider_payment_id = $2 WHERE id = $3',
-              ['confirmed', liveStatus.providerPaymentId || 'LIVE_VERIFIED', attempt.id]
-            );
-            const paidAt = new Date().toISOString();
-            await client.query(
-              'UPDATE bookings SET status = $1, paid_at = $2 WHERE id = $3',
-              ['payment_confirmed', paidAt, booking.id]
-            );
-            await allocateCouponsForBooking(client, booking.id, () => db.getNextCouponSerial());
-          });
-
-          const couponsRes = await db.query(
-            'SELECT coupon_number, holder_name, phone, village, status, issued_at FROM coupons WHERE booking_id = $1',
-            [booking.id]
-          );
-
-          return res.json({
-            success: true,
-            status: 'SUCCESS',
-            order_id: attempt.client_txn_id,
-            booking: {
-              publicId: booking.public_id,
-              id: booking.public_id,
-              name: booking.name,
-              phone: booking.phone,
-              village: booking.village,
-              quantity: booking.quantity,
-              totalAmount: Math.round(booking.total_amount_paise / 100),
-              paidAt: new Date().toISOString(),
-              status: 'confirmed',
-              coupons: couponsRes.rows,
-            },
-          });
-        }
-      } catch (err) {
-        // Continue to return pending
-      }
-    }
-
-    // Return PENDING
-    return res.json({
-      success: true,
-      status: 'PENDING',
-      order_id: attempt?.client_txn_id || booking.public_id,
-      message: 'Payment is pending verification.',
-    });
-  } catch (err: any) {
-    console.error('Error fetching payment status:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 3. Standard JSON Parser for all other endpoints
-app.use(express.json());
-
-// 4. Mount Admin Routes
-app.use('/api/admin', adminRoutes);
-
-// 5. Public Health Check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    environment: config.NODE_ENV,
-    paymentMode: config.PAYMENT_MODE,
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// 6. Public Event Configuration (Safe Projection)
-app.get('/api/config', (req, res) => {
-  res.json(getPublicConfig());
-});
-
-// Helper for Indian Phone Normalization
+// Helper to normalize 10-digit Indian Mobile
 function normalizeIndianPhone(phone: string): string | null {
-  const cleaned = phone.replace(/\D/g, '');
-  if (cleaned.length === 10 && /^[6-9]\d{9}$/.test(cleaned)) {
-    return cleaned;
-  }
-  if (cleaned.length === 12 && cleaned.startsWith('91')) {
-    const withoutPrefix = cleaned.slice(2);
-    if (/^[6-9]\d{9}$/.test(withoutPrefix)) {
-      return withoutPrefix;
-    }
-  }
+  if (!phone) return null;
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 10) return digits;
+  if (digits.length === 12 && digits.startsWith('91')) return digits.slice(2);
+  if (digits.length === 11 && digits.startsWith('0')) return digits.slice(1);
   return null;
 }
 
-// 7. Create Public Booking & Payment Session
-app.post('/api/bookings', async (req, res) => {
+// 2. Health & Config
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/config', (req, res) => {
+  const pub = getPublicConfig();
+  res.json({
+    success: true,
+    data: pub,
+    ...pub,
+  });
+});
+
+// 3. Mount Admin Routes
+app.use('/api/admin', adminRoutes);
+
+// 4. Create Public Booking & Direct UPI Session
+app.post('/api/bookings', async (req: Request, res: Response) => {
   try {
     const gate = canAcceptPayments();
     if (!gate.allowed) {
@@ -359,7 +77,7 @@ app.post('/api/bookings', async (req, res) => {
       });
     }
 
-    const { name, phone, village, quantity } = req.body;
+    const { name, phone, village, quantity, selectedApp } = req.body;
 
     // Validate inputs
     if (!name || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 80) {
@@ -406,7 +124,7 @@ app.post('/api/bookings', async (req, res) => {
     const totalAmountPaise = unitPricePaise * qty;
 
     const publicId = `BK-${Math.floor(100000 + Math.random() * 900000)}`;
-    const clientTxnId = `ORD_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const paymentReference = `YSYS-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const bookingId = crypto.randomUUID();
 
     // Secure tokens
@@ -416,13 +134,21 @@ app.post('/api/bookings', async (req, res) => {
     const downloadToken = crypto.randomBytes(24).toString('hex');
     const downloadTokenHash = crypto.createHash('sha256').update(downloadToken).digest('hex');
 
+    // Generate canonical NPCI UPI Session & QR
+    const upiSession = await generateUpiPaymentSession({
+      publicBookingId: publicId,
+      transactionReference: paymentReference,
+      totalAmountPaise,
+      participantName: name.trim(),
+    });
+
     // Insert booking into database
     await db.query(
       `INSERT INTO bookings (
         id, public_id, participant_name, phone, village, quantity,
         unit_price_paise, total_amount_paise, status, provider_name,
-        download_token_hash, status_token_hash
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        download_token_hash, status_token_hash, selected_upi_app, payment_reference
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         bookingId,
         publicId,
@@ -432,48 +158,12 @@ app.post('/api/bookings', async (req, res) => {
         qty,
         unitPricePaise,
         totalAmountPaise,
-        'payment_pending',
-        'vyapar_gateway',
+        'payment_initiated',
+        'direct_upi',
         downloadTokenHash,
         statusTokenHash,
-      ]
-    );
-
-    // Call payment provider
-    const provider = getPaymentProvider();
-    const paymentSession = await provider.createPaymentSession({
-      bookingId,
-      publicBookingId: publicId,
-      clientTxnId,
-      amountPaise: totalAmountPaise,
-      customerName: name.trim(),
-      customerPhone: normalizedPhone,
-      customerVillage: village.trim(),
-      redirectUrl: `${config.APP_URL}/?booking=${publicId}&status_token=${statusToken}`,
-    });
-
-    // Save payment attempt
-    const attemptId = crypto.randomUUID();
-    await db.query(
-      `INSERT INTO payment_attempts (
-        id, booking_id, provider_name, client_txn_id, provider_order_id,
-        amount_paise, provider_status, normalized_status, checkout_url,
-        qr_data, upi_intent_uri, expires_at, provider_metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [
-        attemptId,
-        bookingId,
-        provider.name,
-        clientTxnId,
-        paymentSession.providerOrderId || null,
-        totalAmountPaise,
-        'PENDING',
-        'pending',
-        paymentSession.checkoutUrl || null,
-        paymentSession.qrData || null,
-        paymentSession.upiIntentUri || null,
-        paymentSession.expiresAt || null,
-        paymentSession.rawMetadata || {},
+        selectedApp || 'other_upi',
+        paymentReference,
       ]
     );
 
@@ -481,23 +171,28 @@ app.post('/api/bookings', async (req, res) => {
       success: true,
       data: {
         booking: {
+          id: bookingId,
           publicId,
           name: name.trim(),
           phone: normalizedPhone,
           village: village.trim(),
           quantity: qty,
           totalAmount: totalAmountPaise / 100,
-          status: 'payment_pending',
+          status: 'payment_initiated',
         },
         payment: {
-          clientTxnId,
-          orderId: paymentSession.providerOrderId || clientTxnId,
-          checkoutUrl: paymentSession.checkoutUrl,
-          qrData: paymentSession.qrData,
-          upiIntentUri: paymentSession.upiIntentUri,
-          expiresAt: paymentSession.expiresAt,
+          clientTxnId: paymentReference,
+          orderId: paymentReference,
+          qrDataUrl: upiSession.qrDataUrl,
+          canonicalUri: upiSession.canonicalUri,
+          payeeUpiId: upiSession.maskedPayeeUpiId,
+          rawPayeeUpiId: upiSession.payeeUpiId,
+          payeeDisplayName: upiSession.payeeDisplayName,
+          amountInr: upiSession.amountInr,
+          totalAmount: totalAmountPaise / 100,
+          expiresAt: upiSession.expiresAt,
           statusToken,
-          isTestMode: config.PAYMENT_MODE === 'test',
+          appIntents: upiSession.appIntents,
         },
       },
     });
@@ -510,11 +205,208 @@ app.post('/api/bookings', async (req, res) => {
   }
 });
 
-// 8. Booking Status Polling Endpoint
-app.get('/api/bookings/:publicId/status', async (req, res) => {
+// 5. Submit Mandatory Payment Proof (UTR + Screenshot + Consent)
+app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
-    const statusToken = (req.query.token as string) || (req.headers['x-status-token'] as string);
+    const { utr, screenshotBase64, selectedApp, consentGiven } = req.body;
+
+    // 1. Validate Consent
+    if (!consentGiven) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'CONSENT_REQUIRED', message: 'You must consent to automated image analysis and administrator verification.' },
+      });
+    }
+
+    // 2. Validate UTR
+    if (!utr || typeof utr !== 'string' || utr.trim().length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_UTR', message: 'Please enter a valid 12-digit UTR/RRN/Transaction reference number.' },
+      });
+    }
+
+    // 3. Validate Screenshot presence
+    if (!screenshotBase64 || typeof screenshotBase64 !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'MISSING_SCREENSHOT', message: 'Payment confirmation screenshot is mandatory.' },
+      });
+    }
+
+    // 4. Find Booking
+    const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
+    if (bookingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: { message: 'Booking not found.' } });
+    }
+
+    const booking = bookingRes.rows[0];
+    if (booking.status === 'payment_confirmed') {
+      return res.json({
+        success: true,
+        data: { status: 'payment_confirmed', message: 'Payment already confirmed. Coupons are available.' },
+      });
+    }
+
+    // 5. Clean & Decode Screenshot Buffer
+    const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+    const imageBuffer = Buffer.from(cleanBase64, 'base64');
+
+    // 6. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to disk
+    const processed = await processPaymentScreenshot(imageBuffer, booking.id);
+
+    // 7. Check Duplicate UTR (Global uniqueness check)
+    const normalizedUtr = normalizeUtr(utr);
+    const utrHash = crypto.createHash('sha256').update(normalizedUtr).digest('hex');
+
+    const dupUtrRes = await db.query(
+      'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3',
+      [utrHash, booking.id, 'admin_rejected']
+    );
+    const isDuplicateUtr = dupUtrRes.rows.length > 0;
+
+    // 8. Check Duplicate Screenshot Hash
+    const dupScreenRes = await db.query(
+      'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3',
+      [processed.sha256, booking.id, 'admin_rejected']
+    );
+    const isDuplicateScreenshot = dupScreenRes.rows.length > 0;
+
+    // 9. Run Gemini-Assisted OCR & Risk Analysis
+    const extraction = await analyzePaymentScreenshotWithGemini(
+      processed.sanitizedBuffer,
+      processed.mimeType
+    );
+
+    // 10. Run Deterministic Comparison Engine
+    const match = performDeterministicComparison({
+      expectedAmountPaise: booking.total_amount_paise,
+      expectedPayeeUpiId: config.PAYEE_UPI_ID,
+      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      enteredUtr: utr,
+      selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
+      extraction,
+      isDuplicateUtr,
+      isDuplicateScreenshot,
+    });
+
+    const submissionId = crypto.randomUUID();
+    const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
+
+    // Simple symmetric encryption for raw UTR at rest
+    const cipher = crypto.createCipheriv('aes-256-ecb', Buffer.from(config.FIELD_ENCRYPTION_KEY.slice(0, 32)), null);
+    let encryptedUtr = cipher.update(normalizedUtr, 'utf8', 'hex');
+    encryptedUtr += cipher.final('hex');
+
+    // 11. Persist payment submission record
+    await db.query(
+      `INSERT INTO payment_submissions (
+        id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
+        expected_payee_name, expected_amount_paise, payer_utr_hash, encrypted_utr,
+        screenshot_storage_path, screenshot_sha256, screenshot_phash, mime_type,
+        byte_size, width, height, status, gemini_extraction, deterministic_comparison,
+        risk_score, reason_codes, ai_model_version
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
+      [
+        submissionId,
+        booking.id,
+        paymentRef,
+        selectedApp || booking.selected_upi_app || 'other_upi',
+        config.PAYEE_UPI_ID,
+        config.PAYEE_DISPLAY_NAME,
+        booking.total_amount_paise,
+        utrHash,
+        encryptedUtr,
+        processed.storagePath,
+        processed.sha256,
+        processed.phash,
+        processed.mimeType,
+        processed.byteSize,
+        processed.width,
+        processed.height,
+        match.nextStatus,
+        JSON.stringify(extraction),
+        JSON.stringify(match),
+        match.riskScore,
+        match.reasonCodes,
+        config.GEMINI_MODEL,
+      ]
+    );
+
+    // 12. Record verification run
+    const runId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO payment_verification_runs (
+        id, submission_id, stage, status, confidence, reason_codes, result_json, completed_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        runId,
+        submissionId,
+        'gemini_and_deterministic',
+        match.passed ? 'passed' : 'flagged',
+        extraction.field_confidence?.amount || 0.8,
+        match.reasonCodes,
+        JSON.stringify({ match, extractionSummary: { utr: extraction.utr_or_rrn, amount: extraction.amount } }),
+        new Date().toISOString(),
+      ]
+    );
+
+    if (match.passed) {
+      // Step 6: Idempotent atomic automatic finalization and coupon issuance
+      const finalResult = await finalizeVerifiedSubmission({
+        submissionId,
+        bookingId: booking.id,
+        decisionVersion: 'v1-gemini-deterministic-auto',
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          submissionId,
+          publicId: booking.public_id,
+          status: 'proof_verified',
+          message: 'Payment proof verified, coupons ready.',
+          coupons: finalResult.coupons,
+          details: match.details,
+        },
+      });
+    } else {
+      // Step 5 Fail-Closed: mark booking verification_failed
+      await db.query(
+        'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
+        ['verification_failed', new Date().toISOString(), booking.id]
+      );
+
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'VERIFICATION_FAILED',
+          message: match.userMessage,
+          reasonCodes: match.reasonCodes,
+        },
+        data: {
+          submissionId,
+          publicId: booking.public_id,
+          status: 'verification_failed',
+          message: match.userMessage,
+          details: match.details,
+        },
+      });
+    }
+  } catch (error: any) {
+    console.error('Payment proof submission error:', error);
+    res.status(500).json({
+      success: false,
+      error: { code: 'SUBMISSION_FAILED', message: error.message || 'Failed to process payment proof.' },
+    });
+  }
+});
+
+// 6. Booking Status Polling Endpoint
+app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) => {
+  try {
+    const { publicId } = req.params;
 
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
     if (bookingRes.rows.length === 0) {
@@ -523,52 +415,9 @@ app.get('/api/bookings/:publicId/status', async (req, res) => {
 
     const booking = bookingRes.rows[0];
 
-    // Verify status token
-    if (statusToken) {
-      const hash = crypto.createHash('sha256').update(statusToken).digest('hex');
-      if (hash !== booking.status_token_hash && hash !== booking.download_token_hash) {
-        return res.status(403).json({ success: false, error: { message: 'Invalid status token.' } });
-      }
-    }
-
-    // If still pending, check status with provider as fallback reconciliation
-    if (booking.status === 'payment_pending') {
-      const attRes = await db.query(
-        'SELECT * FROM payment_attempts WHERE booking_id = $1 ORDER BY created_at DESC LIMIT 1',
-        [booking.id]
-      );
-      if (attRes.rows.length > 0) {
-        const attempt = attRes.rows[0];
-        try {
-          const provider = getPaymentProvider();
-          const providerStatus = await provider.fetchPaymentStatus({
-            clientTxnId: attempt.client_txn_id,
-            providerOrderId: attempt.provider_order_id,
-          });
-
-          if (providerStatus.status === 'confirmed') {
-            await db.withTransaction(async (client) => {
-              await client.query(
-                'UPDATE payment_attempts SET normalized_status = $1, provider_payment_id = $2 WHERE id = $3',
-                ['confirmed', providerStatus.providerPaymentId || 'PROV_RECONCILED', attempt.id]
-              );
-              await client.query(
-                'UPDATE bookings SET status = $1, paid_at = $2 WHERE id = $3',
-                ['payment_confirmed', new Date().toISOString(), booking.id]
-              );
-              await allocateCouponsForBooking(client, booking.id, () => db.getNextCouponSerial());
-            });
-            booking.status = 'payment_confirmed';
-          }
-        } catch {
-          // ignore provider status check errors on polling
-        }
-      }
-    }
-
-    // If confirmed, retrieve issued coupons
+    const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
     let coupons: any[] = [];
-    if (booking.status === 'payment_confirmed') {
+    if (isVerified) {
       const couponsRes = await db.query(
         'SELECT coupon_number, holder_name, phone, village, ticket_index, total_quantity, issued_at FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
         [booking.id]
@@ -576,17 +425,37 @@ app.get('/api/bookings/:publicId/status', async (req, res) => {
       coupons = couponsRes.rows;
     }
 
+    // Get latest submission status message if any
+    const subRes = await db.query(
+      'SELECT status, reason_codes, admin_review_note FROM payment_submissions WHERE booking_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [booking.id]
+    );
+    const latestSub = subRes.rows[0];
+
+    let userMessage = 'Payment not yet submitted';
+    if (booking.status === 'ai_checking' || booking.status === 'proof_submitted') {
+      userMessage = 'Checking uploaded proof...';
+    } else if (isVerified) {
+      userMessage = 'Payment proof verified, coupons ready.';
+    } else if (booking.status === 'verification_failed') {
+      userMessage = latestSub?.reason_codes?.length
+        ? `Verification failed: ${latestSub.reason_codes.join(', ')}. Please correct and resubmit.`
+        : 'Verification failed, correct the highlighted issue and resubmit.';
+    }
+
     res.json({
       success: true,
       data: {
         publicId: booking.public_id,
-        status: booking.status,
-        isConfirmed: booking.status === 'payment_confirmed',
+        status: isVerified ? 'proof_verified' : booking.status,
+        isConfirmed: isVerified,
+        isVerified,
         quantity: booking.quantity,
         totalAmount: booking.total_amount_paise / 100,
-        paidAt: booking.paid_at,
+        paidAt: booking.verified_at || booking.paid_at,
+        message: userMessage,
         coupons,
-        downloadUrl: booking.status === 'payment_confirmed' ? `/api/bookings/${booking.public_id}/download-all` : null,
+        downloadUrl: isVerified ? `/api/bookings/${booking.public_id}/download-all` : null,
       },
     });
   } catch (error: any) {
@@ -595,8 +464,34 @@ app.get('/api/bookings/:publicId/status', async (req, res) => {
   }
 });
 
-// 9. Public Coupon Verification Tool (PII Protected)
-app.get('/api/coupons/:couponNumber/verify', async (req, res) => {
+// 7. Get Issued Coupons for Booking
+app.get('/api/bookings/:publicId/coupons', async (req: Request, res: Response) => {
+  try {
+    const { publicId } = req.params;
+    const bookingRes = await db.query('SELECT id, status FROM bookings WHERE public_id = $1', [publicId]);
+    if (bookingRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: { message: 'Booking not found.' } });
+    }
+
+    const booking = bookingRes.rows[0];
+    const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
+    if (!isVerified) {
+      return res.status(403).json({ success: false, error: { message: 'Payment proof not verified yet.' } });
+    }
+
+    const couponsRes = await db.query(
+      'SELECT coupon_number, holder_name, phone, village, ticket_index, total_quantity, issued_at FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
+      [booking.id]
+    );
+
+    res.json({ success: true, data: couponsRes.rows });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: { message: error.message } });
+  }
+});
+
+// 8. Public Coupon Verification (PII Protected)
+app.get('/api/coupons/:couponNumber/verify', async (req: Request, res: Response) => {
   try {
     const { couponNumber } = req.params;
     const cleanNumber = couponNumber.trim().toUpperCase();
@@ -610,18 +505,18 @@ app.get('/api/coupons/:couponNumber/verify', async (req, res) => {
     }
 
     const coupon = couponRes.rows[0];
-    const bookingRes = await db.query('SELECT status, paid_at, public_id FROM bookings WHERE id = $1', [
+    const bookingRes = await db.query('SELECT status, paid_at, verified_at, public_id FROM bookings WHERE id = $1', [
       coupon.booking_id,
     ]);
     const booking = bookingRes.rows[0];
 
-    const isValid = coupon.status === 'valid' && booking?.status === 'payment_confirmed';
+    const isVerified = (booking?.status === 'proof_verified' || booking?.status === 'payment_confirmed') && coupon.status === 'valid';
 
     return res.json({
       success: true,
       data: {
         couponNumber: coupon.coupon_number,
-        isValid,
+        isValid: isVerified,
         status: coupon.status,
         participantName: coupon.holder_name,
         maskedPhone: maskPhoneNumber(coupon.phone),
@@ -640,12 +535,17 @@ app.get('/api/coupons/:couponNumber/verify', async (req, res) => {
   }
 });
 
-// 10. Public Download Single Ticket PDF
-app.get('/api/coupons/:couponNumber/download', async (req, res) => {
+// 9. Download Single Ticket (PDF, PNG, JPEG)
+app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Response) => {
   try {
     const { couponNumber } = req.params;
-    const cleanNumber = couponNumber.trim().toUpperCase();
+    const format = ((req.query.format as string) || 'pdf').toLowerCase();
 
+    if (!['pdf', 'png', 'jpeg', 'jpg'].includes(format)) {
+      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg.');
+    }
+
+    const cleanNumber = couponNumber.trim().toUpperCase();
     const couponRes = await db.query('SELECT * FROM coupons WHERE coupon_number = $1', [cleanNumber]);
     if (couponRes.rows.length === 0) {
       return res.status(404).send('Coupon not found');
@@ -655,11 +555,12 @@ app.get('/api/coupons/:couponNumber/download', async (req, res) => {
     const bookingRes = await db.query('SELECT * FROM bookings WHERE id = $1', [coupon.booking_id]);
     const booking = bookingRes.rows[0];
 
-    if (booking.status !== 'payment_confirmed' || coupon.status !== 'valid') {
-      return res.status(403).send('Ticket cannot be downloaded until payment is confirmed.');
+    const isVerified = (booking?.status === 'proof_verified' || booking?.status === 'payment_confirmed') && coupon.status === 'valid';
+    if (!isVerified) {
+      return res.status(403).send('Ticket cannot be downloaded until payment proof is verified.');
     }
 
-    const pdfBuffer = await renderTicketPdf({
+    const ticketData = {
       couponNumber: coupon.coupon_number,
       participantName: coupon.holder_name,
       phone: coupon.phone,
@@ -667,20 +568,29 @@ app.get('/api/coupons/:couponNumber/download', async (req, res) => {
       bookingPublicId: booking.public_id,
       ticketIndex: coupon.ticket_index,
       totalQuantity: coupon.total_quantity,
-      paidAt: booking.paid_at,
-    });
+      paidAt: booking.verified_at || booking.paid_at,
+    };
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.pdf"`);
-    res.send(pdfBuffer);
+    if (format === 'pdf') {
+      const pdfBuffer = await renderTicketPdf(ticketData);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.pdf"`);
+      return res.send(pdfBuffer);
+    }
+
+    const targetRaster = format === 'png' ? 'png' : 'jpeg';
+    const rasterBuffer = await renderTicketRaster(ticketData, targetRaster);
+    res.setHeader('Content-Type', targetRaster === 'png' ? 'image/png' : 'image/jpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.${targetRaster === 'png' ? 'png' : 'jpg'}"`);
+    return res.send(rasterBuffer);
   } catch (error: any) {
     console.error('Download ticket error:', error);
-    res.status(500).send('Failed to generate ticket PDF.');
+    res.status(500).send('Failed to generate ticket.');
   }
 });
 
-// 11. Download All Tickets for a Booking (ZIP or Multi-page PDF)
-app.get('/api/bookings/:publicId/download-all', async (req, res) => {
+// 10. Download All Tickets for a Booking (ZIP or Multi-page PDF)
+app.get('/api/bookings/:publicId/download-all', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
@@ -690,8 +600,9 @@ app.get('/api/bookings/:publicId/download-all', async (req, res) => {
     }
 
     const booking = bookingRes.rows[0];
-    if (booking.status !== 'payment_confirmed') {
-      return res.status(403).send('Tickets cannot be downloaded until payment is confirmed.');
+    const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
+    if (!isVerified) {
+      return res.status(403).send('Tickets cannot be downloaded until payment proof is verified.');
     }
 
     const couponsRes = await db.query(
@@ -707,7 +618,7 @@ app.get('/api/bookings/:publicId/download-all', async (req, res) => {
       bookingPublicId: booking.public_id,
       ticketIndex: c.ticket_index,
       totalQuantity: c.total_quantity,
-      paidAt: booking.paid_at,
+      paidAt: booking.verified_at || booking.paid_at,
     }));
 
     if (tickets.length === 1) {
@@ -717,7 +628,7 @@ app.get('/api/bookings/:publicId/download-all', async (req, res) => {
       return res.send(pdfBuffer);
     }
 
-    // Multiple tickets: send ZIP
+    // Multiple tickets: send ZIP package containing PDFs, PNGs, and JPEGs
     const zipBuffer = await createTicketsZipArchive(tickets);
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="tickets_${booking.public_id}.zip"`);
@@ -728,55 +639,66 @@ app.get('/api/bookings/:publicId/download-all', async (req, res) => {
   }
 });
 
-// 12. Test Mode Simulated Payment Confirmation (Development & Automated Tests ONLY)
-app.post('/api/test-mode/simulate-payment', async (req, res) => {
+// 11. Test Mode Simulated Proof Verification (Automated Tests ONLY)
+app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate-admin-confirm', '/api/test-mode/simulate-payment'], async (req: Request, res: Response) => {
   if (!process.env.VITEST && process.env.NODE_ENV !== 'test') {
-    if (config.NODE_ENV === 'production' || config.PAYMENT_MODE === 'live') {
-      return res.status(403).json({ error: 'Prohibited in production mode.' });
-    }
+    return res.status(403).json({ error: 'Prohibited in production mode.' });
   }
 
   try {
-    const { clientTxnId } = req.body;
-    if (!clientTxnId) {
-      return res.status(400).json({ error: 'clientTxnId required' });
+    const { submissionId, bookingPublicId, clientTxnId } = req.body;
+    let targetSubId = submissionId;
+    let targetBookingId = '';
+
+    if (bookingPublicId) {
+      const bRes = await db.query('SELECT id FROM bookings WHERE public_id = $1', [bookingPublicId]);
+      if (bRes.rows.length > 0) targetBookingId = bRes.rows[0].id;
+    } else if (clientTxnId) {
+      const bRes = await db.query('SELECT id FROM bookings WHERE payment_reference = $1 OR public_id = $1', [clientTxnId]);
+      if (bRes.rows.length > 0) targetBookingId = bRes.rows[0].id;
     }
 
-    const attemptRes = await db.query(
-      'SELECT * FROM payment_attempts WHERE client_txn_id = $1',
-      [clientTxnId]
-    );
-
-    if (attemptRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Attempt not found' });
+    if (!targetBookingId) {
+      // Find latest unverified booking
+      const latestB = await db.query('SELECT id FROM bookings WHERE status != $1 ORDER BY created_at DESC LIMIT 1', ['proof_verified']);
+      if (latestB.rows.length > 0) targetBookingId = latestB.rows[0].id;
     }
 
-    const attempt = attemptRes.rows[0];
+    if (!targetSubId && targetBookingId) {
+      const sRes = await db.query('SELECT id FROM payment_submissions WHERE booking_id = $1 LIMIT 1', [targetBookingId]);
+      if (sRes.rows.length > 0) {
+        targetSubId = sRes.rows[0].id;
+      } else {
+        targetSubId = crypto.randomUUID();
+        const simUtrHash = `sim-${crypto.randomBytes(8).toString('hex')}`;
+        await db.query(
+          `INSERT INTO payment_submissions (
+            id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
+            expected_payee_name, expected_amount_paise, payer_utr_hash, status
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [targetSubId, targetBookingId, 'YSYS-SIM-REF', 'phonepe', config.PAYEE_UPI_ID, config.PAYEE_DISPLAY_NAME, 5000, simUtrHash, 'proof_submitted']
+        );
+      }
+    }
 
-    await db.withTransaction(async (client) => {
-      await client.query(
-        'UPDATE payment_attempts SET normalized_status = $1, provider_payment_id = $2 WHERE id = $3',
-        ['confirmed', `sim_pay_${Date.now()}`, attempt.id]
-      );
+    if (!targetSubId || !targetBookingId) {
+      return res.status(400).json({ error: 'No booking or submission found to verify.' });
+    }
 
-      const paidAt = new Date().toISOString();
-      await client.query(
-        'UPDATE bookings SET status = $1, paid_at = $2 WHERE id = $3',
-        ['payment_confirmed', paidAt, attempt.booking_id]
-      );
-
-      await allocateCouponsForBooking(client, attempt.booking_id, () => db.getNextCouponSerial());
+    const result = await finalizeVerifiedSubmission({
+      submissionId: targetSubId,
+      bookingId: targetBookingId,
+      decisionVersion: 'test-mode-simulation',
     });
 
-    MockPaymentProvider.confirmTxn(clientTxnId);
-
-    res.json({ success: true, message: 'Simulated payment confirmed in TEST MODE.' });
+    res.json({ success: true, data: result });
   } catch (err: any) {
+    console.error('SIMULATE ERROR:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 13. Mount Vite middleware or Static Bundle
+// 12. Mount Vite middleware or Static Bundle
 async function startServer() {
   if (config.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -794,7 +716,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Yuva Shakti Portal running on http://0.0.0.0:${PORT}`);
-    console.log(`💳 Payment Provider: ${config.PAYMENT_PROVIDER} [Mode: ${config.PAYMENT_MODE}]`);
+    console.log(`💳 Payment Mode: ${config.PAYMENT_MODE} [Payee: ${config.PAYEE_UPI_ID}]`);
   });
 }
 
