@@ -30,6 +30,7 @@ app.use(
 );
 
 app.use(cookieParser());
+app.use(express.static(path.join(process.cwd(), 'public')));
 
 // 2. CRITICAL: Raw-body parser for VyaparGateway Webhook BEFORE express.json()
 app.post(

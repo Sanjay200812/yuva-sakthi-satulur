@@ -15,8 +15,12 @@ export const Footer: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-12 gap-8 pb-8 border-b border-slate-800/80 items-center">
           {/* Brand Info */}
           <div className="md:col-span-6 space-y-2 text-center md:text-left">
-            <div className="flex items-center justify-center md:justify-start gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
+            <div className="flex items-center justify-center md:justify-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-amber-400 to-yellow-600 p-[1.5px] shadow-[0_0_15px_rgba(245,158,11,0.3)] shrink-0">
+                <div className="w-full h-full bg-[#070B19] rounded-[10px] overflow-hidden flex items-center justify-center">
+                  <img src="/logo.jpeg" alt="Yuva Shakti Satulur" className="w-full h-full object-cover" />
+                </div>
+              </div>
               <h4 className="text-xl font-black font-display text-white tracking-tight">
                 YUVA SHAKTI YOUTH SATULUR
               </h4>

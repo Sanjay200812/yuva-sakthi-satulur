@@ -39,9 +39,13 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenBooking, onOpenVerify }) =
       <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between">
         {/* Brand Logo & Name */}
         <a href="#" className="flex items-center gap-2.5 group">
-          <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-purple-600 via-indigo-600 to-amber-500 p-[1.5px] shadow-[0_0_15px_rgba(168,85,247,0.4)] group-hover:shadow-[0_0_20px_rgba(245,158,11,0.6)] transition-all">
-            <div className="w-full h-full bg-[#070B19] rounded-[10px] flex items-center justify-center">
-              <span className="font-display font-black text-xs text-amber-400 tracking-tighter">YS</span>
+          <div className="relative flex items-center justify-center w-10 h-10 sm:w-11 sm:h-11 rounded-xl bg-gradient-to-br from-amber-400 via-yellow-500 to-purple-600 p-[1.5px] shadow-[0_0_15px_rgba(245,158,11,0.4)] group-hover:shadow-[0_0_22px_rgba(245,158,11,0.7)] transition-all">
+            <div className="w-full h-full bg-[#070B19] rounded-[10px] overflow-hidden flex items-center justify-center">
+              <img
+                src="/logo.jpeg"
+                alt="Yuva Shakti Satulur Emblem"
+                className="w-full h-full object-cover rounded-[10px] transform group-hover:scale-105 transition-transform duration-300"
+              />
             </div>
             <div className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-amber-400 rounded-full animate-ping" />
           </div>

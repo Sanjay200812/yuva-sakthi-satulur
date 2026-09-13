@@ -59,9 +59,13 @@ export const InteractiveTicket: React.FC<InteractiveTicketProps> = ({
         {/* Top Header Row of Ticket */}
         <div className="flex items-center justify-between border-b border-purple-500/20 pb-3.5 mb-4">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-purple-600 to-amber-500 p-[1px] shadow-sm">
-              <div className="w-full h-full bg-[#070B19] rounded-[7px] flex items-center justify-center">
-                <Flame className="w-4 h-4 text-amber-400" />
+            <div className="w-9 h-9 rounded-lg bg-gradient-to-tr from-amber-400 to-yellow-600 p-[1px] shadow-sm">
+              <div className="w-full h-full bg-[#070B19] rounded-[7px] overflow-hidden flex items-center justify-center">
+                <img
+                  src="/logo.jpeg"
+                  alt="Yuva Shakti Satulur"
+                  className="w-full h-full object-cover rounded-[7px]"
+                />
               </div>
             </div>
             <div>

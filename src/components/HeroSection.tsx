@@ -19,16 +19,18 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onOpenBooking, onExplo
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-8 items-center">
           {/* Left Column: Typography & Action */}
           <div className="lg:col-span-7 text-center lg:text-left space-y-6">
-            {/* Top Tag / Pill */}
+            {/* Top Tag / Pill with Official Logo */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.5 }}
-              className="inline-flex flex-wrap items-center justify-center lg:justify-start gap-2"
+              className="inline-flex flex-wrap items-center justify-center lg:justify-start gap-2.5"
             >
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-950/80 border border-purple-500/40 text-purple-200 text-xs font-semibold tracking-wide shadow-sm">
-                <Sparkles className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
-                <span>YUVA SHAKTI YOUTH SATULUR</span>
+              <span className="inline-flex items-center gap-2 pl-1 pr-3.5 py-1 rounded-full bg-purple-950/90 border border-amber-400/40 text-purple-200 text-xs font-bold tracking-wide shadow-[0_0_15px_rgba(245,158,11,0.25)]">
+                <span className="w-6 h-6 rounded-full overflow-hidden border border-amber-400/60 shadow-sm shrink-0 flex items-center justify-center bg-[#070B19]">
+                  <img src="/logo.jpeg" alt="Emblem" className="w-full h-full object-cover" />
+                </span>
+                <span className="gold-gradient-text font-display font-extrabold">YUVA SHAKTI YOUTH SATULUR</span>
               </span>
 
               <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-300 text-xs font-bold tracking-wide shadow-sm">

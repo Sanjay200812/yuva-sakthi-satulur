@@ -88,9 +88,13 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
           {/* Ticket Top Header */}
           <div className="flex items-center justify-between pb-3 border-b border-purple-500/30">
             <div className="flex items-center gap-2">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 to-yellow-600 p-[1px]">
-                <div className="w-full h-full bg-[#070B19] rounded-[11px] flex items-center justify-center">
-                  <Flame className="w-4 h-4 text-amber-400" />
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-400 to-yellow-600 p-[1px] shadow-sm">
+                <div className="w-full h-full bg-[#070B19] rounded-[10px] overflow-hidden flex items-center justify-center">
+                  <img
+                    src="/logo.jpeg"
+                    alt="Yuva Shakti Satulur"
+                    className="w-full h-full object-cover rounded-[10px]"
+                  />
                 </div>
               </div>
               <div>

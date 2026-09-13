@@ -17,9 +17,16 @@ export const AboutSection: React.FC = () => {
               <span>COMMUNITY INITIATIVE</span>
             </div>
 
-            <h3 className="text-3xl sm:text-4xl font-black font-display text-white tracking-tight">
-              YUVA SHAKTI <span className="gold-gradient-text">YOUTH SATULUR</span>
-            </h3>
+            <div className="flex items-center gap-3.5 pt-1">
+              <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-amber-400 via-yellow-500 to-purple-600 p-[1.5px] shadow-[0_0_20px_rgba(245,158,11,0.35)] shrink-0">
+                <div className="w-full h-full bg-[#070B19] rounded-[14px] overflow-hidden flex items-center justify-center">
+                  <img src="/logo.jpeg" alt="Yuva Shakti Satulur Emblem" className="w-full h-full object-cover" />
+                </div>
+              </div>
+              <h3 className="text-3xl sm:text-4xl font-black font-display text-white tracking-tight">
+                YUVA SHAKTI <span className="gold-gradient-text">YOUTH SATULUR</span>
+              </h3>
+            </div>
 
             <p className="text-sm sm:text-base text-slate-300 leading-relaxed">
               <strong className="text-white">Yuva Shakti Youth Satulur</strong> is an energetic youth welfare and cultural association based in Satulur, Andhra Pradesh. We come together during festive occasions to celebrate community harmony, organize grand events, and spread joy across our village and neighboring regions.

@@ -196,11 +196,18 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           <X className="w-5 h-5" />
         </button>
 
-        {/* Modal Header */}
-        <div className="text-center space-y-1.5 mb-5">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-950 border border-purple-500/30 text-purple-300 text-[11px] font-bold uppercase tracking-wider">
-            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-            <span>YUVA SHAKTI YOUTH SATULUR</span>
+        {/* Header */}
+        <div className="text-center space-y-2 mb-5">
+          <div className="flex items-center justify-center gap-2">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-400 to-yellow-500 p-[1.5px] shadow-[0_0_12px_rgba(245,158,11,0.4)]">
+              <div className="w-full h-full bg-[#070B19] rounded-[9px] overflow-hidden flex items-center justify-center">
+                <img src="/logo.jpeg" alt="Yuva Shakti Logo" className="w-full h-full object-cover" />
+              </div>
+            </div>
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-950 border border-purple-500/30 text-purple-300 text-[11px] font-bold uppercase tracking-wider">
+              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+              <span>YUVA SHAKTI YOUTH SATULUR</span>
+            </div>
           </div>
           <h3 className="text-xl sm:text-2xl font-black font-display text-white">
             Get Lucky Draw <span className="gold-gradient-text">Coupon</span>

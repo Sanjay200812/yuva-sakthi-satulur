@@ -103,9 +103,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
       {/* Top Navbar */}
       <header className="sticky top-0 z-40 bg-[#0A0E24]/90 backdrop-blur-md border-b border-amber-400/20 px-4 sm:px-8 py-3.5 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 to-yellow-600 p-[1px]">
-            <div className="w-full h-full bg-[#070B19] rounded-[11px] flex items-center justify-center">
-              <ShieldCheck className="w-5 h-5 text-amber-400" />
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-400 to-yellow-600 p-[1px] shadow-sm">
+            <div className="w-full h-full bg-[#070B19] rounded-[10px] overflow-hidden flex items-center justify-center">
+              <img src="/logo.jpeg" alt="Yuva Shakti" className="w-full h-full object-cover" />
             </div>
           </div>
           <div>

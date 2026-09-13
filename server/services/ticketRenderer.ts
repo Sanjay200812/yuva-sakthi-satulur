@@ -101,8 +101,10 @@ export async function renderTicketPdf(data: TicketRenderData): Promise<Buffer> {
     });
   }
 
-  // Embed Logo Image if present in root
-  const logoPath = path.resolve(process.cwd(), 'logo.jpeg');
+  // Embed Logo Image if present in root or public directory
+  const logoPath = fs.existsSync(path.resolve(process.cwd(), 'logo.jpeg'))
+    ? path.resolve(process.cwd(), 'logo.jpeg')
+    : path.resolve(process.cwd(), 'public', 'logo.jpeg');
   if (fs.existsSync(logoPath)) {
     try {
       const logoBytes = fs.readFileSync(logoPath);

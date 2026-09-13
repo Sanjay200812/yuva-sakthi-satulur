@@ -47,12 +47,14 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess, onBackTo
       <div className="relative w-full max-w-md bg-[#0D132D]/90 border border-amber-400/30 rounded-3xl p-7 sm:p-9 shadow-2xl backdrop-blur-xl">
         {/* Header */}
         <div className="text-center mb-8">
-          <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-gradient-to-tr from-amber-500 to-yellow-600 p-[1px] shadow-lg">
-            <div className="w-full h-full bg-[#070B19] rounded-[15px] flex items-center justify-center">
-              <ShieldCheck className="w-7 h-7 text-amber-400" />
+          <div className="w-16 h-16 mx-auto mb-3 rounded-2xl bg-gradient-to-tr from-amber-400 via-yellow-500 to-purple-600 p-[1.5px] shadow-[0_0_20px_rgba(245,158,11,0.4)]">
+            <div className="w-full h-full bg-[#070B19] rounded-[14px] overflow-hidden flex items-center justify-center">
+              <img src="/logo.jpeg" alt="Yuva Shakti Admin" className="w-full h-full object-cover" />
             </div>
           </div>
-          <h2 className="text-2xl font-black font-display text-white tracking-tight">Admin Portal</h2>
+          <h1 className="text-2xl font-black text-white font-display">
+            Yuva Shakti <span className="text-amber-400">Admin</span>
+          </h1>
           <p className="text-xs text-slate-400 mt-1">Yuva Shakti Youth Satulur • Management Desk</p>
         </div>
 
