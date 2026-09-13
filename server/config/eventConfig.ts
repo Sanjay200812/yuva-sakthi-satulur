@@ -7,7 +7,16 @@ const envSchema = z.object({
   // Runtime environment
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.string().default('3000'),
-  APP_URL: z.string().url().default('http://localhost:3000'),
+  APP_URL: z.preprocess((val) => {
+    if (typeof val === 'string') {
+      let trimmed = val.trim();
+      if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+        trimmed = `https://${trimmed}`;
+      }
+      return trimmed.replace(/\/+$/, '');
+    }
+    return val;
+  }, z.string().url()).default('http://localhost:3000'),
 
   // Security
   SESSION_SECRET: z.string().min(16).default('super-secret-yuva-shakti-key-change-in-prod-min-16-chars'),

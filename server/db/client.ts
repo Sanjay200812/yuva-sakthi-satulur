@@ -16,7 +16,7 @@ export interface TransactionalDB {
 // PostgreSQL Real Connection Pool
 let pool: pg.Pool | null = null;
 
-if (config.DATABASE_URL) {
+if (config.DATABASE_URL && process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
   pool = new pg.Pool({
     connectionString: config.DATABASE_URL,
     ssl: config.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
