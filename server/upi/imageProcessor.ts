@@ -1,8 +1,9 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { getSharp } from '../utils/sharpHelper.ts';
-import { config } from '../config/eventConfig.ts';
+import { config, isAnonKey } from '../config/eventConfig.ts';
 
 export interface ProcessedImageResult {
   sanitizedBuffer: Buffer;
@@ -13,6 +14,29 @@ export interface ProcessedImageResult {
   byteSize: number;
   width: number;
   height: number;
+}
+
+/**
+ * Creates authenticated Supabase client for private storage operations.
+ */
+export function getSupabaseStorageClient(): SupabaseClient {
+  const url = (config.SUPABASE_URL || '').trim();
+  const key = (config.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
+  if (!url || !key) {
+    throw new Error('STORAGE_NOT_CONFIGURED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing.');
+  }
+
+  if (isAnonKey(key)) {
+    throw new Error('STORAGE_NOT_CONFIGURED: Anon key supplied as SUPABASE_SERVICE_ROLE_KEY. Service role key is mandatory for storage operations.');
+  }
+
+  return createClient(url, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
 }
 
 /**
@@ -133,7 +157,7 @@ async function uploadToSupabaseStorage(
 ): Promise<boolean> {
   const isProduction = config.NODE_ENV === 'production';
 
-  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || !config.PAYMENT_PROOF_BUCKET) {
+  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || config.PAYMENT_PROOF_BUCKET !== 'payment-proofs') {
     if (isProduction) {
       console.error(`Payment proof storage failed:
 provider=supabase
@@ -147,41 +171,46 @@ bookingId=${bookingId}`);
     return false;
   }
 
-  try {
-    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/${config.PAYMENT_PROOF_BUCKET}/${objectPath}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
-        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
-        'Content-Type': mimeType,
-        'x-upsert': 'true',
-      },
-      body: buffer,
-    });
+  if (isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY)) {
+    if (isProduction) {
+      console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET}
+status=401
+message=Anon key supplied as SUPABASE_SERVICE_ROLE_KEY
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+      throw new Error('STORAGE_NOT_CONFIGURED: Anon key cannot be used as SUPABASE_SERVICE_ROLE_KEY.');
+    }
+    return false;
+  }
 
-    if (res.ok) {
+  try {
+    const supabase = getSupabaseStorageClient();
+    const { data, error } = await supabase.storage
+      .from(config.PAYMENT_PROOF_BUCKET)
+      .upload(objectPath, buffer, {
+        contentType: mimeType,
+        upsert: false,
+      });
+
+    if (!error && data) {
       return true;
     }
 
-    let safeErrorMessage = res.statusText;
-    try {
-      const errData = await res.json();
-      safeErrorMessage = errData.message || errData.error || res.statusText;
-    } catch {
-      // Ignore JSON parse failure
-    }
+    const statusCode = (error as any)?.status || (error as any)?.statusCode || '400';
+    const safeErrorMessage = error?.message || 'Storage upload error';
 
     console.error(`Payment proof storage failed:
 provider=supabase
 bucket=${config.PAYMENT_PROOF_BUCKET}
-status=${res.status}
+status=${statusCode}
 message=${safeErrorMessage}
 objectPath=${objectPath}
 bookingId=${bookingId}`);
 
     if (isProduction) {
-      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${res.status}: ${safeErrorMessage}`);
+      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${statusCode}: ${safeErrorMessage}`);
     }
     return false;
   } catch (err: any) {
@@ -213,48 +242,44 @@ export async function checkStorageHealth(): Promise<{
   ready: boolean;
   error?: string;
 }> {
-  const isConfigured = Boolean(config.SUPABASE_URL && config.SUPABASE_SERVICE_ROLE_KEY && config.PAYMENT_PROOF_BUCKET);
+  const isConfigured = Boolean(
+    config.SUPABASE_URL &&
+    config.SUPABASE_SERVICE_ROLE_KEY &&
+    !isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY) &&
+    config.PAYMENT_PROOF_BUCKET === 'payment-proofs'
+  );
+
   if (!isConfigured) {
     return {
       configured: false,
       provider: 'supabase',
       bucket: config.PAYMENT_PROOF_BUCKET || 'payment-proofs',
       ready: false,
-      error: 'Supabase storage credentials or bucket are not configured',
+      error: isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY)
+        ? 'Anon key supplied as SUPABASE_SERVICE_ROLE_KEY'
+        : 'Supabase storage credentials or bucket are not configured',
     };
   }
 
   try {
-    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/bucket/${config.PAYMENT_PROOF_BUCKET}`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
-        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
-      },
-    });
+    const supabase = getSupabaseStorageClient();
+    const { data, error } = await supabase.storage.getBucket(config.PAYMENT_PROOF_BUCKET);
 
-    if (res.ok) {
+    if (error || !data) {
       return {
         configured: true,
         provider: 'supabase',
         bucket: config.PAYMENT_PROOF_BUCKET,
-        ready: true,
+        ready: false,
+        error: error?.message || 'Bucket not found or permission denied',
       };
     }
-
-    let msg = res.statusText;
-    try {
-      const data = await res.json();
-      msg = data.message || data.error || res.statusText;
-    } catch {}
 
     return {
       configured: true,
       provider: 'supabase',
       bucket: config.PAYMENT_PROOF_BUCKET,
-      ready: false,
-      error: `Supabase bucket status ${res.status}: ${msg}`,
+      ready: true,
     };
   } catch (err: any) {
     return {
@@ -262,7 +287,7 @@ export async function checkStorageHealth(): Promise<{
       provider: 'supabase',
       bucket: config.PAYMENT_PROOF_BUCKET,
       ready: false,
-      error: err?.message || 'Network error connecting to Supabase Storage',
+      error: err?.message || 'Exception connecting to Supabase Storage',
     };
   }
 }
@@ -276,22 +301,17 @@ export async function getSignedScreenshotUrl(storagePath: string, expiresIn = 30
     return null;
   }
   try {
-    const cleanPath = storagePath.startsWith('supabase:') ? storagePath.replace('supabase:', '') : storagePath;
-    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/sign/${config.PAYMENT_PROOF_BUCKET}/${cleanPath}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
-        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ expiresIn }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.signedURL) {
-        return `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1${data.signedURL}`;
-      }
+    const cleanPath = storagePath.startsWith('supabase:') ? storagePath.replace(/^supabase:/, '') : storagePath;
+    const supabase = getSupabaseStorageClient();
+    const { data, error } = await supabase.storage
+      .from(config.PAYMENT_PROOF_BUCKET)
+      .createSignedUrl(cleanPath, expiresIn);
+
+    if (!error && data?.signedUrl) {
+      return data.signedUrl;
+    }
+    if (error) {
+      console.error(`Signed screenshot URL generation failed: ${error.message}`);
     }
   } catch (err) {
     console.warn('⚠️ Failed to generate signed Supabase URL:', err);

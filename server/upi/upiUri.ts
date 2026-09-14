@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { config, isValidUpiId } from '../config/eventConfig.ts';
+import { config, isValidUpiId, AUTHORITATIVE_PAYMENT_SESSION_MINUTES } from '../config/eventConfig.ts';
 
 export interface UpiSessionInput {
   publicBookingId: string;
@@ -89,7 +89,7 @@ export async function generateUpiPaymentSession(input: UpiSessionInput): Promise
     },
   });
 
-  const expiresAt = new Date(Date.now() + config.PAYMENT_SESSION_MINUTES * 60 * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + AUTHORITATIVE_PAYMENT_SESSION_MINUTES * 60 * 1000).toISOString();
 
   // App-specific intent URIs
   const queryString = params.toString();

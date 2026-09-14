@@ -946,12 +946,69 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       expect(retryRes.body.data.coupons[0].coupon_number).toBe(proofRes.body.data.coupons[0].coupon_number);
     });
 
+    it('permanently fixes payment session to exactly 5 minutes even if process.env.PAYMENT_SESSION_MINUTES is 20', async () => {
+      const origMins = process.env.PAYMENT_SESSION_MINUTES;
+      try {
+        process.env.PAYMENT_SESSION_MINUTES = '20';
+
+        // 1. Config endpoint reports exactly 5 minutes
+        const cfgRes = await request(app).get('/api/config');
+        expect(cfgRes.status).toBe(200);
+        expect(cfgRes.body.sessionMinutes).toBe(5);
+        expect(cfgRes.body.data.sessionMinutes).toBe(5);
+
+        // 2. New booking creation produces expiry exactly 5 minutes (300 seconds) in the future
+        const now = Date.now();
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Fixed Timer User', phone: '9848099111', village: 'Satulur', quantity: 1 });
+
+        expect(bRes.status).toBe(200);
+        const { booking, payment } = bRes.body.data;
+        const expiresAtMs = new Date(booking.expiresAt).getTime();
+        const diffSeconds = Math.round((expiresAtMs - now) / 1000);
+
+        // Must be exactly around 300 seconds (5 minutes), NEVER 1200 seconds (20 minutes)
+        expect(diffSeconds).toBeGreaterThanOrEqual(295);
+        expect(diffSeconds).toBeLessThanOrEqual(305);
+        expect(payment.expiresAt).toBe(booking.expiresAt);
+
+        // 3. Database value is also that exact server-generated expiry
+        const dbRes = await db.query('SELECT payment_expires_at FROM bookings WHERE public_id = $1', [booking.publicId]);
+        const dbExpiresAtMs = new Date(dbRes.rows[0].payment_expires_at).getTime();
+        expect(dbExpiresAtMs).toBe(expiresAtMs);
+      } finally {
+        process.env.PAYMENT_SESSION_MINUTES = origMins;
+      }
+    });
+
+    it('rejects anon key as service role key for storage operations', async () => {
+      const origKey = config.SUPABASE_SERVICE_ROLE_KEY;
+      const origNodeEnv = config.NODE_ENV;
+      try {
+        config.NODE_ENV = 'production';
+        config.SUPABASE_SERVICE_ROLE_KEY = 'sbp_fake_anon_key_123';
+
+        const dummyBuf = await sharp({
+          create: { width: 300, height: 400, channels: 3, background: { r: 100, g: 100, b: 100 } }
+        }).jpeg().toBuffer();
+
+        await expect(processPaymentScreenshot(dummyBuf, 'test-anon-key-booking')).rejects.toThrow(
+          /STORAGE_NOT_CONFIGURED/
+        );
+      } finally {
+        config.SUPABASE_SERVICE_ROLE_KEY = origKey;
+        config.NODE_ENV = (origNodeEnv as any) || 'test';
+      }
+    });
+
     it('health check endpoint safely reports storage status without leaking credentials', async () => {
       const healthRes = await request(app).get('/api/health');
       expect(healthRes.status).toBe(200);
       expect(healthRes.body).toHaveProperty('storage');
       expect(healthRes.body.storage.provider).toBe('supabase');
       expect(healthRes.body.storage.bucket).toBe('payment-proofs');
+      expect(healthRes.body).toHaveProperty('paymentProofStorageConfigured');
       expect(JSON.stringify(healthRes.body)).not.toContain('sb_secret');
       expect(JSON.stringify(healthRes.body)).not.toContain('postgres:');
     });

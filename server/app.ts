@@ -96,6 +96,7 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
       database: dbStatus.provider,
       databaseConnected: dbStatus.connected,
       databaseHost: dbStatus.hostMasked,
+      paymentProofStorageConfigured: storageStatus.configured && storageStatus.ready,
       storage: {
         provider: storageStatus.provider,
         configured: storageStatus.configured,
