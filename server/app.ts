@@ -7,7 +7,7 @@ import helmet from 'helmet';
 import { config, getPublicConfig, canAcceptPayments } from './config/eventConfig.ts';
 import { db, isDatabaseConnected } from './db/client.ts';
 import { generateUpiPaymentSession } from './upi/upiUri.ts';
-import { processPaymentScreenshot, hammingDistance } from './upi/imageProcessor.ts';
+import { processPaymentScreenshot, hammingDistance, checkStorageHealth } from './upi/imageProcessor.ts';
 import { analyzePaymentScreenshotWithGemini } from './upi/geminiAnalyzer.ts';
 import { performDeterministicComparison, normalizeUtr } from './upi/deterministicMatcher.ts';
 import { finalizeVerifiedSubmission } from './upi/automatedFinalizer.ts';
@@ -78,18 +78,31 @@ function generateCollisionSafePaymentReference(): string {
   return `YSYS-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
 }
 
-// 2. Health & Diagnostic Check
+// 2. Health & Diagnostic Check (Requirement 12: Safe Storage & DB Health Diagnostic)
 app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
   try {
-    const dbStatus = await isDatabaseConnected();
+    const [dbStatus, storageStatus] = await Promise.all([
+      isDatabaseConnected(),
+      checkStorageHealth(),
+    ]);
+
+    const isHealthy = dbStatus.connected && storageStatus.ready;
+
     return res.status(200).json({
-      status: 'ok',
+      status: isHealthy ? 'ok' : 'degraded',
       service: 'yuva-shakti-portal',
       timestamp: new Date().toISOString(),
       database: dbStatus.provider,
       databaseConnected: dbStatus.connected,
       databaseHost: dbStatus.hostMasked,
+      storage: {
+        provider: storageStatus.provider,
+        configured: storageStatus.configured,
+        bucket: storageStatus.bucket,
+        ready: storageStatus.ready,
+        ...(storageStatus.error ? { warning: storageStatus.error } : {}),
+      },
       ...(dbStatus.error ? { warning: 'Database connection check reported an issue' } : {}),
     });
   } catch (err: any) {
@@ -103,6 +116,12 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
       timestamp: new Date().toISOString(),
       database: 'postgresql',
       databaseConnected: false,
+      storage: {
+        provider: 'supabase',
+        configured: false,
+        bucket: config.PAYMENT_PROOF_BUCKET,
+        ready: false,
+      },
     });
   }
 });
@@ -325,16 +344,59 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 2. Server-Enforced Expiry Check (5-Minute Session)
-    const isExpired = booking.status === 'expired' || (booking.payment_expires_at && new Date(booking.payment_expires_at).getTime() < Date.now());
-    if (isExpired) {
-      if (booking.status !== 'expired') {
-        await db.query('UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3', ['expired', new Date().toISOString(), booking.id]);
+    // 2. Server-Enforced Expiry Check with Safe Recovery Rule (Requirement 10)
+    const expiresAtMs = booking.payment_expires_at ? new Date(booking.payment_expires_at).getTime() : 0;
+    const isPastExpiry = booking.status === 'expired' || (expiresAtMs > 0 && Date.now() > expiresAtMs);
+
+    if (isPastExpiry) {
+      // Check if coupons have already been issued for this booking
+      const couponCheck = await db.query('SELECT COUNT(*) as count FROM coupons WHERE booking_id = $1', [booking.id]);
+      const hasCoupons = parseInt(couponCheck.rows[0]?.count || '0', 10) > 0;
+
+      // Check if any verified payment proof already exists
+      const proofCheck = await db.query(
+        "SELECT id FROM payment_submissions WHERE booking_id = $1 AND (status = 'payment_confirmed' OR status = 'proof_verified') LIMIT 1",
+        [booking.id]
+      );
+      const hasVerifiedProof = proofCheck.rows.length > 0;
+
+      // Check for prior submission attempt around/before expiry
+      const priorAttemptCheck = await db.query(
+        'SELECT id FROM payment_submissions WHERE booking_id = $1 LIMIT 1',
+        [booking.id]
+      );
+      const hasPriorSubmissionAttempt = priorAttemptCheck.rows.length > 0;
+      const isRecoveryFlag = req.body.isRecovery === true || req.headers['x-payment-recovery'] === 'true';
+
+      const createdAtMs = new Date(booking.created_at || Date.now()).getTime();
+      const paymentInitiatedBeforeExpiry = booking.payment_expires_at ? (createdAtMs <= expiresAtMs) : true;
+      const isWithinRecoveryWindow = (Date.now() - createdAtMs) < 24 * 60 * 60 * 1000;
+
+      // Safe recovery rule (Requirement 10):
+      // - booking exists
+      // - payment was initiated before expiry
+      // - proof submission attempt occurred before/around expiry (prior submission OR explicit recovery flag)
+      // - no coupon has been issued
+      // - no successful payment proof exists
+      const isEligibleForRecovery =
+        paymentInitiatedBeforeExpiry &&
+        (hasPriorSubmissionAttempt || isRecoveryFlag || booking.status === 'ai_check_failed' || booking.status === 'proof_required') &&
+        !hasCoupons &&
+        !hasVerifiedProof &&
+        booking.status !== 'cancelled' &&
+        isWithinRecoveryWindow;
+
+      if (isEligibleForRecovery) {
+        console.warn(`[POST /api/bookings/:publicId/payment-proof] Processing safe proof recovery for booking ${booking.public_id} (session expired, but unfinalized and within recovery window).`);
+      } else {
+        if (booking.status !== 'expired') {
+          await db.query('UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3', ['expired', new Date().toISOString(), booking.id]);
+        }
+        return res.status(400).json({
+          success: false,
+          error: { code: 'PAYMENT_SESSION_EXPIRED', message: 'Payment session expired. Start a new booking.' },
+        });
       }
-      return res.status(400).json({
-        success: false,
-        error: { code: 'PAYMENT_SESSION_EXPIRED', message: 'Payment session expired. Start a new booking.' },
-      });
     }
 
     // 3. Validate Consent
@@ -445,7 +507,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       extraction,
       isDuplicateUtr,
       isDuplicateScreenshot,
-      isExpired,
+      isExpired: false,
     });
 
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
@@ -550,9 +612,17 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     }
   } catch (error: any) {
     console.error('Payment proof submission error:', error);
-    res.status(500).json({
+    const isStorageErr = error?.message?.includes('STORAGE_NOT_CONFIGURED') || error?.message?.includes('PAYMENT_PROOF_STORAGE_FAILED');
+    const errCode = error?.message?.includes('STORAGE_NOT_CONFIGURED')
+      ? 'STORAGE_NOT_CONFIGURED'
+      : (error?.message?.includes('PAYMENT_PROOF_STORAGE_FAILED') ? 'PAYMENT_PROOF_STORAGE_FAILED' : 'SUBMISSION_FAILED');
+    const safeMsg = isStorageErr
+      ? 'Payment proof storage is temporarily unavailable. Your booking is preserved. Please retry in a few moments.'
+      : (error.message || 'Failed to process payment proof.');
+
+    res.status(isStorageErr ? 503 : 500).json({
       success: false,
-      error: { code: 'SUBMISSION_FAILED', message: error.message || 'Failed to process payment proof.' },
+      error: { code: errCode, message: safeMsg },
     });
   }
 });

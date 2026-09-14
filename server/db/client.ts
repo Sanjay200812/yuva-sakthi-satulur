@@ -134,35 +134,29 @@ class MemoryDB implements TransactionalDB {
       const idOrPubId = params[params.length - 1];
       const b = this.bookings.get(idOrPubId) || Array.from(this.bookings.values()).find((bk) => bk.public_id === idOrPubId);
       if (b) {
-        if (trimmed.includes('payment_expires_at = $1')) {
-          b.payment_expires_at = params[0];
+        const setMatch = trimmed.match(/SET\s+(.*?)\s+WHERE/is);
+        if (setMatch && setMatch[1]) {
+          const assignments = setMatch[1].split(',').map((s) => s.trim());
+          for (const assign of assignments) {
+            const parts = assign.split('=').map((s) => s.trim());
+            if (parts.length === 2) {
+              const col = parts[0];
+              const valPart = parts[1];
+              const paramIdxMatch = valPart.match(/\$(\d+)/);
+              if (paramIdxMatch) {
+                const idx = parseInt(paramIdxMatch[1], 10) - 1;
+                (b as any)[col] = params[idx];
+              } else if (valPart.startsWith("'") && valPart.endsWith("'")) {
+                (b as any)[col] = valPart.slice(1, -1);
+              }
+            }
+          }
         }
-        if (trimmed.includes("status = 'payment_confirmed'")) {
+        if (b.status === 'proof_verified') {
           b.status = 'payment_confirmed';
-        } else if (trimmed.includes("status = 'payment_rejected'")) {
-          b.status = 'payment_rejected';
-        } else if (trimmed.includes("status = 'expired'")) {
-          b.status = 'expired';
-        } else if (trimmed.includes("status = 'proof_required'")) {
-          b.status = 'proof_required';
-        } else if (trimmed.includes("status = 'awaiting_admin_review'")) {
-          b.status = 'awaiting_admin_review';
-        } else if (trimmed.includes("status = 'ai_check_failed'")) {
-          b.status = 'ai_check_failed';
-        } else if (trimmed.includes("status = 'proof_verified'")) {
-          b.status = 'payment_confirmed';
-        } else if (trimmed.includes('status = $1')) {
-          b.status = params[0];
         }
-
-        if (trimmed.includes('paid_at = $1')) {
-          b.paid_at = params[0];
-          b.verified_at = params[0];
-        } else if (trimmed.includes('verified_at = $1')) {
-          b.verified_at = params[0];
-          b.paid_at = params[0];
-        } else if (trimmed.includes('paid_at = $2')) {
-          b.paid_at = params[1];
+        if (b.paid_at && !b.verified_at) {
+          b.verified_at = b.paid_at;
         }
         b.updated_at = new Date().toISOString();
         return { rows: [b] as any, rowCount: 1 };

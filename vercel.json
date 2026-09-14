@@ -6,7 +6,8 @@
   "env": {
     "PAYEE_UPI_ID": "7075920852@ybl",
     "PAYEE_DISPLAY_NAME": "Yuva Shakti Youth Satulur",
-    "PAYMENT_SESSION_MINUTES": "5"
+    "PAYMENT_SESSION_MINUTES": "5",
+    "PAYMENT_PROOF_BUCKET": "payment-proofs"
   },
   "rewrites": [
     {

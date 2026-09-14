@@ -301,34 +301,29 @@ var MemoryDB = class {
       const idOrPubId = params[params.length - 1];
       const b = this.bookings.get(idOrPubId) || Array.from(this.bookings.values()).find((bk) => bk.public_id === idOrPubId);
       if (b) {
-        if (trimmed.includes("payment_expires_at = $1")) {
-          b.payment_expires_at = params[0];
+        const setMatch = trimmed.match(/SET\s+(.*?)\s+WHERE/is);
+        if (setMatch && setMatch[1]) {
+          const assignments = setMatch[1].split(",").map((s) => s.trim());
+          for (const assign of assignments) {
+            const parts = assign.split("=").map((s) => s.trim());
+            if (parts.length === 2) {
+              const col = parts[0];
+              const valPart = parts[1];
+              const paramIdxMatch = valPart.match(/\$(\d+)/);
+              if (paramIdxMatch) {
+                const idx = parseInt(paramIdxMatch[1], 10) - 1;
+                b[col] = params[idx];
+              } else if (valPart.startsWith("'") && valPart.endsWith("'")) {
+                b[col] = valPart.slice(1, -1);
+              }
+            }
+          }
         }
-        if (trimmed.includes("status = 'payment_confirmed'")) {
+        if (b.status === "proof_verified") {
           b.status = "payment_confirmed";
-        } else if (trimmed.includes("status = 'payment_rejected'")) {
-          b.status = "payment_rejected";
-        } else if (trimmed.includes("status = 'expired'")) {
-          b.status = "expired";
-        } else if (trimmed.includes("status = 'proof_required'")) {
-          b.status = "proof_required";
-        } else if (trimmed.includes("status = 'awaiting_admin_review'")) {
-          b.status = "awaiting_admin_review";
-        } else if (trimmed.includes("status = 'ai_check_failed'")) {
-          b.status = "ai_check_failed";
-        } else if (trimmed.includes("status = 'proof_verified'")) {
-          b.status = "payment_confirmed";
-        } else if (trimmed.includes("status = $1")) {
-          b.status = params[0];
         }
-        if (trimmed.includes("paid_at = $1")) {
-          b.paid_at = params[0];
-          b.verified_at = params[0];
-        } else if (trimmed.includes("verified_at = $1")) {
-          b.verified_at = params[0];
-          b.paid_at = params[0];
-        } else if (trimmed.includes("paid_at = $2")) {
-          b.paid_at = params[1];
+        if (b.paid_at && !b.verified_at) {
+          b.verified_at = b.paid_at;
         }
         b.updated_at = (/* @__PURE__ */ new Date()).toISOString();
         return { rows: [b], rowCount: 1 };
@@ -987,8 +982,19 @@ function hammingDistance(h1, h2) {
   dist += Math.abs(h1.length - h2.length) * 4;
   return dist;
 }
-async function uploadToSupabaseStorage(buffer, objectPath, mimeType) {
-  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY) {
+async function uploadToSupabaseStorage(buffer, objectPath, mimeType, bookingId) {
+  const isProduction = config.NODE_ENV === "production";
+  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || !config.PAYMENT_PROOF_BUCKET) {
+    if (isProduction) {
+      console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET || "missing"}
+status=config_missing
+message=SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY or PAYMENT_PROOF_BUCKET missing in production
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+      throw new Error("STORAGE_NOT_CONFIGURED: Supabase storage credentials or bucket are not configured in production.");
+    }
     return false;
   }
   try {
@@ -1003,10 +1009,92 @@ async function uploadToSupabaseStorage(buffer, objectPath, mimeType) {
       },
       body: buffer
     });
-    return res.ok;
-  } catch (err) {
-    console.warn("\u26A0\uFE0F Supabase Storage upload error, using filesystem fallback:", err);
+    if (res.ok) {
+      return true;
+    }
+    let safeErrorMessage = res.statusText;
+    try {
+      const errData = await res.json();
+      safeErrorMessage = errData.message || errData.error || res.statusText;
+    } catch {
+    }
+    console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET}
+status=${res.status}
+message=${safeErrorMessage}
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+    if (isProduction) {
+      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${res.status}: ${safeErrorMessage}`);
+    }
     return false;
+  } catch (err) {
+    if (err?.message?.startsWith("STORAGE_NOT_CONFIGURED") || err?.message?.startsWith("PAYMENT_PROOF_STORAGE_FAILED")) {
+      throw err;
+    }
+    console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET}
+status=network_error
+message=${err?.message || "Network exception connecting to Supabase"}
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+    if (isProduction) {
+      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Network error during Supabase upload: ${err?.message || "Network error"}`);
+    }
+    return false;
+  }
+}
+async function checkStorageHealth() {
+  const isConfigured = Boolean(config.SUPABASE_URL && config.SUPABASE_SERVICE_ROLE_KEY && config.PAYMENT_PROOF_BUCKET);
+  if (!isConfigured) {
+    return {
+      configured: false,
+      provider: "supabase",
+      bucket: config.PAYMENT_PROOF_BUCKET || "payment-proofs",
+      ready: false,
+      error: "Supabase storage credentials or bucket are not configured"
+    };
+  }
+  try {
+    const url = `${config.SUPABASE_URL.replace(/\/+$/, "")}/storage/v1/bucket/${config.PAYMENT_PROOF_BUCKET}`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
+        "apikey": config.SUPABASE_SERVICE_ROLE_KEY
+      }
+    });
+    if (res.ok) {
+      return {
+        configured: true,
+        provider: "supabase",
+        bucket: config.PAYMENT_PROOF_BUCKET,
+        ready: true
+      };
+    }
+    let msg = res.statusText;
+    try {
+      const data = await res.json();
+      msg = data.message || data.error || res.statusText;
+    } catch {
+    }
+    return {
+      configured: true,
+      provider: "supabase",
+      bucket: config.PAYMENT_PROOF_BUCKET,
+      ready: false,
+      error: `Supabase bucket status ${res.status}: ${msg}`
+    };
+  } catch (err) {
+    return {
+      configured: true,
+      provider: "supabase",
+      bucket: config.PAYMENT_PROOF_BUCKET,
+      ready: false,
+      error: err?.message || "Network error connecting to Supabase Storage"
+    };
   }
 }
 async function getSignedScreenshotUrl(storagePath, expiresIn = 300) {
@@ -1069,11 +1157,14 @@ async function processPaymentScreenshot(rawBuffer, bookingId) {
   const phash = await computePerceptualHash(sanitizedBuffer);
   const filename = `${sha256.slice(0, 16)}.jpg`;
   const objectPath = `${bookingId}/${filename}`;
-  const uploadedToSupabase = await uploadToSupabaseStorage(sanitizedBuffer, objectPath, "image/jpeg");
+  const uploadedToSupabase = await uploadToSupabaseStorage(sanitizedBuffer, objectPath, "image/jpeg", bookingId);
   let storagePath;
   if (uploadedToSupabase) {
     storagePath = `supabase:${objectPath}`;
   } else {
+    if (config.NODE_ENV === "production") {
+      throw new Error("PAYMENT_PROOF_STORAGE_FAILED: Supabase storage is mandatory in production. Local filesystem writes are prohibited.");
+    }
     const uploadDir = path.resolve(process.cwd(), "uploads", "payment-proofs", bookingId);
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
@@ -2819,14 +2910,25 @@ function generateCollisionSafePaymentReference() {
 app.get(["/api/health", "/health"], async (_req, res) => {
   res.setHeader("Content-Type", "application/json");
   try {
-    const dbStatus = await isDatabaseConnected();
+    const [dbStatus, storageStatus] = await Promise.all([
+      isDatabaseConnected(),
+      checkStorageHealth()
+    ]);
+    const isHealthy = dbStatus.connected && storageStatus.ready;
     return res.status(200).json({
-      status: "ok",
+      status: isHealthy ? "ok" : "degraded",
       service: "yuva-shakti-portal",
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       database: dbStatus.provider,
       databaseConnected: dbStatus.connected,
       databaseHost: dbStatus.hostMasked,
+      storage: {
+        provider: storageStatus.provider,
+        configured: storageStatus.configured,
+        bucket: storageStatus.bucket,
+        ready: storageStatus.ready,
+        ...storageStatus.error ? { warning: storageStatus.error } : {}
+      },
       ...dbStatus.error ? { warning: "Database connection check reported an issue" } : {}
     });
   } catch (err) {
@@ -2839,7 +2941,13 @@ app.get(["/api/health", "/health"], async (_req, res) => {
       service: "yuva-shakti-portal",
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       database: "postgresql",
-      databaseConnected: false
+      databaseConnected: false,
+      storage: {
+        provider: "supabase",
+        configured: false,
+        bucket: config.PAYMENT_PROOF_BUCKET,
+        ready: false
+      }
     });
   }
 });
@@ -3024,15 +3132,37 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         error: { code: "UNAUTHORIZED", message: "Invalid booking access token." }
       });
     }
-    const isExpired = booking.status === "expired" || booking.payment_expires_at && new Date(booking.payment_expires_at).getTime() < Date.now();
-    if (isExpired) {
-      if (booking.status !== "expired") {
-        await db.query("UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3", ["expired", (/* @__PURE__ */ new Date()).toISOString(), booking.id]);
+    const expiresAtMs = booking.payment_expires_at ? new Date(booking.payment_expires_at).getTime() : 0;
+    const isPastExpiry = booking.status === "expired" || expiresAtMs > 0 && Date.now() > expiresAtMs;
+    if (isPastExpiry) {
+      const couponCheck = await db.query("SELECT COUNT(*) as count FROM coupons WHERE booking_id = $1", [booking.id]);
+      const hasCoupons = parseInt(couponCheck.rows[0]?.count || "0", 10) > 0;
+      const proofCheck = await db.query(
+        "SELECT id FROM payment_submissions WHERE booking_id = $1 AND (status = 'payment_confirmed' OR status = 'proof_verified') LIMIT 1",
+        [booking.id]
+      );
+      const hasVerifiedProof = proofCheck.rows.length > 0;
+      const priorAttemptCheck = await db.query(
+        "SELECT id FROM payment_submissions WHERE booking_id = $1 LIMIT 1",
+        [booking.id]
+      );
+      const hasPriorSubmissionAttempt = priorAttemptCheck.rows.length > 0;
+      const isRecoveryFlag = req.body.isRecovery === true || req.headers["x-payment-recovery"] === "true";
+      const createdAtMs = new Date(booking.created_at || Date.now()).getTime();
+      const paymentInitiatedBeforeExpiry = booking.payment_expires_at ? createdAtMs <= expiresAtMs : true;
+      const isWithinRecoveryWindow = Date.now() - createdAtMs < 24 * 60 * 60 * 1e3;
+      const isEligibleForRecovery = paymentInitiatedBeforeExpiry && (hasPriorSubmissionAttempt || isRecoveryFlag || booking.status === "ai_check_failed" || booking.status === "proof_required") && !hasCoupons && !hasVerifiedProof && booking.status !== "cancelled" && isWithinRecoveryWindow;
+      if (isEligibleForRecovery) {
+        console.warn(`[POST /api/bookings/:publicId/payment-proof] Processing safe proof recovery for booking ${booking.public_id} (session expired, but unfinalized and within recovery window).`);
+      } else {
+        if (booking.status !== "expired") {
+          await db.query("UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3", ["expired", (/* @__PURE__ */ new Date()).toISOString(), booking.id]);
+        }
+        return res.status(400).json({
+          success: false,
+          error: { code: "PAYMENT_SESSION_EXPIRED", message: "Payment session expired. Start a new booking." }
+        });
       }
-      return res.status(400).json({
-        success: false,
-        error: { code: "PAYMENT_SESSION_EXPIRED", message: "Payment session expired. Start a new booking." }
-      });
     }
     if (!consentGiven) {
       return res.status(400).json({
@@ -3121,7 +3251,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
       extraction,
       isDuplicateUtr,
       isDuplicateScreenshot,
-      isExpired
+      isExpired: false
     });
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
     await db.query(
@@ -3216,9 +3346,12 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
     }
   } catch (error) {
     console.error("Payment proof submission error:", error);
-    res.status(500).json({
+    const isStorageErr = error?.message?.includes("STORAGE_NOT_CONFIGURED") || error?.message?.includes("PAYMENT_PROOF_STORAGE_FAILED");
+    const errCode = error?.message?.includes("STORAGE_NOT_CONFIGURED") ? "STORAGE_NOT_CONFIGURED" : error?.message?.includes("PAYMENT_PROOF_STORAGE_FAILED") ? "PAYMENT_PROOF_STORAGE_FAILED" : "SUBMISSION_FAILED";
+    const safeMsg = isStorageErr ? "Payment proof storage is temporarily unavailable. Your booking is preserved. Please retry in a few moments." : error.message || "Failed to process payment proof.";
+    res.status(isStorageErr ? 503 : 500).json({
       success: false,
-      error: { code: "SUBMISSION_FAILED", message: error.message || "Failed to process payment proof." }
+      error: { code: errCode, message: safeMsg }
     });
   }
 });

@@ -50,6 +50,7 @@ export interface PaymentProofParams {
   selectedApp: string;
   consentGiven: boolean;
   statusToken?: string;
+  isRecovery?: boolean;
 }
 
 export interface PaymentProofResponse {
@@ -110,6 +111,7 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
         selectedApp: params.selectedApp,
         consentGiven: params.consentGiven,
         statusToken: params.statusToken,
+        isRecovery: params.isRecovery,
       }),
     },
     'Payment proof service'

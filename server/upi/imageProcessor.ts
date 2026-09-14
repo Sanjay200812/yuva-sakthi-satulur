@@ -122,16 +122,31 @@ export function hammingDistance(h1: string, h2: string): number {
 
 /**
  * Uploads sanitized screenshot buffer to private Supabase Storage bucket.
- * Returns the object path if successful.
+ * In production: Supabase upload is mandatory. Fails closed with structured errors.
+ * In dev/test: Returns false on failure to allow local filesystem fallback.
  */
 async function uploadToSupabaseStorage(
   buffer: Buffer,
   objectPath: string,
-  mimeType: string
+  mimeType: string,
+  bookingId: string
 ): Promise<boolean> {
-  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY) {
+  const isProduction = config.NODE_ENV === 'production';
+
+  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || !config.PAYMENT_PROOF_BUCKET) {
+    if (isProduction) {
+      console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET || 'missing'}
+status=config_missing
+message=SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY or PAYMENT_PROOF_BUCKET missing in production
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+      throw new Error('STORAGE_NOT_CONFIGURED: Supabase storage credentials or bucket are not configured in production.');
+    }
     return false;
   }
+
   try {
     const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/${config.PAYMENT_PROOF_BUCKET}/${objectPath}`;
     const res = await fetch(url, {
@@ -144,10 +159,111 @@ async function uploadToSupabaseStorage(
       },
       body: buffer,
     });
-    return res.ok;
-  } catch (err) {
-    console.warn('⚠️ Supabase Storage upload error, using filesystem fallback:', err);
+
+    if (res.ok) {
+      return true;
+    }
+
+    let safeErrorMessage = res.statusText;
+    try {
+      const errData = await res.json();
+      safeErrorMessage = errData.message || errData.error || res.statusText;
+    } catch {
+      // Ignore JSON parse failure
+    }
+
+    console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET}
+status=${res.status}
+message=${safeErrorMessage}
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+
+    if (isProduction) {
+      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${res.status}: ${safeErrorMessage}`);
+    }
     return false;
+  } catch (err: any) {
+    if (err?.message?.startsWith('STORAGE_NOT_CONFIGURED') || err?.message?.startsWith('PAYMENT_PROOF_STORAGE_FAILED')) {
+      throw err;
+    }
+    console.error(`Payment proof storage failed:
+provider=supabase
+bucket=${config.PAYMENT_PROOF_BUCKET}
+status=network_error
+message=${err?.message || 'Network exception connecting to Supabase'}
+objectPath=${objectPath}
+bookingId=${bookingId}`);
+
+    if (isProduction) {
+      throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Network error during Supabase upload: ${err?.message || 'Network error'}`);
+    }
+    return false;
+  }
+}
+
+/**
+ * Diagnostics helper to verify Supabase Storage readiness safely without leaking credentials.
+ */
+export async function checkStorageHealth(): Promise<{
+  configured: boolean;
+  provider: string;
+  bucket: string;
+  ready: boolean;
+  error?: string;
+}> {
+  const isConfigured = Boolean(config.SUPABASE_URL && config.SUPABASE_SERVICE_ROLE_KEY && config.PAYMENT_PROOF_BUCKET);
+  if (!isConfigured) {
+    return {
+      configured: false,
+      provider: 'supabase',
+      bucket: config.PAYMENT_PROOF_BUCKET || 'payment-proofs',
+      ready: false,
+      error: 'Supabase storage credentials or bucket are not configured',
+    };
+  }
+
+  try {
+    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/bucket/${config.PAYMENT_PROOF_BUCKET}`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
+      },
+    });
+
+    if (res.ok) {
+      return {
+        configured: true,
+        provider: 'supabase',
+        bucket: config.PAYMENT_PROOF_BUCKET,
+        ready: true,
+      };
+    }
+
+    let msg = res.statusText;
+    try {
+      const data = await res.json();
+      msg = data.message || data.error || res.statusText;
+    } catch {}
+
+    return {
+      configured: true,
+      provider: 'supabase',
+      bucket: config.PAYMENT_PROOF_BUCKET,
+      ready: false,
+      error: `Supabase bucket status ${res.status}: ${msg}`,
+    };
+  } catch (err: any) {
+    return {
+      configured: true,
+      provider: 'supabase',
+      bucket: config.PAYMENT_PROOF_BUCKET,
+      ready: false,
+      error: err?.message || 'Network error connecting to Supabase Storage',
+    };
   }
 }
 
@@ -185,7 +301,7 @@ export async function getSignedScreenshotUrl(storagePath: string, expiresIn = 30
 
 /**
  * Strips metadata, validates dimensions/size, re-encodes to clean JPEG,
- * and persists to private Supabase bucket or fallback uploads directory.
+ * and persists to private Supabase bucket (mandatory in production) or fallback uploads directory (dev only).
  */
 export async function processPaymentScreenshot(
   rawBuffer: Buffer,
@@ -242,14 +358,18 @@ export async function processPaymentScreenshot(
   const filename = `${sha256.slice(0, 16)}.jpg`;
   const objectPath = `${bookingId}/${filename}`;
 
-  // 5. Try Supabase Storage upload if configured
-  const uploadedToSupabase = await uploadToSupabaseStorage(sanitizedBuffer, objectPath, 'image/jpeg');
+  // 5. Persist screenshot: Supabase Storage is mandatory in production
+  const uploadedToSupabase = await uploadToSupabaseStorage(sanitizedBuffer, objectPath, 'image/jpeg', bookingId);
 
   let storagePath: string;
   if (uploadedToSupabase) {
     storagePath = `supabase:${objectPath}`;
   } else {
-    // Local filesystem fallback for local development / testing
+    // In production, NEVER fall back to /var/task or process.cwd()
+    if (config.NODE_ENV === 'production') {
+      throw new Error('PAYMENT_PROOF_STORAGE_FAILED: Supabase storage is mandatory in production. Local filesystem writes are prohibited.');
+    }
+    // Local filesystem fallback strictly for local development / testing
     const uploadDir = path.resolve(process.cwd(), 'uploads', 'payment-proofs', bookingId);
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });

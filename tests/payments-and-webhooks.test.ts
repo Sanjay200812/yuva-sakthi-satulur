@@ -1,11 +1,17 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import sharp from 'sharp';
 import QRCode from 'qrcode';
+import fs from 'fs';
 import { app } from '../server.ts';
 import { generateCanonicalUpiUri, generateUpiPaymentSession } from '../server/upi/upiUri.ts';
-import { canAcceptPayments } from '../server/config/eventConfig.ts';
-import { validateScreenshotBuffer } from '../server/upi/imageProcessor.ts';
+import { canAcceptPayments, config } from '../server/config/eventConfig.ts';
+import {
+  validateScreenshotBuffer,
+  processPaymentScreenshot,
+  getSignedScreenshotUrl,
+  checkStorageHealth,
+} from '../server/upi/imageProcessor.ts';
 import { performDeterministicComparison } from '../server/upi/deterministicMatcher.ts';
 import { setMockGeminiExtraction } from '../server/upi/geminiAnalyzer.ts';
 import { db } from '../server/db/client.ts';
@@ -744,5 +750,229 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       process.env.NODE_ENV = origNodeEnv;
       process.env.PAYEE_UPI_ID = origPayeeUpiId;
     }
+  });
+
+  describe('Storage Safety & Proof Recovery Pipeline', () => {
+    it('in production, missing Supabase credentials throws STORAGE_NOT_CONFIGURED and NEVER writes to /var/task or process.cwd()', async () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origUrl = config.SUPABASE_URL;
+      const origKey = config.SUPABASE_SERVICE_ROLE_KEY;
+
+      const mkdirSpy = vi.spyOn(fs, 'mkdirSync');
+      const writeSpy = vi.spyOn(fs, 'writeFileSync');
+
+      try {
+        config.NODE_ENV = 'production';
+        config.SUPABASE_URL = '';
+        config.SUPABASE_SERVICE_ROLE_KEY = '';
+
+        const dummyBuf = await sharp({
+          create: { width: 300, height: 400, channels: 3, background: { r: 100, g: 100, b: 100 } }
+        }).jpeg().toBuffer();
+
+        await expect(processPaymentScreenshot(dummyBuf, 'test-prod-booking-1')).rejects.toThrow(
+          /STORAGE_NOT_CONFIGURED/
+        );
+
+        // Crucial: Filesystem writes must NEVER be invoked in production
+        expect(mkdirSpy).not.toHaveBeenCalled();
+        expect(writeSpy).not.toHaveBeenCalled();
+      } finally {
+        config.NODE_ENV = (origNodeEnv as any) || 'test';
+        config.SUPABASE_URL = origUrl;
+        config.SUPABASE_SERVICE_ROLE_KEY = origKey;
+        mkdirSpy.mockRestore();
+        writeSpy.mockRestore();
+      }
+    });
+
+    it('in production, failed Supabase upload throws PAYMENT_PROOF_STORAGE_FAILED and does NOT fall back to filesystem', async () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origFetch = global.fetch;
+
+      const mkdirSpy = vi.spyOn(fs, 'mkdirSync');
+      const writeSpy = vi.spyOn(fs, 'writeFileSync');
+
+      try {
+        config.NODE_ENV = 'production';
+        config.SUPABASE_URL = 'https://fake-project.supabase.co';
+        config.SUPABASE_SERVICE_ROLE_KEY = 'fake-key';
+
+        // Mock Supabase returning 404 Bucket not found
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: false,
+          status: 404,
+          statusText: 'Not Found',
+          json: async () => ({ message: 'Bucket not found' }),
+        } as any);
+
+        const dummyBuf = await sharp({
+          create: { width: 300, height: 400, channels: 3, background: { r: 120, g: 120, b: 120 } }
+        }).jpeg().toBuffer();
+
+        await expect(processPaymentScreenshot(dummyBuf, 'test-prod-booking-2')).rejects.toThrow(
+          /PAYMENT_PROOF_STORAGE_FAILED/
+        );
+
+        expect(mkdirSpy).not.toHaveBeenCalled();
+        expect(writeSpy).not.toHaveBeenCalled();
+      } finally {
+        config.NODE_ENV = (origNodeEnv as any) || 'test';
+        global.fetch = origFetch;
+        mkdirSpy.mockRestore();
+        writeSpy.mockRestore();
+      }
+    });
+
+    it('in development/test, allows local filesystem fallback if Supabase is unavailable', async () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      const origUrl = config.SUPABASE_URL;
+
+      try {
+        config.NODE_ENV = 'test';
+        config.SUPABASE_URL = ''; // disable Supabase
+
+        const dummyBuf = await sharp({
+          create: { width: 300, height: 400, channels: 3, background: { r: 150, g: 150, b: 150 } }
+        }).jpeg().toBuffer();
+
+        const result = await processPaymentScreenshot(dummyBuf, 'test-dev-booking');
+        expect(result.storagePath).toContain('uploads');
+        expect(result.sanitizedBuffer).toBeInstanceOf(Buffer);
+        expect(result.mimeType).toBe('image/jpeg');
+      } finally {
+        config.NODE_ENV = (origNodeEnv as any) || 'test';
+        config.SUPABASE_URL = origUrl;
+      }
+    });
+
+    it('successful Supabase upload stores supabase:<objectPath> and keeps sanitizedBuffer in memory for Gemini', async () => {
+      const origFetch = global.fetch;
+
+      try {
+        global.fetch = vi.fn().mockImplementation(async (url: string) => {
+          if (String(url).includes('/storage/v1/object/')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ Key: 'payment-proofs/test/test.jpg' }),
+            };
+          }
+          return { ok: true, status: 200, json: async () => ({}) };
+        });
+
+        const dummyBuf = await sharp({
+          create: { width: 400, height: 500, channels: 3, background: { r: 50, g: 80, b: 120 } }
+        }).jpeg().toBuffer();
+
+        const result = await processPaymentScreenshot(dummyBuf, 'BK-SUPA-SUCCESS');
+
+        expect(result.storagePath).toMatch(/^supabase:BK-SUPA-SUCCESS\//);
+        // sanitizedBuffer must be directly available in memory
+        expect(result.sanitizedBuffer).toBeDefined();
+        expect(result.sanitizedBuffer.length).toBeGreaterThan(0);
+        const validated = await validateScreenshotBuffer(result.sanitizedBuffer);
+        expect(validated.valid).toBe(true);
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('safe recovery rule allows unfinalized booking past payment expiry to resubmit proof and receive coupons', async () => {
+      // 1. Create a booking
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Real Paid User', phone: '9848011223', village: 'Satulur', quantity: 1 });
+
+      expect(bRes.status).toBe(200);
+      const { booking, payment } = bRes.body.data;
+
+      // 2. Artificially set booking created_at and payment_expires_at to simulate payment initiated before expiry
+      const createdTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const pastTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      await db.query(
+        'UPDATE bookings SET created_at = $1, payment_expires_at = $2, status = $3 WHERE id = $4',
+        [createdTime, pastTime, 'payment_initiated', booking.id]
+      );
+
+      // 3. Mock Gemini with matching extraction
+      setMockGeminiExtraction({
+        looks_like_payment_screen: true,
+        visible_payment_status: 'success',
+        app_name: 'phonepe',
+        amount: '50.00',
+        currency: 'INR',
+        payee_name: config.PAYEE_DISPLAY_NAME,
+        payee_upi_id: config.PAYEE_UPI_ID,
+        payer_name: 'Real Paid User',
+        utr_or_rrn: '998877665544',
+        transaction_id: 'TXN-REC-1',
+        transaction_timestamp: new Date().toISOString(),
+        obvious_editing_signals: [],
+        ai_generated_likelihood: 'low',
+        field_confidence: { amount: 0.98, payee: 0.95, utr: 0.98, status: 0.99, timestamp: 0.95 },
+      });
+
+      const validImg = await createValidScreenshotBase64(4455);
+
+      // 4. Submit proof on the expired booking: safe recovery rule MUST allow it to process
+      const proofRes = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          selectedApp: 'phonepe',
+          consentGiven: true,
+          isRecovery: true,
+        });
+
+      expect(proofRes.status).toBe(200);
+      expect(proofRes.body.data.status).toBe('payment_confirmed');
+      expect(proofRes.body.data.coupons.length).toBe(1);
+
+      // 5. Idempotent Retry: Submitting proof again for already confirmed booking returns same coupons without duplicates
+      const retryRes = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          selectedApp: 'phonepe',
+          consentGiven: true,
+          isRecovery: true,
+        });
+
+      expect(retryRes.status).toBe(200);
+      expect(retryRes.body.data.coupons.length).toBe(1);
+      expect(retryRes.body.data.coupons[0].coupon_number).toBe(proofRes.body.data.coupons[0].coupon_number);
+    });
+
+    it('health check endpoint safely reports storage status without leaking credentials', async () => {
+      const healthRes = await request(app).get('/api/health');
+      expect(healthRes.status).toBe(200);
+      expect(healthRes.body).toHaveProperty('storage');
+      expect(healthRes.body.storage.provider).toBe('supabase');
+      expect(healthRes.body.storage.bucket).toBe('payment-proofs');
+      expect(JSON.stringify(healthRes.body)).not.toContain('sb_secret');
+      expect(JSON.stringify(healthRes.body)).not.toContain('postgres:');
+    });
+
+    it('admin signed screenshot URL uses Supabase signed URL and remains private', async () => {
+      const origFetch = global.fetch;
+      try {
+        global.fetch = vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            signedURL: '/object/sign/payment-proofs/BK-1/hash.jpg?token=temp-jwt-token',
+          }),
+        } as any);
+
+        const signed = await getSignedScreenshotUrl('supabase:BK-1/hash.jpg', 300);
+        expect(signed).toContain('token=temp-jwt-token');
+        expect(signed).not.toContain('sb_secret');
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
   });
 });

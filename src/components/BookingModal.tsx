@@ -243,7 +243,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     e.preventDefault();
     if (!bookingData) return;
 
-    if (isExpired) {
+    if (isExpired && step !== 'proof') {
       setErrorMessage('Payment session expired. Start a new booking.');
       return;
     }
@@ -271,6 +271,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         selectedApp,
         consentGiven,
         statusToken: bookingData.payment.statusToken,
+        isRecovery: isExpired || false,
       });
 
       if ((res.status === 'payment_confirmed' || res.status === 'proof_verified') && res.coupons?.length) {
@@ -466,7 +467,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         )}
 
         {/* Expired Message Banner */}
-        {isExpired && (
+        {isExpired && step !== 'proof' && (
           <div className="p-3 mb-4 rounded-xl bg-red-950/80 border border-red-500 text-red-200 text-xs font-semibold text-center space-y-2">
             <p>Payment session expired. Start a new booking.</p>
             <button
@@ -476,6 +477,12 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             >
               Start New Booking
             </button>
+          </div>
+        )}
+        {isExpired && step === 'proof' && (
+          <div className="p-3 mb-4 rounded-xl bg-amber-950/60 border border-amber-500/50 text-amber-200 text-xs text-center space-y-1">
+            <p className="font-semibold">Timer ended, but proof submission is available.</p>
+            <p className="text-[11px] text-slate-300">If you completed your UPI transfer, attach your screenshot below to complete verification.</p>
           </div>
         )}
 
@@ -785,14 +792,14 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                 type="file"
                 ref={fileInputRef}
                 accept="image/png,image/jpeg,image/jpg,image/webp"
-                disabled={isExpired || isProcessing}
+                disabled={isProcessing}
                 onChange={handleFileChange}
                 className="hidden"
               />
 
               {!screenshotPreview ? (
                 <div
-                  onClick={() => !isExpired && !isProcessing && fileInputRef.current?.click()}
+                  onClick={() => !isProcessing && fileInputRef.current?.click()}
                   className="border-2 border-dashed border-amber-400/50 hover:border-amber-400 rounded-2xl p-6 text-center cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 transition-all group shadow-[0_0_20px_rgba(245,158,11,0.08)]"
                 >
                   <div className="w-12 h-12 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
@@ -836,7 +843,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                 type="checkbox"
                 id="consent"
                 checked={consentGiven}
-                disabled={isExpired || isProcessing}
+                disabled={isProcessing}
                 onChange={(e) => setConsentGiven(e.target.checked)}
                 className="mt-0.5 w-4 h-4 rounded border-purple-500 text-amber-500 focus:ring-0 cursor-pointer"
               />
@@ -857,7 +864,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isProcessing || isExpired || !screenshotBase64 || !consentGiven}
+                disabled={isProcessing || !screenshotBase64 || !consentGiven}
                 className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {isProcessing ? (
