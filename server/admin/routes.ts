@@ -10,6 +10,7 @@ import {
   destroyAdminSession,
 } from './auth.ts';
 import { renderTicketPdf, renderTicketRaster, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
+import { getSignedScreenshotUrl } from '../upi/imageProcessor.ts';
 import {
   confirmPaymentFromBankRecord,
   rejectPaymentSubmission,
@@ -395,6 +396,13 @@ router.get(['/payment-reviews/:submissionId/screenshot', '/payment-diagnostics/:
     }
     const submission = result.rows[0];
     const filePath = submission.screenshot_storage_path;
+
+    if (filePath && filePath.startsWith('supabase:')) {
+      const signedUrl = await getSignedScreenshotUrl(filePath, 300);
+      if (signedUrl) {
+        return res.redirect(signedUrl);
+      }
+    }
 
     if (!filePath || !fs.existsSync(filePath)) {
       return res.status(404).send('Screenshot file not found on disk');

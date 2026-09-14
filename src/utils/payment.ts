@@ -31,12 +31,14 @@ export interface BookingCreationResponse {
     totalAmount: number;
     expiresAt: string;
     statusToken: string;
+    downloadToken?: string;
     appIntents: {
       phonepe: string;
       google_pay: string;
       paytm: string;
-      fam: string;
+      other_upi: string;
       standard: string;
+      fam?: string;
     };
   };
 }
@@ -47,6 +49,7 @@ export interface PaymentProofParams {
   screenshotBase64: string;
   selectedApp: string;
   consentGiven: boolean;
+  statusToken?: string;
 }
 
 export interface PaymentProofResponse {
@@ -88,16 +91,22 @@ export async function createBooking(params: BookingCreationParams): Promise<Book
  * Submits mandatory payment proof (UTR, payment screenshot, and user consent) for verification.
  */
 export async function submitPaymentProof(params: PaymentProofParams): Promise<PaymentProofResponse> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (params.statusToken) {
+    headers['Authorization'] = `Bearer ${params.statusToken}`;
+  }
+
   const response = await fetch(`/api/bookings/${params.publicId}/payment-proof`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       utr: params.utr,
       screenshotBase64: params.screenshotBase64,
       selectedApp: params.selectedApp,
       consentGiven: params.consentGiven,
+      statusToken: params.statusToken,
     }),
   });
 
@@ -116,7 +125,8 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
 export function pollPaymentStatus(
   publicId: string,
   onStatusChange: (status: string, message: string, booking?: CouponBooking) => void,
-  intervalMs = 3000
+  intervalMs = 3000,
+  statusToken?: string
 ): () => void {
   let isCancelled = false;
 
@@ -124,13 +134,17 @@ export function pollPaymentStatus(
     if (isCancelled) return;
 
     try {
-      const res = await fetch(`/api/bookings/${publicId}/status`);
+      const headers: Record<string, string> = {};
+      if (statusToken) {
+        headers['Authorization'] = `Bearer ${statusToken}`;
+      }
+      const res = await fetch(`/api/bookings/${publicId}/status`, { headers });
       if (res.ok) {
         const json = await res.json();
         if (json.success && json.data) {
           const b = json.data;
 
-          if (b.status === 'proof_verified' || b.status === 'payment_confirmed') {
+          if (b.status === 'payment_confirmed' || b.status === 'proof_verified') {
             const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
             const confirmedBooking: CouponBooking = {
               id: b.publicId,
@@ -149,7 +163,7 @@ export function pollPaymentStatus(
               status: 'confirmed',
               transactionRef: 'AUTOMATED_PROOF_VERIFIED',
             };
-            onStatusChange('proof_verified', b.message, confirmedBooking);
+            onStatusChange('payment_confirmed', b.message, confirmedBooking);
             return; // stop polling
           }
 

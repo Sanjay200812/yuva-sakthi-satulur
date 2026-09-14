@@ -8,10 +8,12 @@ import { createServer as createViteServer } from 'vite';
 import { config, getPublicConfig, canAcceptPayments } from './server/config/eventConfig.ts';
 import { db } from './server/db/client.ts';
 import { generateUpiPaymentSession } from './server/upi/upiUri.ts';
-import { processPaymentScreenshot } from './server/upi/imageProcessor.ts';
+import { processPaymentScreenshot, hammingDistance } from './server/upi/imageProcessor.ts';
 import { analyzePaymentScreenshotWithGemini } from './server/upi/geminiAnalyzer.ts';
 import { performDeterministicComparison, normalizeUtr } from './server/upi/deterministicMatcher.ts';
 import { finalizeVerifiedSubmission } from './server/upi/automatedFinalizer.ts';
+import { encryptSensitiveField } from './server/utils/crypto.ts';
+import { getAdminSession } from './server/admin/auth.ts';
 import { confirmPaymentFromBankRecord } from './server/upi/adminReconciliation.ts';
 import { allocateCouponsForBooking } from './server/services/couponAllocator.ts';
 import {
@@ -148,8 +150,8 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
       `INSERT INTO bookings (
         id, public_id, participant_name, phone, village, quantity,
         unit_price_paise, total_amount_paise, status, provider_name,
-        download_token_hash, status_token_hash, selected_upi_app, payment_reference
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        download_token_hash, status_token_hash, selected_upi_app, payment_reference, payment_expires_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         bookingId,
         publicId,
@@ -165,6 +167,7 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
         statusTokenHash,
         selectedApp || 'other_upi',
         paymentReference,
+        upiSession.expiresAt,
       ]
     );
 
@@ -180,6 +183,7 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
           quantity: qty,
           totalAmount: totalAmountPaise / 100,
           status: 'payment_initiated',
+          expiresAt: upiSession.expiresAt,
         },
         payment: {
           clientTxnId: paymentReference,
@@ -193,6 +197,7 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
           totalAmount: totalAmountPaise / 100,
           expiresAt: upiSession.expiresAt,
           statusToken,
+          downloadToken,
           appIntents: upiSession.appIntents,
         },
       },
@@ -206,86 +211,149 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
   }
 });
 
-// 5. Submit Mandatory Payment Proof (UTR + Screenshot + Consent)
+// 5. Submit Mandatory Payment Proof (12-Digit RRN + Screenshot + Consent)
 app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
     const { utr, screenshotBase64, selectedApp, consentGiven } = req.body;
 
-    // 1. Validate Consent
-    if (!consentGiven) {
-      return res.status(400).json({
+    // 0. Secure Token Authentication
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : ((req.headers['x-booking-token'] as string) || (req.body.statusToken as string) || (req.query.token as string));
+
+    if (!token) {
+      return res.status(401).json({
         success: false,
-        error: { code: 'CONSENT_REQUIRED', message: 'You must consent to automated image analysis and administrator verification.' },
+        error: { code: 'UNAUTHORIZED', message: 'Valid booking access token is required.' },
       });
     }
 
-    // 2. Validate UTR
-    if (!utr || typeof utr !== 'string' || utr.trim().length < 6) {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'INVALID_UTR', message: 'Please enter a valid 12-digit UTR/RRN/Transaction reference number.' },
-      });
-    }
-
-    // 3. Validate Screenshot presence
-    if (!screenshotBase64 || typeof screenshotBase64 !== 'string') {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'MISSING_SCREENSHOT', message: 'Payment confirmation screenshot is mandatory.' },
-      });
-    }
-
-    // 4. Find Booking
+    // 1. Find Booking
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
     if (bookingRes.rows.length === 0) {
       return res.status(404).json({ success: false, error: { message: 'Booking not found.' } });
     }
 
     const booking = bookingRes.rows[0];
-    if (booking.status === 'payment_confirmed') {
-      return res.json({
-        success: true,
-        data: { status: 'payment_confirmed', message: 'Payment already confirmed. Coupons are available.' },
+
+    // Validate access token hash
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    if (booking.status_token_hash && booking.status_token_hash !== tokenHash) {
+      return res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Invalid booking access token.' },
       });
     }
 
-    // 5. Clean & Decode Screenshot Buffer
+    // 2. Server-Enforced Expiry Check (5-Minute Session)
+    const isExpired = booking.status === 'expired' || (booking.payment_expires_at && new Date(booking.payment_expires_at).getTime() < Date.now());
+    if (isExpired) {
+      if (booking.status !== 'expired') {
+        await db.query('UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3', ['expired', new Date().toISOString(), booking.id]);
+      }
+      return res.status(400).json({
+        success: false,
+        error: { code: 'PAYMENT_SESSION_EXPIRED', message: 'Payment session expired. Start a new booking.' },
+      });
+    }
+
+    // 3. Validate Consent
+    if (!consentGiven) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'CONSENT_REQUIRED', message: 'You must consent to automated image analysis.' },
+      });
+    }
+
+    // 4. Strict 12-Digit Numeric RRN Validation
+    const normalizedUtr = normalizeUtr(String(utr || ''));
+    if (!normalizedUtr || !/^\d{12}$/.test(normalizedUtr)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_RRN', message: 'Please enter a valid 12-digit UPI RRN / Transaction reference number.' },
+      });
+    }
+
+    // 5. Validate Screenshot Presence
+    if (!screenshotBase64 || typeof screenshotBase64 !== 'string' || !screenshotBase64.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'MISSING_SCREENSHOT', message: 'Payment confirmation screenshot is mandatory.' },
+      });
+    }
+
+    // 6. Idempotency: Return immediately if already confirmed
+    if (booking.status === 'payment_confirmed' || booking.status === 'proof_verified') {
+      const existingCoupons = await db.query(
+        'SELECT coupon_number, holder_name, phone, village, ticket_index, total_quantity, issued_at FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
+        [booking.id]
+      );
+      return res.json({
+        success: true,
+        data: {
+          status: 'payment_confirmed',
+          message: 'Payment proof accepted',
+          coupons: existingCoupons.rows,
+          couponsIssuedCount: existingCoupons.rows.length,
+          downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
+        },
+      });
+    }
+
+    // 7. Clean & Decode Screenshot Buffer
     const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, '');
     const imageBuffer = Buffer.from(cleanBase64, 'base64');
 
-    // 6. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to disk
+    // 8. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
     const processed = await processPaymentScreenshot(imageBuffer, booking.id);
 
-    // 7. Check Duplicate UTR (Global uniqueness check)
-    const normalizedUtr = normalizeUtr(utr);
+    // 9. Check Duplicate RRN (Global uniqueness check)
     const utrHash = crypto.createHash('sha256').update(normalizedUtr).digest('hex');
-
     const dupUtrRes = await db.query(
-      'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3',
-      [utrHash, booking.id, 'admin_rejected']
+      'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
+      [utrHash, booking.id, 'admin_rejected', 'ai_check_failed']
     );
     const isDuplicateUtr = dupUtrRes.rows.length > 0;
 
-    // 8. Check Duplicate Screenshot Hash
+    // 10. Check Duplicate Screenshot Hash
     const dupScreenRes = await db.query(
-      'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3',
-      [processed.sha256, booking.id, 'admin_rejected']
+      'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4',
+      [processed.sha256, booking.id, 'admin_rejected', 'ai_check_failed']
     );
-    const isDuplicateScreenshot = dupScreenRes.rows.length > 0;
+    let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
 
-    // 9. Run Gemini-Assisted OCR & Risk Analysis
+    // 10b. Perceptual dHash Duplicate Detection
+    if (!isDuplicateScreenshot && processed.phash) {
+      const pastSubs = await db.query(
+        'SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3',
+        [booking.id, 'admin_rejected', 'ai_check_failed']
+      );
+      for (const past of pastSubs.rows) {
+        if (past.screenshot_phash) {
+          const dist = hammingDistance(processed.phash, past.screenshot_phash);
+          // If images are virtually identical and amount matches, flag duplicate screenshot
+          if (dist <= 2 && past.expected_amount_paise === booking.total_amount_paise) {
+            isDuplicateScreenshot = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 11. Run Gemini-Assisted OCR & Risk Analysis
     const extraction = await analyzePaymentScreenshotWithGemini(
       processed.sanitizedBuffer,
       processed.mimeType
     );
 
-    // 10. Run Deterministic Comparison Engine
+    // 12. Run Deterministic Comparison Engine (Fail-Closed)
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: utr,
+      enteredUtr: normalizedUtr,
       selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
       extraction,
       isDuplicateUtr,
@@ -295,12 +363,10 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     const submissionId = crypto.randomUUID();
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
 
-    // Simple symmetric encryption for raw UTR at rest
-    const cipher = crypto.createCipheriv('aes-256-ecb', Buffer.from(config.FIELD_ENCRYPTION_KEY.slice(0, 32)), null);
-    let encryptedUtr = cipher.update(normalizedUtr, 'utf8', 'hex');
-    encryptedUtr += cipher.final('hex');
+    // Authenticated AES-256-GCM encryption for sensitive RRN at rest
+    const encryptedUtr = encryptSensitiveField(normalizedUtr);
 
-    // 11. Persist payment submission record
+    // 13. Persist payment submission record
     await db.query(
       `INSERT INTO payment_submissions (
         id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
@@ -335,7 +401,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       ]
     );
 
-    // 12. Record verification run
+    // 14. Record verification run
     const runId = crypto.randomUUID();
     await db.query(
       `INSERT INTO payment_verification_runs (
@@ -354,25 +420,29 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     );
 
     if (match.passed) {
-      // Transition to awaiting_admin_review (Coupons issued strictly on admin bank reconciliation)
-      await db.query(
-        'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
-        ['awaiting_admin_review', new Date().toISOString(), booking.id]
-      );
+      // 15. AUTOMATED FINALIZATION: Atomic transaction locks booking, allocates sequential coupons, and transitions to payment_confirmed
+      const finalResult = await finalizeVerifiedSubmission({
+        submissionId,
+        bookingId: booking.id,
+        decisionVersion: 'v2-automated-gemini-deterministic',
+      });
 
       return res.json({
         success: true,
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: 'awaiting_admin_review',
+          status: 'payment_confirmed',
           reviewStatus: 'ai_check_passed',
-          message: 'Details matched, awaiting bank confirmation',
+          message: 'Payment proof accepted',
+          coupons: finalResult.coupons,
+          couponsIssuedCount: finalResult.couponsIssuedCount,
+          downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
           details: match.details,
         },
       });
     } else {
-      // Step 5 Fail-Closed: mark booking ai_check_failed
+      // Step Fail-Closed: mark booking ai_check_failed
       await db.query(
         'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
         ['ai_check_failed', new Date().toISOString(), booking.id]
@@ -403,10 +473,21 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
   }
 });
 
-// 6. Booking Status Polling Endpoint
+// 6. Booking Status Polling Endpoint (Secured by Access Token)
 app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : ((req.query.token as string) || (req.query.statusToken as string) || (req.headers['x-booking-token'] as string));
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Valid booking access token is required.' },
+      });
+    }
 
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
     if (bookingRes.rows.length === 0) {
@@ -415,7 +496,23 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
 
     const booking = bookingRes.rows[0];
 
-    const isConfirmed = booking.status === 'payment_confirmed';
+    // Enforce booking status token authentication
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    if (booking.status_token_hash && booking.status_token_hash !== tokenHash) {
+      return res.status(401).json({
+        success: false,
+        error: { code: 'UNAUTHORIZED', message: 'Invalid booking access token.' },
+      });
+    }
+
+    // Check expiry
+    const isExpired = booking.status === 'expired' || (booking.payment_expires_at && new Date(booking.payment_expires_at).getTime() < Date.now() && booking.status === 'payment_initiated');
+    if (isExpired && booking.status === 'payment_initiated') {
+      await db.query('UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3', ['expired', new Date().toISOString(), booking.id]);
+      booking.status = 'expired';
+    }
+
+    const isConfirmed = booking.status === 'payment_confirmed' || booking.status === 'proof_verified';
     let coupons: any[] = [];
     if (isConfirmed) {
       const couponsRes = await db.query(
@@ -433,10 +530,10 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
     const latestSub = subRes.rows[0];
 
     let userMessage = 'Payment not yet submitted';
-    if (booking.status === 'ai_checking' || booking.status === 'proof_submitted') {
+    if (booking.status === 'expired') {
+      userMessage = 'Payment session expired. Start a new booking.';
+    } else if (booking.status === 'ai_checking' || booking.status === 'proof_submitted') {
       userMessage = 'Checking uploaded proof...';
-    } else if (booking.status === 'awaiting_admin_review') {
-      userMessage = 'Details matched, awaiting bank confirmation';
     } else if (isConfirmed) {
       userMessage = 'Payment confirmed, coupons ready';
     } else if (booking.status === 'ai_check_failed' || booking.status === 'verification_failed') {
@@ -453,7 +550,7 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
       success: true,
       data: {
         publicId: booking.public_id,
-        status: booking.status,
+        status: isConfirmed ? 'payment_confirmed' : booking.status,
         isConfirmed,
         isVerified: isConfirmed,
         quantity: booking.quantity,
@@ -461,7 +558,7 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
         paidAt: booking.paid_at || booking.verified_at,
         message: userMessage,
         coupons,
-        downloadUrl: isConfirmed ? `/api/bookings/${booking.public_id}/download-all` : null,
+        downloadUrl: isConfirmed ? `/api/bookings/${booking.public_id}/download-all?token=${token}` : null,
       },
     });
   } catch (error: any) {
@@ -470,19 +567,39 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
   }
 });
 
-// 7. Get Issued Coupons for Booking
+// 7. Get Issued Coupons for Booking (Secured by token or admin session)
 app.get('/api/bookings/:publicId/coupons', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
-    const bookingRes = await db.query('SELECT id, status FROM bookings WHERE public_id = $1', [publicId]);
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : ((req.query.token as string) || (req.headers['x-booking-token'] as string));
+    const adminToken = req.cookies?.admin_session || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null);
+    const adminSession = adminToken ? getAdminSession(adminToken) : null;
+
+    const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
     if (bookingRes.rows.length === 0) {
       return res.status(404).json({ success: false, error: { message: 'Booking not found.' } });
     }
 
     const booking = bookingRes.rows[0];
-    const isConfirmed = booking.status === 'payment_confirmed';
+
+    let isAuthorized = !!adminSession;
+    if (!isAuthorized && token) {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      if (booking.status_token_hash === tokenHash || booking.download_token_hash === tokenHash) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
+      return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Valid booking access token is required.' } });
+    }
+
+    const isConfirmed = booking.status === 'payment_confirmed' || booking.status === 'proof_verified';
     if (!isConfirmed) {
-      return res.status(403).json({ success: false, error: { message: 'Payment not yet confirmed by administrator.' } });
+      return res.status(403).json({ success: false, error: { message: 'Payment not yet confirmed.' } });
     }
 
     const couponsRes = await db.query(
@@ -561,6 +678,25 @@ app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Respons
     const bookingRes = await db.query('SELECT * FROM bookings WHERE id = $1', [coupon.booking_id]);
     const booking = bookingRes.rows[0];
 
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : ((req.query.token as string) || (req.headers['x-booking-token'] as string));
+    const adminToken = req.cookies?.admin_session || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null);
+    const adminSession = adminToken ? getAdminSession(adminToken) : null;
+
+    let isAuthorized = !!adminSession;
+    if (!isAuthorized && token) {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      if (booking.download_token_hash === tokenHash || booking.status_token_hash === tokenHash) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
+      return res.status(401).send('Unauthorized. Valid booking download token or admin session is required.');
+    }
+
     const isVerified = (booking?.status === 'proof_verified' || booking?.status === 'payment_confirmed') && coupon.status === 'valid';
     if (!isVerified) {
       return res.status(403).send('Ticket cannot be downloaded until payment proof is verified.');
@@ -595,10 +731,17 @@ app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Respons
   }
 });
 
-// 10. Download All Tickets for a Booking (ZIP or Multi-page PDF)
+// 10. Download All Tickets for a Booking (ZIP or Multi-page PDF, secured by token or admin session)
 app.get('/api/bookings/:publicId/download-all', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : ((req.query.token as string) || (req.headers['x-booking-token'] as string));
+    const adminToken = req.cookies?.admin_session || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null);
+    const adminSession = adminToken ? getAdminSession(adminToken) : null;
+
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
 
     if (bookingRes.rows.length === 0) {
@@ -606,6 +749,19 @@ app.get('/api/bookings/:publicId/download-all', async (req: Request, res: Respon
     }
 
     const booking = bookingRes.rows[0];
+
+    let isAuthorized = !!adminSession;
+    if (!isAuthorized && token) {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      if (booking.download_token_hash === tokenHash || booking.status_token_hash === tokenHash) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
+      return res.status(401).send('Unauthorized. Valid booking access token or admin session is required.');
+    }
+
     const isVerified = booking.status === 'proof_verified' || booking.status === 'payment_confirmed';
     if (!isVerified) {
       return res.status(403).send('Tickets cannot be downloaded until payment proof is verified.');
@@ -685,7 +841,7 @@ app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate
             id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
             expected_payee_name, expected_amount_paise, payer_utr_hash, status
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [targetSubId, targetBookingId, 'YSYS-SIM-REF', 'phonepe', config.PAYEE_UPI_ID, config.PAYEE_DISPLAY_NAME, expectedAmount, simUtrHash, 'awaiting_admin_review']
+          [targetSubId, targetBookingId, 'YSYS-SIM-REF', 'phonepe', config.PAYEE_UPI_ID, config.PAYEE_DISPLAY_NAME, expectedAmount, simUtrHash, 'proof_submitted']
         );
       }
     }
@@ -694,19 +850,10 @@ app.post(['/api/test-mode/simulate-proof-verification', '/api/test-mode/simulate
       return res.status(400).json({ error: 'No booking or submission found to verify.' });
     }
 
-    const subData = await db.query('SELECT expected_amount_paise FROM payment_submissions WHERE id = $1', [targetSubId]);
-    const requiredAmount = subData.rows[0]?.expected_amount_paise || 5000;
-
-    const result = await confirmPaymentFromBankRecord({
+    const result = await finalizeVerifiedSubmission({
       submissionId: targetSubId,
-      adminUserId: '00000000-0000-0000-0000-000000000001',
-      bankRecordMatch: {
-        bankTxnId: 'SIM-BANK-TXN-123456',
-        receivedAmountPaise: requiredAmount,
-        recipientAccount: config.PAYEE_UPI_ID,
-        matchNote: 'Simulated bank match in test mode',
-      },
-      auditNote: 'Simulated test bank confirmation',
+      bookingId: targetBookingId,
+      decisionVersion: 'test-simulation',
     });
 
     res.json({ success: true, data: result });

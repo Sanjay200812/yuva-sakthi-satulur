@@ -96,8 +96,92 @@ export async function computePerceptualHash(buffer: Buffer): Promise<string> {
 }
 
 /**
+ * Computes the Hamming distance (number of bit positions where bits differ)
+ * between two 64-bit hexadecimal hashes (16 hex chars).
+ */
+export function hammingDistance(h1: string, h2: string): number {
+  if (!h1 || !h2) return 64;
+  const len = Math.min(h1.length, h2.length);
+  let dist = 0;
+  for (let i = 0; i < len; i++) {
+    const v1 = parseInt(h1[i], 16);
+    const v2 = parseInt(h2[i], 16);
+    let xor = (isNaN(v1) ? 0 : v1) ^ (isNaN(v2) ? 0 : v2);
+    while (xor > 0) {
+      dist += xor & 1;
+      xor >>= 1;
+    }
+  }
+  dist += Math.abs(h1.length - h2.length) * 4;
+  return dist;
+}
+
+/**
+ * Uploads sanitized screenshot buffer to private Supabase Storage bucket.
+ * Returns the object path if successful.
+ */
+async function uploadToSupabaseStorage(
+  buffer: Buffer,
+  objectPath: string,
+  mimeType: string
+): Promise<boolean> {
+  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY) {
+    return false;
+  }
+  try {
+    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/${config.PAYMENT_PROOF_BUCKET}/${objectPath}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': mimeType,
+        'x-upsert': 'true',
+      },
+      body: buffer,
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('⚠️ Supabase Storage upload error, using filesystem fallback:', err);
+    return false;
+  }
+}
+
+/**
+ * Generates an authenticated short-lived signed URL for an admin to view a payment proof.
+ */
+export async function getSignedScreenshotUrl(storagePath: string, expiresIn = 300): Promise<string | null> {
+  if (!storagePath) return null;
+  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY) {
+    return null;
+  }
+  try {
+    const cleanPath = storagePath.startsWith('supabase:') ? storagePath.replace('supabase:', '') : storagePath;
+    const url = `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1/object/sign/${config.PAYMENT_PROOF_BUCKET}/${cleanPath}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': config.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ expiresIn }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.signedURL) {
+        return `${config.SUPABASE_URL.replace(/\/+$/, '')}/storage/v1${data.signedURL}`;
+      }
+    }
+  } catch (err) {
+    console.warn('⚠️ Failed to generate signed Supabase URL:', err);
+  }
+  return null;
+}
+
+/**
  * Strips metadata, validates dimensions/size, re-encodes to clean JPEG,
- * and persists to private storage directory.
+ * and persists to private Supabase bucket or fallback uploads directory.
  */
 export async function processPaymentScreenshot(
   rawBuffer: Buffer,
@@ -141,15 +225,24 @@ export async function processPaymentScreenshot(
   const sha256 = crypto.createHash('sha256').update(sanitizedBuffer).digest('hex');
   const phash = await computePerceptualHash(sanitizedBuffer);
 
-  // 5. Persist to private uploads folder
-  const uploadDir = path.resolve(process.cwd(), 'uploads', 'payment-proofs', bookingId);
-  if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-  }
-
   const filename = `${sha256.slice(0, 16)}.jpg`;
-  const storagePath = path.join(uploadDir, filename);
-  fs.writeFileSync(storagePath, sanitizedBuffer);
+  const objectPath = `${bookingId}/${filename}`;
+
+  // 5. Try Supabase Storage upload if configured
+  const uploadedToSupabase = await uploadToSupabaseStorage(sanitizedBuffer, objectPath, 'image/jpeg');
+
+  let storagePath: string;
+  if (uploadedToSupabase) {
+    storagePath = `supabase:${objectPath}`;
+  } else {
+    // Local filesystem fallback for local development / testing
+    const uploadDir = path.resolve(process.cwd(), 'uploads', 'payment-proofs', bookingId);
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    storagePath = path.join(uploadDir, filename);
+    fs.writeFileSync(storagePath, sanitizedBuffer);
+  }
 
   return {
     sanitizedBuffer,

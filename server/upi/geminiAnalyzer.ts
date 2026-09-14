@@ -4,7 +4,7 @@ import { config } from '../config/eventConfig.ts';
 export interface GeminiExtractionResult {
   looks_like_payment_screen: boolean;
   visible_payment_status: 'success' | 'pending' | 'failed' | 'unknown';
-  app_name: 'phonepe' | 'google_pay' | 'paytm' | 'fam' | 'other' | 'unknown';
+  app_name: 'phonepe' | 'google_pay' | 'paytm' | 'other' | 'unknown';
   amount: string | null;
   currency: string | null;
   payee_name: string | null;
@@ -101,7 +101,7 @@ export async function analyzePaymentScreenshotWithGemini(
             },
             app_name: {
               type: 'STRING' as any,
-              enum: ['phonepe', 'google_pay', 'paytm', 'fam', 'other', 'unknown'],
+              enum: ['phonepe', 'google_pay', 'paytm', 'other', 'unknown'],
             },
             amount: { type: 'STRING' as any, nullable: true },
             currency: { type: 'STRING' as any, nullable: true },

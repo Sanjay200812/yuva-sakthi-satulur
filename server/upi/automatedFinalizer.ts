@@ -17,8 +17,8 @@ export interface FinalizedBookingResult {
 
 /**
  * Concurrency-safe, atomic automated finalization.
- * Locks the booking and submission, checks idempotency, validates UTR uniqueness,
- * transitions statuses to 'proof_verified', allocates unique sequential coupon numbers,
+ * Locks the booking and submission, checks idempotency, validates RRN uniqueness,
+ * transitions statuses to 'payment_confirmed', allocates unique sequential coupon numbers,
  * and creates coupon records and system audit log.
  */
 export async function finalizeVerifiedSubmission(
@@ -40,13 +40,13 @@ export async function finalizeVerifiedSubmission(
     const booking = bRes.rows[0];
 
     // Check if already finalized (Idempotency)
-    if (booking.status === 'proof_verified') {
+    if (booking.status === 'payment_confirmed' || booking.status === 'proof_verified') {
       const existingCoupons = await client.query(
         'SELECT * FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
         [booking.id]
       );
       return {
-        booking,
+        booking: { ...booking, status: 'payment_confirmed' },
         coupons: existingCoupons.rows,
         couponsIssuedCount: existingCoupons.rows.length,
       };
@@ -59,34 +59,35 @@ export async function finalizeVerifiedSubmission(
     }
     const submission = sRes.rows[0];
 
-    // 3. Enforce global UTR uniqueness among verified submissions
+    // 3. Enforce global RRN uniqueness among verified submissions
     if (submission.payer_utr_hash) {
       const existingUtrRes = await client.query(
         `SELECT id, booking_id FROM payment_submissions 
-         WHERE payer_utr_hash = $1 AND status = 'proof_verified' AND booking_id != $2`,
+         WHERE payer_utr_hash = $1 AND status IN ('payment_confirmed', 'proof_verified') AND booking_id != $2`,
         [submission.payer_utr_hash, booking.id]
       );
       if (existingUtrRes.rows.length > 0) {
-        throw new Error('This UTR has already been finalized for another booking.');
+        throw new Error('This 12-digit UPI RRN has already been finalized for another booking.');
       }
     }
 
     const finalizedAt = new Date().toISOString();
 
-    // 4. Update payment submission to proof_verified
+    // 4. Update payment submission to payment_confirmed
     await client.query(
       `UPDATE payment_submissions 
-       SET status = 'proof_verified', 
+       SET status = 'payment_confirmed', 
            ai_model_version = $1, 
            updated_at = $2
        WHERE id = $3`,
       [decisionVersion, finalizedAt, submission.id]
     );
 
-    // 5. Update booking to proof_verified
+    // 5. Update booking to payment_confirmed
     await client.query(
       `UPDATE bookings 
-       SET status = 'proof_verified', 
+       SET status = 'payment_confirmed', 
+           paid_at = $1,
            verified_at = $1, 
            updated_at = $1 
        WHERE id = $2`,
@@ -173,7 +174,7 @@ export async function finalizeVerifiedSubmission(
     );
 
     return {
-      booking: { ...booking, status: 'proof_verified', verified_at: finalizedAt },
+      booking: { ...booking, status: 'payment_confirmed', paid_at: finalizedAt, verified_at: finalizedAt },
       coupons: issuedCoupons,
       couponsIssuedCount: quantity,
     };

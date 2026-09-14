@@ -22,7 +22,7 @@ export interface UpiSessionResult {
     phonepe: string;
     google_pay: string;
     paytm: string;
-    fam: string;
+    other_upi: string;
     standard: string;
   };
 }
@@ -94,7 +94,7 @@ export async function generateUpiPaymentSession(input: UpiSessionInput): Promise
     phonepe: `phonepe://pay?${queryString}`,
     google_pay: `gpay://upi/pay?${queryString}`,
     paytm: `paytmmp://pay?${queryString}`,
-    fam: `fampay://pay?${queryString}`,
+    other_upi: canonicalUri,
     standard: canonicalUri,
   };
 

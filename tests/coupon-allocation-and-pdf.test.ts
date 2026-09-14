@@ -123,4 +123,36 @@ describe('Phase 11: Coupon Allocation and Multi-Format Pass Rendering', () => {
     expect(data.maskedPhone).toBe('XXXXXX2345');
     expect(data.maskedPhone).not.toBe('9848012345');
   });
+
+  it('enforces download authorization: unauthenticated coupon download is blocked with 401', async () => {
+    // 1. Create and confirm a booking
+    const bookingRes = await request(app)
+      .post('/api/bookings')
+      .send({
+        name: 'Download Auth User',
+        phone: '9848099111',
+        village: 'Satulur',
+        quantity: 1,
+      });
+
+    const { booking, payment } = bookingRes.body.data;
+    await request(app)
+      .post('/api/test-mode/simulate-payment')
+      .send({ clientTxnId: payment.clientTxnId });
+
+    const statusRes = await request(app)
+      .get(`/api/bookings/${booking.publicId}/status?token=${payment.statusToken}`);
+    const couponNumber = statusRes.body.data.coupons[0].coupon_number;
+
+    // 2. Attacker without downloadToken gets 401
+    const unauthDownload = await request(app)
+      .get(`/api/coupons/${couponNumber}/download?format=pdf`);
+    expect(unauthDownload.status).toBe(401);
+
+    // 3. Authorized customer with downloadToken gets 200 and valid PDF buffer
+    const authDownload = await request(app)
+      .get(`/api/coupons/${couponNumber}/download?format=pdf&token=${payment.downloadToken}`);
+    expect(authDownload.status).toBe(200);
+    expect(authDownload.headers['content-type']).toContain('application/pdf');
+  });
 });

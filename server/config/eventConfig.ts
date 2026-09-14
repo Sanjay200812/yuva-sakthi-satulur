@@ -19,7 +19,7 @@ const envSchema = z.object({
   }, z.string().url()).default('http://localhost:3000'),
 
   // Security
-  SESSION_SECRET: z.string().min(16).default('super-secret-yuva-shakti-key-change-in-prod-min-16-chars'),
+  SESSION_SECRET: z.string().min(16).default(process.env.SESSION_SECRET || 'dev-session-secret-yuva-shakti-satulur-min-32-chars-long'),
   ADMIN_EMAIL: z.string().email().default('admin@yuvashakti.org'),
 
   // Database
@@ -28,17 +28,17 @@ const envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 
   // Direct Merchant-UPI & Gemini Verification Configuration
-  PAYMENT_MODE: z.string().default('direct_upi_manual_reconciliation'),
+  PAYMENT_MODE: z.string().default('direct_upi_automated_verification'),
   PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || '9574876369@ybl'),
   PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur'),
   UPI_TRANSACTION_NOTE_PREFIX: z.string().default(process.env.UPI_TRANSACTION_NOTE_PREFIX || 'YSYS'),
-  PAYMENT_SESSION_MINUTES: z.coerce.number().int().positive().default(20),
+  PAYMENT_SESSION_MINUTES: z.coerce.number().int().positive().default(5),
   PAYMENT_SCREENSHOT_MAX_BYTES: z.coerce.number().int().positive().default(5242880),
   PAYMENT_PROOF_BUCKET: z.string().default('payment-proofs'),
   GEMINI_API_KEY: z.string().default(process.env.GEMINI_API_KEY || ''),
   GEMINI_MODEL: z.string().default(process.env.GEMINI_MODEL || 'gemini-2.5-flash'),
   GEMINI_STORE_INTERACTIONS: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(false),
-  FIELD_ENCRYPTION_KEY: z.string().default(process.env.FIELD_ENCRYPTION_KEY || 'c9b68a3f81e9b2512a8848db92ea91bc310dc2e811c7fae98f0601931889c02b'),
+  FIELD_ENCRYPTION_KEY: z.string().default(process.env.FIELD_ENCRYPTION_KEY || ''),
 
   // Event Configuration
   EVENT_NAME: z.string().default('Yuva Shakti Youth Satulur Lucky Draw'),
@@ -71,6 +71,18 @@ if (!parsedEnv.success) {
 }
 
 export const config = parsedEnv.success ? parsedEnv.data : envSchema.parse({});
+
+// Production Security Validation (Fail Closed)
+if (config.NODE_ENV === 'production') {
+  if (!config.FIELD_ENCRYPTION_KEY || !/^[0-9a-fA-F]{64}$/.test(config.FIELD_ENCRYPTION_KEY)) {
+    console.error('❌ FATAL: In production, FIELD_ENCRYPTION_KEY must be a 64-character hex string (32 bytes).');
+    process.exit(1);
+  }
+  if (!config.SESSION_SECRET || config.SESSION_SECRET.length < 32 || config.SESSION_SECRET.includes('dev-session-secret')) {
+    console.error('❌ FATAL: In production, SESSION_SECRET must be at least 32 characters and not a default secret.');
+    process.exit(1);
+  }
+}
 
 // Server validation for payment creation
 export function canAcceptPayments(): { allowed: boolean; reason?: string } {

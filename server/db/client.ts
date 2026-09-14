@@ -129,13 +129,18 @@ class MemoryDB implements TransactionalDB {
 
     // 5. Update booking status
     if (trimmed.startsWith('UPDATE bookings')) {
-      const id = params[params.length - 1];
-      const b = this.bookings.get(id);
+      const idOrPubId = params[params.length - 1];
+      const b = this.bookings.get(idOrPubId) || Array.from(this.bookings.values()).find((bk) => bk.public_id === idOrPubId);
       if (b) {
+        if (trimmed.includes('payment_expires_at = $1')) {
+          b.payment_expires_at = params[0];
+        }
         if (trimmed.includes("status = 'payment_confirmed'")) {
           b.status = 'payment_confirmed';
         } else if (trimmed.includes("status = 'payment_rejected'")) {
           b.status = 'payment_rejected';
+        } else if (trimmed.includes("status = 'expired'")) {
+          b.status = 'expired';
         } else if (trimmed.includes("status = 'proof_required'")) {
           b.status = 'proof_required';
         } else if (trimmed.includes("status = 'awaiting_admin_review'")) {
@@ -143,7 +148,7 @@ class MemoryDB implements TransactionalDB {
         } else if (trimmed.includes("status = 'ai_check_failed'")) {
           b.status = 'ai_check_failed';
         } else if (trimmed.includes("status = 'proof_verified'")) {
-          b.status = 'proof_verified';
+          b.status = 'payment_confirmed';
         } else if (trimmed.includes('status = $1')) {
           b.status = params[0];
         }
@@ -214,14 +219,14 @@ class MemoryDB implements TransactionalDB {
     // 7. Check UTR duplicate
     if (trimmed.includes('FROM payment_submissions') && trimmed.includes('payer_utr_hash = $1')) {
       const bookingIdToExclude = trimmed.includes('booking_id != $2') ? params[1] : null;
-      const requireConfirmed = trimmed.includes("status = 'admin_confirmed'");
-      const requireVerified = trimmed.includes("status = 'proof_verified'");
+      const requireConfirmed = trimmed.includes("status = 'admin_confirmed'") || trimmed.includes("status = 'payment_confirmed'") || trimmed.includes("status IN ('payment_confirmed', 'proof_verified')");
+      const requireVerified = trimmed.includes("status = 'proof_verified'") || trimmed.includes("status = 'payment_confirmed'");
       const found = Array.from(this.paymentSubmissions.values()).find(
         (s) =>
           s.payer_utr_hash === params[0] &&
           (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) &&
-          (!requireConfirmed || s.status === 'admin_confirmed') &&
-          (!requireVerified || s.status === 'proof_verified') &&
+          (!requireConfirmed || s.status === 'payment_confirmed' || s.status === 'admin_confirmed' || s.status === 'proof_verified') &&
+          (!requireVerified || s.status === 'proof_verified' || s.status === 'payment_confirmed') &&
           s.status !== 'admin_rejected' &&
           s.status !== 'verification_failed' &&
           s.status !== 'ai_check_failed'
@@ -279,14 +284,16 @@ class MemoryDB implements TransactionalDB {
       const id = params[params.length - 1];
       const s = this.paymentSubmissions.get(id);
       if (s) {
-        if (trimmed.includes("status = 'admin_confirmed'")) {
+        if (trimmed.includes("status = 'payment_confirmed'")) {
+          s.status = 'payment_confirmed';
+        } else if (trimmed.includes("status = 'admin_confirmed'")) {
           s.status = 'admin_confirmed';
         } else if (trimmed.includes("status = 'admin_rejected'")) {
           s.status = 'admin_rejected';
         } else if (trimmed.includes("status = 'superseded'")) {
           s.status = 'superseded';
         } else if (trimmed.includes("status = 'proof_verified'")) {
-          s.status = 'proof_verified';
+          s.status = 'payment_confirmed';
         } else if (trimmed.includes('status = $1')) {
           s.status = params[0];
         }
@@ -321,14 +328,30 @@ class MemoryDB implements TransactionalDB {
 
     // 11.5 Insert Admin Audit Logs
     if (trimmed.startsWith('INSERT INTO admin_audit_logs')) {
-      const [id, admin_user_id, action, entity_type, entity_id, metadata, created_at] = params;
+      let id, admin_user_id, action, entity_type, entity_id, metadata, created_at;
+      if (params.length === 6) {
+        [id, action, entity_type, entity_id, metadata, created_at] = params;
+        admin_user_id = null;
+      } else {
+        [id, admin_user_id, action, entity_type, entity_id, metadata, created_at] = params;
+      }
+
+      let parsedMeta = metadata;
+      if (typeof metadata === 'string') {
+        try {
+          parsedMeta = JSON.parse(metadata);
+        } catch {
+          parsedMeta = { raw: metadata };
+        }
+      }
+
       const log = {
         id: id || crypto.randomUUID(),
         admin_user_id,
         action,
         entity_type,
         entity_id,
-        metadata: typeof metadata === 'string' ? JSON.parse(metadata) : metadata,
+        metadata: parsedMeta,
         created_at: created_at || new Date().toISOString(),
       };
       return { rows: [log] as any, rowCount: 1 };
@@ -552,7 +575,7 @@ class MemoryDB implements TransactionalDB {
         .map((c) => {
           const b = this.bookings.get(c.booking_id);
           const sub = Array.from(this.paymentSubmissions.values()).find(
-            (s) => s.booking_id === c.booking_id && (s.status === 'admin_confirmed' || s.status === 'proof_verified')
+            (s) => s.booking_id === c.booking_id && (s.status === 'admin_confirmed' || s.status === 'proof_verified' || s.status === 'payment_confirmed')
           );
           return {
             ...c,
@@ -562,7 +585,7 @@ class MemoryDB implements TransactionalDB {
             amount_paise: b?.total_amount_paise || (c.total_quantity * 5000),
             provider_payment_id: sub?.payer_utr_hash ? `UTR-${sub.payer_utr_hash.slice(0, 8)}` : 'BANK_CONFIRMED',
             utr_display: sub ? `UTR: ${sub.payer_utr_hash.slice(0, 6)}...` : 'Bank Confirmed',
-            verification_method: sub?.status === 'admin_confirmed' ? 'Admin Bank Reconciliation' : 'Automated Proof Verification',
+            verification_method: 'Automated Proof Verification (Gemini OCR + Deterministic Rules)',
             confirming_admin: sub?.admin_reviewer_id || null,
             confirmed_at: sub?.reviewed_at || b?.paid_at || null,
           };

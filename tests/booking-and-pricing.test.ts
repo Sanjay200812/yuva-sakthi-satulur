@@ -55,7 +55,24 @@ describe('Phase 11: Booking and Pricing Validation', () => {
     expect(resExcess.status).toBe(400);
   });
 
-  it('calculates amount strictly on server at ₹50 per coupon and ignores client tampering', async () => {
+  it('calculates amount strictly on server at ₹50 per coupon: 2 coupons = exactly ₹100', async () => {
+    const res = await request(app)
+      .post('/api/bookings')
+      .send({
+        name: 'Srinivasa Rao',
+        phone: '9876543210',
+        village: 'Satulur Center',
+        quantity: 2,
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.booking.quantity).toBe(2);
+    expect(res.body.data.booking.totalAmount).toBe(100);
+    expect(res.body.data.payment.amountInr).toBe('100.00');
+  });
+
+  it('calculates amount strictly on server and completely ignores client amount tampering', async () => {
     const res = await request(app)
       .post('/api/bookings')
       .send({
@@ -65,6 +82,8 @@ describe('Phase 11: Booking and Pricing Validation', () => {
         quantity: 3,
         amount: 1, // Client attempting price tampering!
         price: 0,
+        total: 5,
+        totalAmountPaise: 100,
       });
 
     expect(res.status).toBe(200);
@@ -73,6 +92,54 @@ describe('Phase 11: Booking and Pricing Validation', () => {
     expect(res.body.data.booking.totalAmount).toBe(150);
     expect(res.body.data.booking.quantity).toBe(3);
     expect(res.body.data.booking.status).toBe('payment_initiated');
+    expect(res.body.data.payment.amountInr).toBe('150.00');
+  });
+
+  it('enforces a 5-minute payment session on the server and returns exact expiresAt', async () => {
+    const beforeTime = Date.now();
+    const res = await request(app)
+      .post('/api/bookings')
+      .send({
+        name: 'Lakshmi Narayana',
+        phone: '9876543210',
+        village: 'Satulur',
+        quantity: 1,
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.payment).toHaveProperty('expiresAt');
+
+    const expiresAtMs = new Date(res.body.data.payment.expiresAt).getTime();
+    // Expiry should be approximately 5 minutes (300,000 ms) from now (+/- 10s)
+    const diffMs = expiresAtMs - beforeTime;
+    expect(diffMs).toBeGreaterThanOrEqual(290000);
+    expect(diffMs).toBeLessThanOrEqual(315000);
+  });
+
+  it('protects private booking status: guessing public booking ID without statusToken returns 401', async () => {
+    const res = await request(app)
+      .post('/api/bookings')
+      .send({
+        name: 'Private User',
+        phone: '9848011223',
+        village: 'Satulur Secret',
+        quantity: 1,
+      });
+    const publicId = res.body.data.booking.publicId;
+    const statusToken = res.body.data.payment.statusToken;
+
+    // Attacker attempting to access private booking details using only the 6-digit public ID
+    const unauthRes = await request(app).get(`/api/bookings/${publicId}/status`);
+    expect(unauthRes.status).toBe(401);
+    expect(unauthRes.body.success).toBe(false);
+
+    // Legitimate client with statusToken in Authorization header
+    const authRes = await request(app)
+      .get(`/api/bookings/${publicId}/status`)
+      .set('Authorization', `Bearer ${statusToken}`);
+    expect(authRes.status).toBe(200);
+    expect(authRes.body.success).toBe(true);
+    expect(authRes.body.data.publicId).toBe(publicId);
   });
 
   it('returns safe public configuration from /api/config', async () => {
@@ -83,5 +150,6 @@ describe('Phase 11: Booking and Pricing Validation', () => {
     expect(res.body.canBook).toBe(true);
     expect(res.body).not.toHaveProperty('databaseUrl');
     expect(res.body).not.toHaveProperty('sessionSecret');
+    expect(res.body).not.toHaveProperty('fieldEncryptionKey');
   });
 });
