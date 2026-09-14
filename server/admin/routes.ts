@@ -8,6 +8,7 @@ import {
   comparePassword,
   createAdminSession,
   destroyAdminSession,
+  getAdminCookieOptions,
 } from './auth.ts';
 import { renderTicketPdf, renderTicketRaster, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
 import { getSignedScreenshotUrl } from '../upi/imageProcessor.ts';
@@ -38,7 +39,8 @@ router.post('/auth/login', async (req: Request, res: Response) => {
       });
     }
 
-    const userRes = await db.query('SELECT * FROM admin_users WHERE email = $1', [email.toLowerCase().trim()]);
+    const normalizedEmail = email.toLowerCase().trim();
+    const userRes = await db.query('SELECT * FROM admin_users WHERE email = $1', [normalizedEmail]);
     if (userRes.rows.length === 0) {
       return res.status(401).json({
         success: false,
@@ -47,6 +49,15 @@ router.post('/auth/login', async (req: Request, res: Response) => {
     }
 
     const user = userRes.rows[0];
+
+    // Check account active state
+    if (user.is_active === false) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'ACCOUNT_DISABLED', message: 'This admin account has been deactivated.' },
+      });
+    }
+
     const isMatch = await comparePassword(password, user.password_hash);
     if (!isMatch) {
       return res.status(401).json({
@@ -58,12 +69,7 @@ router.post('/auth/login', async (req: Request, res: Response) => {
     const token = createAdminSession({ id: user.id, email: user.email, role: user.role });
 
     // Set secure HTTP-only cookie
-    res.cookie('admin_session', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000,
-    });
+    res.cookie('admin_session', token, getAdminCookieOptions());
 
     return res.json({
       success: true,
@@ -79,10 +85,16 @@ router.post('/auth/login', async (req: Request, res: Response) => {
 });
 
 // 2. Admin Logout
-router.post('/auth/logout', requireAdminAuth, (req: Request, res: Response) => {
-  const token = req.cookies.admin_session || req.headers.authorization?.replace('Bearer ', '');
+router.post('/auth/logout', (req: Request, res: Response) => {
+  const token = req.cookies?.admin_session || req.headers.authorization?.replace('Bearer ', '');
   if (token) destroyAdminSession(token);
-  res.clearCookie('admin_session');
+  const cookieOpts = getAdminCookieOptions();
+  res.clearCookie('admin_session', {
+    httpOnly: cookieOpts.httpOnly,
+    secure: cookieOpts.secure,
+    sameSite: cookieOpts.sameSite,
+    path: cookieOpts.path,
+  });
   res.json({ success: true, message: 'Logged out successfully.' });
 });
 

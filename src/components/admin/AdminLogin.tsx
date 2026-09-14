@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, Mail, ShieldCheck, ArrowRight, AlertCircle, Loader2 } from 'lucide-react';
+import { safeFetchJson } from '../../utils/api.ts';
 
 interface AdminLoginProps {
   onLoginSuccess: (user: any) => void;
@@ -18,15 +19,18 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLoginSuccess, onBackTo
     setLoading(true);
 
     try {
-      const res = await fetch('/api/admin/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password }),
-      });
+      const data = await safeFetchJson<any>(
+        '/api/admin/auth/login',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+        },
+        'Admin authentication'
+      );
 
-      const data = await res.json();
-
-      if (!res.ok || !data.success) {
+      if (!data.success) {
         throw new Error(data.error?.message || 'Login failed. Please check your credentials.');
       }
 

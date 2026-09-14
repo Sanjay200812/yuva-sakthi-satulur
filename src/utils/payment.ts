@@ -1,4 +1,5 @@
 import { CouponBooking } from '../types.ts';
+import { safeFetchJson } from './api.ts';
 
 export interface BookingCreationParams {
   name: string;
@@ -69,17 +70,19 @@ export interface PaymentProofResponse {
  * Creates a genuine booking record on the server and generates a Direct UPI payment session.
  */
 export async function createBooking(params: BookingCreationParams): Promise<BookingCreationResponse> {
-  const response = await fetch('/api/bookings', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
+  const data = await safeFetchJson<any>(
+    '/api/bookings',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(params),
     },
-    body: JSON.stringify(params),
-  });
+    'Booking service'
+  );
 
-  const data = await response.json();
-
-  if (!response.ok || !data.success) {
+  if (!data.success) {
     throw new Error(data.error?.message || 'Failed to create booking.');
   }
 
@@ -97,20 +100,22 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
     headers['Authorization'] = `Bearer ${params.statusToken}`;
   }
 
-  const response = await fetch(`/api/bookings/${params.publicId}/payment-proof`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      screenshotBase64: params.screenshotBase64,
-      selectedApp: params.selectedApp,
-      consentGiven: params.consentGiven,
-      statusToken: params.statusToken,
-    }),
-  });
+  const data = await safeFetchJson<any>(
+    `/api/bookings/${params.publicId}/payment-proof`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        screenshotBase64: params.screenshotBase64,
+        selectedApp: params.selectedApp,
+        consentGiven: params.consentGiven,
+        statusToken: params.statusToken,
+      }),
+    },
+    'Payment proof service'
+  );
 
-  const data = await response.json();
-
-  if (!response.ok || !data.success) {
+  if (!data.success) {
     throw new Error(data.error?.message || 'Failed to submit payment proof.');
   }
 
@@ -136,37 +141,38 @@ export function pollPaymentStatus(
       if (statusToken) {
         headers['Authorization'] = `Bearer ${statusToken}`;
       }
-      const res = await fetch(`/api/bookings/${publicId}/status`, { headers });
-      if (res.ok) {
-        const json = await res.json();
-        if (json.success && json.data) {
-          const b = json.data;
+      const json = await safeFetchJson<any>(
+        `/api/bookings/${publicId}/status`,
+        { headers },
+        'Payment status'
+      );
+      if (json.success && json.data) {
+        const b = json.data;
 
-          if (b.status === 'payment_confirmed' || b.status === 'proof_verified') {
-            const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
-            const confirmedBooking: CouponBooking = {
-              id: b.publicId,
-              ticketNumbers: couponNumbers,
-              name: b.coupons?.[0]?.holder_name || 'Participant',
-              phone: b.coupons?.[0]?.phone || '',
-              village: b.coupons?.[0]?.village || 'Satulur',
-              quantity: b.quantity,
-              totalAmount: b.totalAmount,
-              bookedAt: new Date(b.paidAt || Date.now()).toLocaleDateString('en-IN', {
-                day: 'numeric',
-                month: 'short',
-                hour: '2-digit',
-                minute: '2-digit',
-              }),
-              status: 'confirmed',
-              transactionRef: 'AUTOMATED_PROOF_VERIFIED',
-            };
-            onStatusChange('payment_confirmed', b.message, confirmedBooking);
-            return; // stop polling
-          }
-
-          onStatusChange(b.status, b.message);
+        if (b.status === 'payment_confirmed' || b.status === 'proof_verified') {
+          const couponNumbers = (b.coupons || []).map((c: any) => c.coupon_number);
+          const confirmedBooking: CouponBooking = {
+            id: b.publicId,
+            ticketNumbers: couponNumbers,
+            name: b.coupons?.[0]?.holder_name || 'Participant',
+            phone: b.coupons?.[0]?.phone || '',
+            village: b.coupons?.[0]?.village || 'Satulur',
+            quantity: b.quantity,
+            totalAmount: b.totalAmount,
+            bookedAt: new Date(b.paidAt || Date.now()).toLocaleDateString('en-IN', {
+              day: 'numeric',
+              month: 'short',
+              hour: '2-digit',
+              minute: '2-digit',
+            }),
+            status: 'confirmed',
+            transactionRef: 'AUTOMATED_PROOF_VERIFIED',
+          };
+          onStatusChange('payment_confirmed', b.message, confirmedBooking);
+          return; // stop polling
         }
+
+        onStatusChange(b.status, b.message);
       }
     } catch {
       // transient network error, continue polling
@@ -189,14 +195,18 @@ export function pollPaymentStatus(
  */
 export async function simulateAdminBankConfirm(bookingPublicId: string): Promise<boolean> {
   try {
-    const res = await fetch('/api/test-mode/simulate-admin-confirm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookingPublicId }),
-    });
-    const json = await res.json();
+    const json = await safeFetchJson<any>(
+      '/api/test-mode/simulate-admin-confirm',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bookingPublicId }),
+      },
+      'Payment simulation'
+    );
     return json.success === true;
   } catch {
     return false;
   }
 }
+

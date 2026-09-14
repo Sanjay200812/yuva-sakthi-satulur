@@ -17,6 +17,7 @@ import { FloatingContact } from './components/FloatingContact.tsx';
 import { AdminLogin } from './components/admin/AdminLogin.tsx';
 import { AdminDashboard } from './components/admin/AdminDashboard.tsx';
 import { CouponBooking } from './types.ts';
+import { safeFetchJson } from './utils/api.ts';
 
 export default function App() {
   const [introFinished, setIntroFinished] = useState(false);
@@ -41,8 +42,7 @@ export default function App() {
 
     // If on admin route, check existing session
     if (window.location.pathname.startsWith('/admin')) {
-      fetch('/api/admin/auth/me')
-        .then((res) => res.json())
+      safeFetchJson<any>('/api/admin/auth/me', { credentials: 'include' }, 'Admin session')
         .then((json) => {
           if (json.success && json.data) {
             setAdminUser(json.data);
@@ -65,8 +65,7 @@ export default function App() {
       const targetOrderId = (orderMatch && orderMatch[1]) || queryOrderId;
 
       if (targetOrderId && !isAdminRoute) {
-        fetch(`/api/payment/status?order_id=${encodeURIComponent(targetOrderId)}`)
-          .then((res) => res.json())
+        safeFetchJson<any>(`/api/payment/status?order_id=${encodeURIComponent(targetOrderId)}`, {}, 'Order status')
           .then((json) => {
             if (json.status === 'SUCCESS' && json.booking) {
               const b = json.booking;
@@ -108,7 +107,7 @@ export default function App() {
 
   const handleAdminLogout = async () => {
     try {
-      await fetch('/api/admin/auth/logout', { method: 'POST' });
+      await fetch('/api/admin/auth/logout', { method: 'POST', credentials: 'include' });
     } catch {}
     setAdminUser(null);
     navigateTo('/admin');

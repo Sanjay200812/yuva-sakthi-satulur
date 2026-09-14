@@ -144,4 +144,104 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
     expect(reviewsRes.status).toBe(200);
     expect(reviewsRes.body.data.some((r: any) => r.bookingPublicId === booking.publicId)).toBe(true);
   });
+
+  describe('Production API Routing & Security Hardening', () => {
+    it('GET /api/health returns HTTP 200 with JSON content-type and status ok', async () => {
+      const res = await request(app).get('/api/health');
+      expect(res.status).toBe(200);
+      expect(res.headers['content-type']).toContain('application/json');
+      expect(res.body).toHaveProperty('status', 'ok');
+      expect(res.body).toHaveProperty('service', 'yuva-shakti-portal');
+    });
+
+    it('unmatched /api/* route returns JSON 404 and NEVER falls back to HTML', async () => {
+      const res = await request(app).get('/api/some/non/existent/endpoint');
+      expect(res.status).toBe(404);
+      expect(res.headers['content-type']).toContain('application/json');
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toHaveProperty('code', 'API_NOT_FOUND');
+    });
+
+    it('admin login sets HTTP-only cookie and normalizes mixed-case email', async () => {
+      const res = await request(app)
+        .post('/api/admin/auth/login')
+        .send({ email: 'ADMIN@YuvaShakti.ORG', password: 'YuvaShakti@Admin2026' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.user.email).toBe('admin@yuvashakti.org');
+
+      // Verify Set-Cookie header contains admin_session with HttpOnly
+      const cookies = res.headers['set-cookie'];
+      expect(cookies).toBeDefined();
+      const sessionCookie = Array.isArray(cookies) ? cookies.find((c: string) => c.includes('admin_session=')) : cookies;
+      expect(sessionCookie).toBeDefined();
+      expect(sessionCookie).toContain('HttpOnly');
+    });
+
+    it('authenticates admin using HTTP-only cookie session (stateless across instances)', async () => {
+      // 1. Log in to get cookie
+      const loginRes = await request(app)
+        .post('/api/admin/auth/login')
+        .send({ email: 'admin@yuvashakti.org', password: 'YuvaShakti@Admin2026' });
+
+      const cookies = loginRes.headers['set-cookie'];
+      const rawCookie = Array.isArray(cookies) ? cookies[0] : cookies;
+      const cookieValue = rawCookie.split(';')[0]; // e.g. "admin_session=..."
+
+      // 2. Fetch /api/admin/auth/me using only the cookie (no Authorization header)
+      const meRes = await request(app)
+        .get('/api/admin/auth/me')
+        .set('Cookie', [cookieValue]);
+
+      expect(meRes.status).toBe(200);
+      expect(meRes.body.success).toBe(true);
+      expect(meRes.body.data.email).toBe('admin@yuvashakti.org');
+
+      // 3. Fetch dashboard using the cookie
+      const dashRes = await request(app)
+        .get('/api/admin/dashboard')
+        .set('Cookie', [cookieValue]);
+
+      expect(dashRes.status).toBe(200);
+      expect(dashRes.body.success).toBe(true);
+    });
+
+    it('denies login and access for deactivated admin accounts (is_active = false)', async () => {
+      // Create a deactivated admin user in db
+      const inactiveId = '00000000-0000-0000-0000-000000000099';
+      const bcrypt = await import('bcryptjs');
+      const hash = bcrypt.hashSync('InactivePassword123!', 10);
+      await (app as any); // ensure app loaded
+
+      // Insert directly into db
+      const { db } = await import('../server/db/client.ts');
+      await db.query(
+        `INSERT INTO admin_users (id, email, password_hash, role, is_active)
+         VALUES ($1, $2, $3, $4, false)`,
+        [inactiveId, 'disabled@yuvashakti.org', hash, 'viewer']
+      );
+
+      // Attempt login
+      const res = await request(app)
+        .post('/api/admin/auth/login')
+        .send({ email: 'disabled@yuvashakti.org', password: 'InactivePassword123!' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error?.code).toBe('ACCOUNT_DISABLED');
+    });
+
+    it('logout clears the admin_session cookie', async () => {
+      const res = await request(app).post('/api/admin/auth/logout');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+
+      const cookies = res.headers['set-cookie'];
+      const rawCookie = Array.isArray(cookies) ? cookies[0] : cookies;
+      // Cookie is either expired or emptied
+      expect(rawCookie).toMatch(/admin_session=;.*(expires=|max-age=0)/i);
+    });
+  });
 });
+

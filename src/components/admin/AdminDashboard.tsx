@@ -25,6 +25,7 @@ import {
   FileText,
   Image as ImageIcon,
 } from 'lucide-react';
+import { safeFetchJson } from '../../utils/api.ts';
 
 interface AdminDashboardProps {
   adminUser: any;
@@ -51,8 +52,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
 
   const fetchMetrics = async () => {
     try {
-      const res = await fetch('/api/admin/dashboard');
-      const json = await res.json();
+      const json = await safeFetchJson<any>('/api/admin/dashboard', { credentials: 'include' }, 'Admin metrics');
       if (json.success) setMetrics(json.data);
     } catch (err) {
       console.error('Error fetching metrics', err);
@@ -67,8 +67,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
         page: String(page),
         limit: '20',
       });
-      const res = await fetch(`/api/admin/coupons?${query.toString()}`);
-      const json = await res.json();
+      const json = await safeFetchJson<any>(`/api/admin/coupons?${query.toString()}`, { credentials: 'include' }, 'Coupons list');
       if (json.success) {
         setCoupons(json.data.coupons || []);
         setPagination(json.data.pagination);
@@ -90,8 +89,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
       if (searchTerm) {
         query.append('search', searchTerm);
       }
-      const res = await fetch(`/api/admin/payment-reviews?${query.toString()}`);
-      const json = await res.json();
+      const json = await safeFetchJson<any>(`/api/admin/payment-reviews?${query.toString()}`, { credentials: 'include' }, 'Payment reviews');
       if (json.success) {
         setReviews(json.data || []);
       }

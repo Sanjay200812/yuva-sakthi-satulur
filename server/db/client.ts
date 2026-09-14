@@ -29,6 +29,8 @@ if (config.DATABASE_URL && process.env.NODE_ENV !== 'test' && !process.env.VITES
   pool.on('error', (err) => {
     console.error('Unexpected error on idle PostgreSQL client', err);
   });
+} else if (process.env.NODE_ENV === 'production' && !config.DATABASE_URL) {
+  throw new Error('FATAL CONFIGURATION ERROR: DATABASE_URL is missing in production environment. A real PostgreSQL database is required for production.');
 }
 
 // In-Memory Fallback Store for Local Development & Isolated Automated Testing
@@ -522,16 +524,29 @@ class MemoryDB implements TransactionalDB {
     // 16. Insert / Upsert Admin user
     if (trimmed.startsWith('INSERT INTO admin_users')) {
       const [id, email, password_hash, role] = params;
+      const isActive = trimmed.includes('false') ? false : (params[4] !== undefined ? Boolean(params[4]) : true);
       const user = {
         id: id || crypto.randomUUID(),
         email: email.toLowerCase(),
         password_hash,
         role: role || 'super_admin',
-        is_active: true,
+        is_active: isActive,
         created_at: new Date().toISOString(),
       };
       this.adminUsers.set(user.id, user);
       return { rows: [user] as any, rowCount: 1 };
+    }
+
+    if (trimmed.startsWith('UPDATE admin_users')) {
+      const emailParam = params[params.length - 1];
+      const user = Array.from(this.adminUsers.values()).find((u) => u.email === (emailParam ? emailParam.toLowerCase() : ''));
+      if (user) {
+        if (params[0]) user.password_hash = params[0];
+        if (trimmed.includes('is_active = true')) user.is_active = true;
+        if (trimmed.includes('is_active = false')) user.is_active = false;
+        return { rows: [user] as any, rowCount: 1 };
+      }
+      return { rows: [] as any, rowCount: 0 };
     }
 
     // 17. Admin Dashboard Metrics (Confirmed Bookings & Valid Coupons)
@@ -699,3 +714,12 @@ if (pool) {
 } else {
   console.log('ℹ️ Running with local isolated transactional memory store (Development/Test Mode).');
 }
+
+export async function closePool(): Promise<void> {
+  if (pool) {
+    await pool.end();
+  }
+}
+
+export { pool };
+

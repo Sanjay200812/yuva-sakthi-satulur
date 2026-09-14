@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Search, CheckCircle2, XCircle, Ticket, ShieldCheck, User, Calendar, MapPin, X, Tag, Download, Loader2 } from 'lucide-react';
+import { safeFetchJson } from '../utils/api.ts';
 
 interface CouponVerifierProps {
   bookings?: any[];
@@ -29,10 +30,13 @@ export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose 
     setSearchResult({ found: false, searched: false });
 
     try {
-      const res = await fetch(`/api/coupons/${encodeURIComponent(query)}/verify`);
-      const json = await res.json();
+      const json = await safeFetchJson<any>(
+        `/api/coupons/${encodeURIComponent(query)}/verify`,
+        {},
+        'Coupon verification service'
+      );
 
-      if (res.ok && json.success && json.data) {
+      if (json.success && json.data) {
         setSearchResult({
           found: true,
           data: json.data,
@@ -45,11 +49,11 @@ export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose 
           error: json.error?.message || 'No confirmed ticket found with this coupon number.',
         });
       }
-    } catch {
+    } catch (err: any) {
       setSearchResult({
         found: false,
         searched: true,
-        error: 'Verification service temporarily unavailable.',
+        error: err.message || 'Verification service temporarily unavailable.',
       });
     } finally {
       setLoading(false);
