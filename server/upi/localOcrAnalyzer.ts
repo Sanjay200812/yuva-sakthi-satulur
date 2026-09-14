@@ -112,45 +112,50 @@ export async function terminateOcrWorker(): Promise<void> {
  * Preprocesses raw image buffer using Sharp in memory.
  * Generates 2-3 OCR-optimized variants (grayscale, contrast enhanced, sharpened).
  */
-export async function generateOcrImageCandidates(rawBuffer: Buffer): Promise<Buffer[]> {
+export async function generatePrimaryOcrCandidate(rawBuffer: Buffer): Promise<Buffer> {
   const sharp = await getSharp();
-  if (!sharp) return [rawBuffer];
-
+  if (!sharp) return rawBuffer;
   try {
     const metadata = await sharp(rawBuffer).metadata();
     const width = metadata.width || 800;
     const height = metadata.height || 1200;
-
-    // Determine if upscaling is needed for small/low-DPI screenshots
     const shouldUpscale = width < 900 || height < 1200;
-    const targetWidth = shouldUpscale ? Math.round(width * 1.6) : width;
+    const targetWidth = shouldUpscale ? Math.round(width * 1.5) : width;
 
-    // Candidate A: Grayscale, auto-oriented, normalized contrast, sharpened
     let base = sharp(rawBuffer).rotate();
     if (shouldUpscale) {
       base = base.resize(targetWidth, null, { fit: 'inside' });
     }
-    const candidateA = await base
+    return await base
       .grayscale()
       .normalize()
       .sharpen({ sigma: 1.2, m1: 1.0, m2: 2.0 })
       .png()
       .toBuffer();
+  } catch (err) {
+    return rawBuffer;
+  }
+}
 
-    // Candidate B: High contrast / threshold-adapted for faint receipt text
-    const candidateB = await sharp(rawBuffer)
+export async function generateSecondaryContrastCandidate(rawBuffer: Buffer): Promise<Buffer> {
+  const sharp = await getSharp();
+  if (!sharp) return rawBuffer;
+  try {
+    return await sharp(rawBuffer)
       .rotate()
       .grayscale()
-      .linear(1.4, -25) // Increase contrast
+      .linear(1.4, -25)
       .sharpen()
       .png()
       .toBuffer();
-
-    return [candidateA, candidateB];
   } catch (err) {
-    console.warn('⚠️ OCR preprocessing warning, falling back to raw buffer:', err);
-    return [rawBuffer];
+    return rawBuffer;
   }
+}
+
+export async function generateOcrImageCandidates(rawBuffer: Buffer): Promise<Buffer[]> {
+  const primary = await generatePrimaryOcrCandidate(rawBuffer);
+  return [primary];
 }
 
 /**
@@ -585,24 +590,34 @@ export async function analyzePaymentScreenshot(
     extractedRawText = mockOcrText;
   } else {
     try {
-      // Generate OCR candidate images in memory
-      const candidates = await generateOcrImageCandidates(sanitizedBuffer);
+      // Optimized fast OCR pipeline: single primary pass first
       const worker = await getOcrWorker();
+      const primaryCandidate = await generatePrimaryOcrCandidate(sanitizedBuffer);
 
       // Run OCR with a 15-second bounded execution timeout
       const ocrPromise = (async () => {
-        let bestText = '';
-        for (const buf of candidates) {
-          const res = await worker.recognize(buf);
-          const t = res.data.text || '';
-          if (t.length > bestText.length) {
-            bestText = t;
-          }
-          // If we found sufficient text with key markers, don't need second pass
-          if (bestText.length > 80 && (bestText.includes('₹') || bestText.includes('UTR') || bestText.includes('Ref'))) {
-            break;
+        const primaryRes = await worker.recognize(primaryCandidate);
+        let bestText = primaryRes.data.text || '';
+
+        // Check if critical fields (amount and reference) are already extractable
+        const normCheck = normalizeOcrText(bestText);
+        const hasRef = extractPaymentReference(normCheck).utrOrRrn !== null;
+        const hasAmount = extractAmount(normCheck, bookingContext.expectedAmountPaise).amount !== null;
+
+        // If either reference or amount is still missing, run focused secondary pass
+        if (!hasRef || !hasAmount) {
+          try {
+            const secondaryCandidate = await generateSecondaryContrastCandidate(sanitizedBuffer);
+            const secondaryRes = await worker.recognize(secondaryCandidate);
+            const secondaryText = secondaryRes.data.text || '';
+            if (secondaryText.length > 0) {
+              bestText = `${bestText}\n${secondaryText}`;
+            }
+          } catch {
+            // Ignore secondary pass failure and proceed with primary text
           }
         }
+
         return bestText;
       })();
 

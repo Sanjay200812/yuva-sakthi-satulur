@@ -59,29 +59,25 @@ const UPI_APPS: { id: UpiAppChoice; label: string; appName: string; color: strin
 const REASON_MESSAGES: Record<string, string> = {
   INVALID_SCREENSHOT_FORMAT: 'Invalid screenshot format. Only PNG, JPEG, or WebP images are accepted.',
   OCR_UNREADABLE: "We couldn't clearly read this payment receipt. Please upload the detailed payment confirmation screen showing amount, payment status and transaction reference.",
-  OCR_PROCESSING_ERROR: "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.",
-  MISSING_TRANSACTION_REFERENCE: 'Please enter your UTR / Transaction ID to verify payment.',
-  REFERENCE_NOT_READABLE: "We couldn't clearly read the transaction reference from this receipt. Please upload the detailed payment receipt.",
-  TRANSACTION_REFERENCE_MISMATCH: 'The entered UTR does not match the transaction reference shown in the receipt.',
-  INVALID_TRANSACTION_REFERENCE: 'The transaction reference appears invalid. Please check your UTR and upload a clearer receipt.',
+  OCR_PROCESSING_ERROR: "We couldn't process your receipt right now. Please retry verification. Do not make another payment.",
+  REFERENCE_NOT_READABLE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.",
   DUPLICATE_TRANSACTION_REFERENCE: 'This transaction reference has already been used.',
   MISSING_AMOUNT: 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.',
-  AMOUNT_MISMATCH: 'The payment amount is different from the required booking total.',
-  STATUS_NOT_SUCCESS: 'The uploaded receipt shows the transaction as pending or failed.',
+  AMOUNT_MISMATCH: 'The receipt amount does not match this booking.',
+  STATUS_NOT_SUCCESS: 'The uploaded receipt shows the transaction as pending or failed. Only successful payments can be verified.',
   DUPLICATE_SCREENSHOT: 'This screenshot has already been submitted for another booking.',
   WRONG_PAYEE: 'The payment recipient does not match the configured receiver.',
   TRANSACTION_TIME_MISMATCH: 'Transaction timestamp on the receipt does not match this booking session.',
   AI_GENERATOR_WATERMARK: 'AI generator watermark detected on the uploaded image. Please upload an authentic payment receipt.',
-  SUSPICIOUS_FILENAME: 'Suspicious receipt file detected. Please upload an authentic screenshot from your UPI app.',
-  SCREENSHOT_SECURITY_RISK: 'Screenshot security check failed. Please upload a genuine receipt.',
-  PAYMENT_SESSION_EXPIRED: 'Your 5-minute payment session has expired. Start a new booking.',
-  // Fallback aliases
-  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt.",
-  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt.",
-  DUPLICATE_PAYMENT_REFERENCE: 'This payment receipt has already been used.',
-  DUPLICATE_RRN: 'This payment receipt has already been used.',
+  PAYMENT_SESSION_EXPIRED: 'Payment session expired. Start a new payment session.',
+  // Fallbacks
+  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.",
+  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.",
+  MISSING_TRANSACTION_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.",
+  INVALID_TRANSACTION_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.",
+  DUPLICATE_PAYMENT_REFERENCE: 'This transaction reference has already been used.',
+  DUPLICATE_RRN: 'This transaction reference has already been used.',
   DUPLICATE_UTR: 'This transaction reference has already been used.',
-  INVALID_PAYMENT_SCREEN: 'The uploaded image does not appear to be a valid UPI payment confirmation screen.',
 };
 
 export const BookingModal: React.FC<BookingModalProps> = ({
@@ -100,15 +96,14 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Active payment session state (locked once created)
+  // Active payment session state (locked once created, server-authoritative 5-minute session)
   const [bookingData, setBookingData] = useState<BookingCreationResponse | null>(null);
 
   // Session timer state driven strictly by server expiresAt
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
   const [isExpired, setIsExpired] = useState<boolean>(false);
 
-  // Proof form state: TWO MANDATORY INPUTS (UTR + Screenshot)
-  const [enteredUtr, setEnteredUtr] = useState<string>('');
+  // Proof form state: Screenshot ONLY (No manual UTR / reference input)
   const [screenshotBase64, setScreenshotBase64] = useState<string | null>(null);
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null);
   const [originalFilename, setOriginalFilename] = useState<string>('');
@@ -136,9 +131,31 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     }
   }, [initialData, isOpen]);
 
-  // Clean state when modal opens
+  // Restore active booking if valid and unexpired; otherwise clean state when modal opens
   useEffect(() => {
     if (isOpen) {
+      try {
+        const saved = sessionStorage.getItem('active_upi_session');
+        if (saved) {
+          const parsed: BookingCreationResponse = JSON.parse(saved);
+          if (parsed?.payment?.expiresAt && new Date(parsed.payment.expiresAt).getTime() > Date.now()) {
+            setBookingData(parsed);
+            const savedStep = (sessionStorage.getItem('active_upi_step') as ModalStep) || 'payment';
+            setStep(savedStep);
+            setName(parsed.booking.name);
+            setPhone(parsed.booking.phone);
+            setVillage(parsed.booking.village);
+            setQuantity(parsed.booking.quantity);
+            setErrorMessage(null);
+            setIsExpired(false);
+            return;
+          } else {
+            sessionStorage.removeItem('active_upi_session');
+            sessionStorage.removeItem('active_upi_step');
+          }
+        }
+      } catch {}
+
       setStep('details');
       setErrorMessage(null);
       setBookingData(null);
@@ -184,10 +201,13 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   };
 
   const handleResetSession = () => {
+    try {
+      sessionStorage.removeItem('active_upi_session');
+      sessionStorage.removeItem('active_upi_step');
+    } catch {}
     setBookingData(null);
     setStep('details');
     setErrorMessage(null);
-    setEnteredUtr('');
     setScreenshotBase64(null);
     setScreenshotPreview(null);
     setOriginalFilename('');
@@ -223,6 +243,10 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
       setBookingData(resp);
       setStep('payment');
+      try {
+        sessionStorage.setItem('active_upi_session', JSON.stringify(resp));
+        sessionStorage.setItem('active_upi_step', 'payment');
+      } catch {}
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to initiate booking.');
     } finally {
@@ -258,10 +282,14 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   };
 
   const handleBookingConfirmed = (confirmed: any) => {
+    try {
+      sessionStorage.removeItem('active_upi_session');
+      sessionStorage.removeItem('active_upi_step');
+    } catch {}
     const coupons = confirmed.coupons || [];
-    const normalizedEntered = enteredUtr.trim().replace(/\s+/g, '').toUpperCase();
-    const maskedRef = confirmed.transactionReferenceMasked
-      || (normalizedEntered.length >= 4 ? `********${normalizedEntered.slice(-4)}` : '********9012');
+    const maskedRef = confirmed.referenceMasked
+      || confirmed.transactionReferenceMasked
+      || (confirmed.extractedRrn?.length >= 4 ? `********${confirmed.extractedRrn.slice(-4)}` : '********9012');
 
     const confirmedBooking: CouponBooking = {
       id: bookingData?.booking.publicId || confirmed.publicId,
@@ -290,7 +318,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     if (!bookingData) return;
     setIsProcessing(true);
     setLiveStatus('analyzing');
-    setStatusMessage('Reading Payment Receipt...');
+    setStatusMessage('Reading receipt...');
 
     try {
       const res = await retryPaymentVerification({
@@ -305,7 +333,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
       if (res.status === 'ocr_processing_error') {
         setLiveStatus('ocr_processing_error');
-        setStatusMessage(res.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
+        setStatusMessage(res.message || "We couldn't process your receipt right now. Please retry verification. Do not make another payment.");
       } else {
         setLiveStatus('verification_failed');
         const reason = (res as any).reasonCode || (res as any).reasons?.[0];
@@ -314,24 +342,19 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       }
     } catch (err: any) {
       setLiveStatus('ocr_processing_error');
-      setStatusMessage(err.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
+      setStatusMessage(err.message || "We couldn't process your receipt right now. Please retry verification. Do not make another payment.");
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // 3. Submit Payment Proof (Mandatory: Screenshot + UTR + Consent)
+  // 3. Submit Payment Proof (Screenshot-Only + User Consent)
   const handleSubmitProof = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!bookingData) return;
 
-    if (isExpired && step !== 'proof') {
-      setErrorMessage('Payment session expired. Start a new booking.');
-      return;
-    }
-
-    if (!enteredUtr.trim()) {
-      alert('Please enter the UTR / Transaction ID from your payment receipt.');
+    if (isExpired) {
+      setErrorMessage('Payment session expired. Start a new payment session.');
       return;
     }
 
@@ -349,27 +372,23 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     setErrorMessage(null);
     setStep('status');
     setLiveStatus('analyzing');
-    setStatusMessage('Reading Payment Receipt...');
+    setStatusMessage('Reading receipt...');
 
-    // Exact 9 stages required by Master Prompt:
+    // Lightweight UI animation stages
     const verificationStages = [
-      'Reading Payment Receipt...',
-      'Checking Transaction Status...',
-      'Checking Amount...',
-      'Checking Transaction Reference...',
-      'Checking Receiver...',
-      'Checking Payment Time...',
-      'Checking Screenshot Security...',
-      'Checking Duplicate Transaction...',
-      'Finalizing Verification...',
+      'Reading receipt...',
+      'Checking amount...',
+      'Checking transaction...',
+      'Checking recipient...',
+      'Final verification...',
     ];
     let stageIdx = 0;
     const progressTimer = setInterval(() => {
+      stageIdx++;
       if (stageIdx < verificationStages.length) {
         setStatusMessage(verificationStages[stageIdx]);
-        stageIdx++;
       }
-    }, 450);
+    }, 400);
 
     try {
       const res = await submitPaymentProof({
@@ -379,8 +398,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         consentGiven,
         statusToken: bookingData.payment.statusToken,
         isRecovery: isExpired || false,
-        utr: enteredUtr.trim().toUpperCase(),
-        transactionReference: enteredUtr.trim().toUpperCase(),
         originalFilename,
         originalMimeType,
       });
@@ -394,7 +411,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
       if (res.status === 'ocr_processing_error') {
         setLiveStatus('ocr_processing_error');
-        setStatusMessage(res.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
+        setStatusMessage(res.message || "We couldn't process your receipt right now. Please retry verification. Do not make another payment.");
         return;
       }
 
@@ -405,21 +422,23 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         : (res.message || 'Payment proof verification failed.');
       setStatusMessage(friendlyMessage);
 
-      // Start polling for automated verification completion if needed
-      const stopPolling = pollPaymentStatus(
-        bookingData.booking.publicId,
-        (status, message, confirmed) => {
-          setLiveStatus(status);
-          setStatusMessage(message);
+      // Only poll if background processing is pending
+      if (res.status === 'pending_verification') {
+        const stopPolling = pollPaymentStatus(
+          bookingData.booking.publicId,
+          (status, message, confirmed) => {
+            setLiveStatus(status);
+            setStatusMessage(message);
 
-          if ((status === 'payment_confirmed' || status === 'proof_verified') && confirmed) {
-            setConfirmedBookingData(confirmed);
-            stopPolling();
-          }
-        },
-        2500,
-        bookingData.payment.statusToken
-      );
+            if ((status === 'payment_confirmed' || status === 'proof_verified') && confirmed) {
+              setConfirmedBookingData(confirmed);
+              stopPolling();
+            }
+          },
+          2000,
+          bookingData.payment.statusToken
+        );
+      }
     } catch (err: any) {
       clearInterval(progressTimer);
       setLiveStatus('verification_failed');
@@ -645,7 +664,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                 <input
                   type="text"
                   required
-                  placeholder="e.g. Boddukuri Sanjay"
+                  placeholder="Enter your full name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 focus:border-amber-400 outline-none text-white text-sm placeholder:text-slate-500"
@@ -831,7 +850,12 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               <button
                 type="button"
                 disabled={isExpired}
-                onClick={() => setStep('proof')}
+                onClick={() => {
+                  setStep('proof');
+                  try {
+                    sessionStorage.setItem('active_upi_step', 'proof');
+                  } catch {}
+                }}
                 className="flex-1 py-3.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-display font-black text-sm uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 <CheckCircle2 className="w-4 h-4" />
@@ -841,101 +865,94 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </div>
         )}
 
-        {/* STEP 3: Mandatory Proof Form (UTR / Transaction ID + Screenshot Upload) */}
+        {/* STEP 3: Customer Verification Page (Screenshot-Only Automatic Extraction) */}
         {step === 'proof' && bookingData && (
           <form onSubmit={handleSubmitProof} className="space-y-4">
-            <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-purple-500/30 flex items-center justify-between text-xs">
-              <span>Order: <strong className="font-mono text-white">{bookingData.booking.publicId}</strong></span>
-              <span>Total: <strong className="text-amber-300 font-mono text-sm">₹{bookingData.payment.amountInr}</strong></span>
-              <span className={`text-xs font-mono font-bold flex items-center gap-1 ${remainingSeconds !== null && remainingSeconds < 60 ? 'text-red-400 animate-pulse' : 'text-purple-300'}`}>
-                <Clock className="w-3.5 h-3.5" />
-                {formatCountdown(remainingSeconds)}
-              </span>
+            <div className="text-center pb-2 border-b border-purple-500/20">
+              <h3 className="text-base font-black font-display text-white tracking-wider uppercase">
+                PAYMENT VERIFICATION
+              </h3>
             </div>
 
-            {/* Detailed Receipt Guidance */}
-            <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/30 text-[11px] text-purple-200 space-y-1.5">
-              <span className="font-semibold text-amber-300 block">
-                Verification Requirements (Two Mandatory Inputs):
-              </span>
-              <ul className="grid grid-cols-2 gap-1 text-[10.5px] text-slate-300 pl-1">
-                <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> 1. UTR / Transaction ID
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> 2. Payment Screenshot
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Exact Amount: ₹{bookingData.payment.amountInr}
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Status: Successful
-                </li>
-              </ul>
+            <div className="grid grid-cols-3 gap-2 p-3.5 rounded-2xl bg-[#0D132D] border border-purple-500/30 text-center">
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Booking:</span>
+                <span className="font-mono font-bold text-white text-xs sm:text-sm truncate block">
+                  {bookingData.booking.publicId}
+                </span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Amount:</span>
+                <span className="font-mono font-black text-amber-300 text-sm sm:text-base block">
+                  ₹{Number(bookingData.payment.amountInr).toFixed(2)}
+                </span>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Time Remaining:</span>
+                <span className={`font-mono font-bold text-xs sm:text-sm block ${remainingSeconds !== null && remainingSeconds < 60 ? 'text-red-400 animate-pulse' : 'text-purple-300'}`}>
+                  {formatCountdown(remainingSeconds)}
+                </span>
+              </div>
             </div>
 
-            {/* MANDATORY INPUT 1: UTR / Transaction ID */}
+            {isExpired && (
+              <div className="p-3 rounded-xl bg-red-950/60 border border-red-500/50 text-red-200 text-xs text-center font-medium">
+                Payment session expired. Start a new payment session.
+              </div>
+            )}
+
+            {/* UPLOAD PAYMENT SCREENSHOT */}
             <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-200 block">
-                UTR / Transaction ID <span className="text-amber-400">*</span>
-              </label>
-              <input
-                type="text"
-                required
-                maxLength={36}
-                placeholder="e.g. 123456789012"
-                value={enteredUtr}
-                disabled={isProcessing}
-                onChange={(e) => setEnteredUtr(e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
-                className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-purple-500/40 focus:border-amber-400 outline-none text-white text-sm font-mono tracking-wider placeholder:text-slate-500"
-              />
-              <p className="text-[10.5px] text-slate-400 leading-tight">
-                Enter the 12-digit UPI RRN / UTR / Reference ID from your PhonePe, Google Pay, or Paytm receipt.
-              </p>
-            </div>
-
-            {/* MANDATORY INPUT 2: Payment Receipt Screenshot */}
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-200 block">
-                Payment Receipt Screenshot <span className="text-amber-400">*</span>
-              </label>
+              <span className="text-xs font-bold text-slate-200 uppercase tracking-wider block">
+                UPLOAD PAYMENT SCREENSHOT
+              </span>
               <input
                 type="file"
                 ref={fileInputRef}
                 accept="image/png,image/jpeg,image/jpg,image/webp"
-                disabled={isProcessing}
+                disabled={isProcessing || isExpired}
                 onChange={handleFileChange}
                 className="hidden"
               />
 
               {!screenshotPreview ? (
                 <div
-                  onClick={() => !isProcessing && fileInputRef.current?.click()}
-                  className="border-2 border-dashed border-amber-400/50 hover:border-amber-400 rounded-2xl p-5 text-center cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 transition-all group shadow-[0_0_20px_rgba(245,158,11,0.08)]"
+                  onClick={() => !isProcessing && !isExpired && fileInputRef.current?.click()}
+                  className={`border-2 border-dashed rounded-2xl p-6 text-center transition-all ${
+                    isExpired
+                      ? 'border-slate-800 bg-slate-950/40 opacity-50 cursor-not-allowed'
+                      : 'border-amber-400/50 hover:border-amber-400 cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 group shadow-[0_0_20px_rgba(245,158,11,0.08)]'
+                  }`}
                 >
-                  <div className="w-10 h-10 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-2 group-hover:scale-110 transition-transform">
-                    <Upload className="w-5 h-5 text-amber-400" />
+                  <div className="w-12 h-12 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-2.5 group-hover:scale-110 transition-transform">
+                    <Upload className="w-6 h-6 text-amber-400" />
                   </div>
-                  <span className="text-xs font-bold text-white block mb-0.5">
-                    Upload Screenshot <span className="text-amber-400">*</span>
-                  </span>
-                  <span className="text-[11px] text-slate-400 block mb-0.5">Tap to select receipt image from gallery</span>
-                  <span className="text-[9.5px] text-slate-500 font-mono">PNG, JPEG, or WebP up to 5MB</span>
+                  <button
+                    type="button"
+                    disabled={isProcessing || isExpired}
+                    className="px-4 py-2 rounded-xl bg-amber-400/20 hover:bg-amber-400/30 text-amber-300 font-bold text-xs uppercase tracking-wider mb-2 transition"
+                  >
+                    Select Screenshot
+                  </button>
+                  <div className="text-[11px] text-slate-400 space-y-0.5">
+                    <p>Supported: PNG / JPG / JPEG / WebP</p>
+                    <p className="text-slate-500">Maximum 5MB</p>
+                  </div>
                 </div>
               ) : (
-                <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-500/60 bg-black/60 p-3 flex items-center justify-between shadow-lg">
+                <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-500/60 bg-black/60 p-3.5 flex items-center justify-between shadow-lg">
                   <div className="flex items-center gap-3">
-                    <img src={screenshotPreview} alt="Receipt preview" className="w-14 h-14 object-cover rounded-xl border border-emerald-500/30" />
+                    <img src={screenshotPreview} alt="Payment Screenshot" className="w-14 h-14 object-cover rounded-xl border border-emerald-500/30" />
                     <div>
-                      <span className="text-xs font-bold text-white block truncate max-w-[200px]">{originalFilename || 'Receipt Screenshot'}</span>
+                      <span className="text-xs font-bold text-white block truncate max-w-[200px]">{originalFilename || 'Payment Screenshot'}</span>
                       <span className="text-[10px] text-emerald-400 font-medium flex items-center gap-1 mt-0.5">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Attached & ready
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Attached &amp; ready
                       </span>
                     </div>
                   </div>
                   <button
                     type="button"
-                    disabled={isProcessing}
+                    disabled={isProcessing || isExpired}
                     onClick={() => {
                       setScreenshotBase64(null);
                       setScreenshotPreview(null);
@@ -943,6 +960,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                       setOriginalMimeType('');
                     }}
                     className="p-2 text-slate-400 hover:text-red-400 hover:bg-slate-800/80 rounded-xl transition cursor-pointer"
+                    title="Remove screenshot"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -951,22 +969,22 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             </div>
 
             {/* Consent Checkbox */}
-            <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 flex items-start gap-2.5">
+            <div className="p-2.5 rounded-xl bg-slate-950/60 border border-purple-500/20 flex items-start gap-2">
               <input
                 type="checkbox"
                 id="consent"
                 checked={consentGiven}
-                disabled={isProcessing}
+                disabled={isProcessing || isExpired}
                 onChange={(e) => setConsentGiven(e.target.checked)}
                 className="mt-0.5 w-4 h-4 rounded border-purple-500 text-amber-500 focus:ring-0 cursor-pointer"
               />
               <label htmlFor="consent" className="text-[11px] text-slate-300 leading-snug cursor-pointer">
-                I confirm I completed the UPI transfer and consent to automated verification of this receipt.
+                I confirm payment has been made and consent to automated receipt verification.
               </label>
             </div>
 
             {/* Submit Proof Buttons */}
-            <div className="flex gap-2">
+            <div className="flex gap-2 pt-1">
               <button
                 type="button"
                 disabled={isProcessing}
@@ -977,7 +995,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isProcessing || !screenshotBase64 || !enteredUtr.trim() || !consentGiven}
+                disabled={isProcessing || isExpired || !screenshotBase64 || !consentGiven}
                 className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {isProcessing ? (
@@ -1017,7 +1035,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                   <div className="flex items-center justify-between text-slate-400">
                     <span>Transaction Reference:</span>
                     <span className="font-mono text-white font-bold">
-                      {confirmedBookingData?.transactionRef || (enteredUtr ? `********${enteredUtr.slice(-4)}` : '********9012')}
+                      {confirmedBookingData?.transactionRef || '********9012'}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-slate-400">

@@ -185,27 +185,24 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     riskScore += 50;
   }
 
-  // 8. User Entered Reference Validation
-  if (!normalizedEnteredRef) {
-    reasonCodes.push('MISSING_TRANSACTION_REFERENCE');
-    riskScore += 40;
-  } else if (normalizedEnteredRef.length < 6 || normalizedEnteredRef.length > 36) {
-    reasonCodes.push('INVALID_TRANSACTION_REFERENCE');
-    riskScore += 40;
-  }
-
-  // 9. OCR Reference Extraction & Cross-Match Check
+  // 8. Screenshot OCR Reference Extraction Check (Automatic, Screenshot-Only)
   if (!normalizedOcrRef) {
     reasonCodes.push('REFERENCE_NOT_READABLE');
+    riskScore += 50;
+    details.referenceMatched = false;
+  } else if (normalizedOcrRef.length < 6 || normalizedOcrRef.length > 36) {
+    reasonCodes.push('INVALID_TRANSACTION_REFERENCE');
     riskScore += 40;
     details.referenceMatched = false;
-  } else if (normalizedEnteredRef && normalizedEnteredRef !== normalizedOcrRef) {
-    // Cross-match mismatch between what user typed and what OCR sees
-    details.referenceMatched = false;
-    reasonCodes.push('TRANSACTION_REFERENCE_MISMATCH');
-    riskScore += 60;
   } else {
-    details.referenceMatched = true;
+    // If enteredReference is optionally supplied (e.g. testing cross-match), verify consistency
+    if (normalizedEnteredRef && normalizedEnteredRef !== normalizedOcrRef) {
+      details.referenceMatched = false;
+      reasonCodes.push('TRANSACTION_REFERENCE_MISMATCH');
+      riskScore += 60;
+    } else {
+      details.referenceMatched = true;
+    }
   }
 
   // 10. Amount Validation
@@ -310,11 +307,9 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     } else if (reasonCodes.includes('AI_GENERATOR_WATERMARK')) {
       userMessage = 'This image appears to be an AI-generated mock receipt and cannot be verified.';
     } else if (reasonCodes.includes('REFERENCE_NOT_READABLE')) {
-      userMessage = "We couldn't clearly read the transaction reference from this receipt. Please upload the detailed payment receipt.";
+      userMessage = "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.";
     } else if (reasonCodes.includes('TRANSACTION_TIME_MISMATCH')) {
       userMessage = 'The transaction time on the receipt does not match your active payment session.';
-    } else if (reasonCodes.includes('MISSING_TRANSACTION_REFERENCE')) {
-      userMessage = 'Please enter the 12-digit UPI UTR / Transaction ID from your payment app.';
     } else {
       userMessage = 'Payment verification could not be completed with the provided screenshot. Please upload a clear, unedited payment confirmation screen.';
     }

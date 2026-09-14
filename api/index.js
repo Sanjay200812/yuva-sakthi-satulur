@@ -1348,25 +1348,31 @@ async function terminateOcrWorker() {
     }
   }
 }
-async function generateOcrImageCandidates(rawBuffer) {
+async function generatePrimaryOcrCandidate(rawBuffer) {
   const sharp = await getSharp();
-  if (!sharp) return [rawBuffer];
+  if (!sharp) return rawBuffer;
   try {
     const metadata = await sharp(rawBuffer).metadata();
     const width = metadata.width || 800;
     const height = metadata.height || 1200;
     const shouldUpscale = width < 900 || height < 1200;
-    const targetWidth = shouldUpscale ? Math.round(width * 1.6) : width;
+    const targetWidth = shouldUpscale ? Math.round(width * 1.5) : width;
     let base = sharp(rawBuffer).rotate();
     if (shouldUpscale) {
       base = base.resize(targetWidth, null, { fit: "inside" });
     }
-    const candidateA = await base.grayscale().normalize().sharpen({ sigma: 1.2, m1: 1, m2: 2 }).png().toBuffer();
-    const candidateB = await sharp(rawBuffer).rotate().grayscale().linear(1.4, -25).sharpen().png().toBuffer();
-    return [candidateA, candidateB];
+    return await base.grayscale().normalize().sharpen({ sigma: 1.2, m1: 1, m2: 2 }).png().toBuffer();
   } catch (err) {
-    console.warn("\u26A0\uFE0F OCR preprocessing warning, falling back to raw buffer:", err);
-    return [rawBuffer];
+    return rawBuffer;
+  }
+}
+async function generateSecondaryContrastCandidate(rawBuffer) {
+  const sharp = await getSharp();
+  if (!sharp) return rawBuffer;
+  try {
+    return await sharp(rawBuffer).rotate().grayscale().linear(1.4, -25).sharpen().png().toBuffer();
+  } catch (err) {
+    return rawBuffer;
   }
 }
 function normalizeOcrText(text) {
@@ -1614,18 +1620,24 @@ async function analyzePaymentScreenshot(sanitizedBuffer, bookingContext) {
     extractedRawText = mockOcrText;
   } else {
     try {
-      const candidates = await generateOcrImageCandidates(sanitizedBuffer);
       const worker = await getOcrWorker();
+      const primaryCandidate = await generatePrimaryOcrCandidate(sanitizedBuffer);
       const ocrPromise = (async () => {
-        let bestText = "";
-        for (const buf of candidates) {
-          const res = await worker.recognize(buf);
-          const t = res.data.text || "";
-          if (t.length > bestText.length) {
-            bestText = t;
-          }
-          if (bestText.length > 80 && (bestText.includes("\u20B9") || bestText.includes("UTR") || bestText.includes("Ref"))) {
-            break;
+        const primaryRes = await worker.recognize(primaryCandidate);
+        let bestText = primaryRes.data.text || "";
+        const normCheck = normalizeOcrText(bestText);
+        const hasRef = extractPaymentReference(normCheck).utrOrRrn !== null;
+        const hasAmount = extractAmount(normCheck, bookingContext.expectedAmountPaise).amount !== null;
+        if (!hasRef || !hasAmount) {
+          try {
+            const secondaryCandidate = await generateSecondaryContrastCandidate(sanitizedBuffer);
+            const secondaryRes = await worker.recognize(secondaryCandidate);
+            const secondaryText = secondaryRes.data.text || "";
+            if (secondaryText.length > 0) {
+              bestText = `${bestText}
+${secondaryText}`;
+            }
+          } catch {
           }
         }
         return bestText;
@@ -2065,23 +2077,22 @@ function verifyPaymentReceipt(input) {
     reasonCodes.push("STATUS_NOT_SUCCESS");
     riskScore += 50;
   }
-  if (!normalizedEnteredRef) {
-    reasonCodes.push("MISSING_TRANSACTION_REFERENCE");
-    riskScore += 40;
-  } else if (normalizedEnteredRef.length < 6 || normalizedEnteredRef.length > 36) {
-    reasonCodes.push("INVALID_TRANSACTION_REFERENCE");
-    riskScore += 40;
-  }
   if (!normalizedOcrRef) {
     reasonCodes.push("REFERENCE_NOT_READABLE");
+    riskScore += 50;
+    details.referenceMatched = false;
+  } else if (normalizedOcrRef.length < 6 || normalizedOcrRef.length > 36) {
+    reasonCodes.push("INVALID_TRANSACTION_REFERENCE");
     riskScore += 40;
     details.referenceMatched = false;
-  } else if (normalizedEnteredRef && normalizedEnteredRef !== normalizedOcrRef) {
-    details.referenceMatched = false;
-    reasonCodes.push("TRANSACTION_REFERENCE_MISMATCH");
-    riskScore += 60;
   } else {
-    details.referenceMatched = true;
+    if (normalizedEnteredRef && normalizedEnteredRef !== normalizedOcrRef) {
+      details.referenceMatched = false;
+      reasonCodes.push("TRANSACTION_REFERENCE_MISMATCH");
+      riskScore += 60;
+    } else {
+      details.referenceMatched = true;
+    }
   }
   if (analysis.amount == null) {
     details.amountMatched = false;
@@ -2159,11 +2170,9 @@ function verifyPaymentReceipt(input) {
     } else if (reasonCodes.includes("AI_GENERATOR_WATERMARK")) {
       userMessage = "This image appears to be an AI-generated mock receipt and cannot be verified.";
     } else if (reasonCodes.includes("REFERENCE_NOT_READABLE")) {
-      userMessage = "We couldn't clearly read the transaction reference from this receipt. Please upload the detailed payment receipt.";
+      userMessage = "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.";
     } else if (reasonCodes.includes("TRANSACTION_TIME_MISMATCH")) {
       userMessage = "The transaction time on the receipt does not match your active payment session.";
-    } else if (reasonCodes.includes("MISSING_TRANSACTION_REFERENCE")) {
-      userMessage = "Please enter the 12-digit UPI UTR / Transaction ID from your payment app.";
     } else {
       userMessage = "Payment verification could not be completed with the provided screenshot. Please upload a clear, unedited payment confirmation screen.";
     }
@@ -3917,9 +3926,14 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         error: { code: "MISSING_SCREENSHOT", message: "Payment confirmation screenshot is mandatory." }
       });
     }
+    const t0 = Date.now();
     const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, "");
     const imageBuffer = Buffer.from(cleanBase64, "base64");
+    const t1 = Date.now();
+    const imageValidationMs = t1 - t0;
     const processed = await processPaymentScreenshot(imageBuffer, booking.id, originalFilename, originalMimeType);
+    const t2 = Date.now();
+    const imagePreprocessMs = t2 - t1;
     const analysis = await analyzePaymentScreenshot(
       processed.sanitizedBuffer,
       {
@@ -3931,6 +3945,8 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         paymentExpiresAt: booking.payment_expires_at
       }
     );
+    const t3 = Date.now();
+    const ocrMs = t3 - t2;
     const submissionId = crypto8.randomUUID();
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
     if (!analysis.analysisCompleted || analysis.warnings?.includes("OCR_PROCESSING_ERROR")) {
@@ -3992,6 +4008,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
       );
       return res.status(200).json({
         success: true,
+        status: "ocr_processing_error",
         data: {
           submissionId,
           publicId: booking.public_id,
@@ -4009,7 +4026,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
       });
     }
     const enteredUtrField = req.body.utr ?? req.body.transactionReference ?? req.body.enteredUtr;
-    const rawEnteredRef = (enteredUtrField !== void 0 ? enteredUtrField : analysis.utrOrRrn || analysis.transactionId || "").trim();
+    const rawEnteredRef = enteredUtrField !== void 0 ? String(enteredUtrField).trim() : "";
     const normalizedEnteredRef = normalizeTransactionReference(rawEnteredRef);
     const extractedRrn = analysis.utrOrRrn ? normalizeTransactionReference(analysis.utrOrRrn) : analysis.transactionId ? normalizeTransactionReference(analysis.transactionId) : "";
     const enteredRefHash = normalizedEnteredRef ? crypto8.createHash("sha256").update(normalizedEnteredRef).digest("hex") : null;
@@ -4019,32 +4036,30 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
     const fallbackUtr = `UNEXTRACTED_${submissionId}`;
     const payerUtrHash = extractedRefHash || enteredRefHash || crypto8.createHash("sha256").update(fallbackUtr).digest("hex");
     const encryptedUtr = encryptedExtractedRef || encryptedEnteredRef || encryptSensitiveField(fallbackUtr);
-    let isDuplicateUtr = false;
-    if (enteredRefHash) {
-      const dupEntered = await db.query(
+    const t4 = Date.now();
+    const parsingMs = t4 - t3;
+    const [dupEnteredRes, dupExtractedRes, dupScreenRes, pastSubsRes] = await Promise.all([
+      enteredRefHash ? db.query(
         `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
         [enteredRefHash, booking.id, "admin_rejected", "payment_rejected"]
-      );
-      if (dupEntered.rows.length > 0) isDuplicateUtr = true;
-    }
-    if (!isDuplicateUtr && extractedRefHash) {
-      const dupExtracted = await db.query(
+      ) : Promise.resolve({ rows: [] }),
+      extractedRefHash ? db.query(
         `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
         [extractedRefHash, booking.id, "admin_rejected", "payment_rejected"]
-      );
-      if (dupExtracted.rows.length > 0) isDuplicateUtr = true;
-    }
-    const dupScreenRes = await db.query(
-      "SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4",
-      [processed.sha256, booking.id, "admin_rejected", "payment_rejected"]
-    );
-    let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
-    if (!isDuplicateScreenshot && processed.phash) {
-      const pastSubs = await db.query(
+      ) : Promise.resolve({ rows: [] }),
+      db.query(
+        "SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4",
+        [processed.sha256, booking.id, "admin_rejected", "payment_rejected"]
+      ),
+      processed.phash ? db.query(
         "SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3",
         [booking.id, "admin_rejected", "payment_rejected"]
-      );
-      for (const past of pastSubs.rows) {
+      ) : Promise.resolve({ rows: [] })
+    ]);
+    let isDuplicateUtr = dupEnteredRes.rows.length > 0 || dupExtractedRes.rows.length > 0;
+    let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
+    if (!isDuplicateScreenshot && processed.phash) {
+      for (const past of pastSubsRes.rows) {
         if (past.screenshot_phash) {
           const dist = hammingDistance(processed.phash, past.screenshot_phash);
           if (dist <= 2 && past.expected_amount_paise === booking.total_amount_paise) {
@@ -4054,6 +4069,8 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         }
       }
     }
+    const t5 = Date.now();
+    const databaseChecksMs = t5 - t4;
     const verification = verifyPaymentReceipt({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
@@ -4151,14 +4168,25 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         (/* @__PURE__ */ new Date()).toISOString()
       ]
     );
+    const t6 = Date.now();
     if (isPassed) {
       const finalResult = await finalizeVerifiedSubmission({
         submissionId,
         bookingId: booking.id,
         decisionVersion: "v3-local-ocr-deterministic"
       });
+      const t7 = Date.now();
+      const finalizationMs = t7 - t6;
+      const totalVerificationMs = t7 - t0;
+      console.log(`\u23F1\uFE0F [Verification Profile: Passed] total=${totalVerificationMs}ms (validation=${imageValidationMs}ms preprocess=${imagePreprocessMs}ms ocr=${ocrMs}ms parsing=${parsingMs}ms db=${databaseChecksMs}ms finalize=${finalizationMs}ms)`);
+      const maskedReference = extractedRrn ? `********${extractedRrn.slice(-4)}` : rawEnteredRef ? `********${rawEnteredRef.slice(-4)}` : "********0000";
       return res.json({
         success: true,
+        status: "payment_confirmed",
+        verification: "verified",
+        amount: booking.total_amount_paise / 100,
+        referenceMasked: maskedReference,
+        coupons: finalResult.coupons,
         data: {
           submissionId,
           publicId: booking.public_id,
@@ -4179,9 +4207,15 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         "UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3",
         ["payment_rejected", (/* @__PURE__ */ new Date()).toISOString(), booking.id]
       );
+      const t7 = Date.now();
+      const totalVerificationMs = t7 - t0;
+      console.log(`\u23F1\uFE0F [Verification Profile: Rejected] total=${totalVerificationMs}ms (validation=${imageValidationMs}ms preprocess=${imagePreprocessMs}ms ocr=${ocrMs}ms parsing=${parsingMs}ms db=${databaseChecksMs}ms)`);
       const primaryCode = finalReasonCodes[0] || "PROOF_VERIFICATION_FAILED";
       return res.status(400).json({
         success: false,
+        status: "proof_verification_failed",
+        reasonCode: primaryCode,
+        message: verification.userMessage || match.userMessage,
         error: {
           code: primaryCode,
           message: verification.userMessage || match.userMessage,

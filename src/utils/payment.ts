@@ -47,7 +47,7 @@ export interface BookingCreationResponse {
 export interface PaymentProofParams {
   publicId: string;
   screenshotBase64: string;
-  selectedApp: string;
+  selectedApp?: string;
   consentGiven: boolean;
   statusToken?: string;
   isRecovery?: boolean;
@@ -58,18 +58,21 @@ export interface PaymentProofParams {
 }
 
 export interface PaymentProofResponse {
-  submissionId: string;
+  submissionId?: string;
   publicId: string;
   status: string;
   message: string;
+  verification?: string;
+  amount?: number;
+  referenceMasked?: string;
   coupons?: any[];
   reasonCode?: string;
   reasons?: string[];
-  details: {
-    utrMatched: boolean | null;
-    amountMatched: boolean | null;
-    statusMatched: boolean | null;
-    payeeMatched: boolean | null;
+  details?: {
+    utrMatched?: boolean | null;
+    amountMatched?: boolean | null;
+    statusMatched?: boolean | null;
+    payeeMatched?: boolean | null;
   };
 }
 

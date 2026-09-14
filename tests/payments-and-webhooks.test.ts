@@ -2025,4 +2025,337 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       expect(res.body.data.status).toBe('payment_confirmed');
     });
   });
+
+  describe('Final Payment-Flow Changes (Section 39 Scenarios A-P)', () => {
+    function getValidTestTimestampText(): string {
+      const d = new Date();
+      const day = d.getDate();
+      const month = d.toLocaleString('en-US', { month: 'short' });
+      const year = d.getFullYear();
+      const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+      return `${day} ${month} ${year}, ${timeStr}`;
+    }
+
+    it('A: Verification page component source contains NO UTR input field', () => {
+      const source = fs.readFileSync('src/components/BookingModal.tsx', 'utf-8');
+      expect(source).not.toContain('enteredUtr');
+      expect(source).not.toContain('setEnteredUtr');
+      expect(source).not.toContain('placeholder="e.g. 123456789012"');
+      expect(source).toContain('PAYMENT VERIFICATION');
+      expect(source).toContain('UPLOAD PAYMENT SCREENSHOT');
+      expect(source).toContain('VERIFY PAYMENT');
+    });
+
+    it('B: Screenshot-only valid ₹50 receipt -> verified', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Scenario B User', phone: '9988776601', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(301);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990156789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('payment_confirmed');
+      expect(res.body.data.coupons.length).toBe(1);
+    });
+
+    it('C: Screenshot-only valid ₹100 receipt for quantity 2 -> verified', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Scenario C User', phone: '9988776602', village: 'Satulur', quantity: 2 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(302);
+
+      setMockOcrText(
+        `Payment Successful\n₹100.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990256789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('payment_confirmed');
+      expect(res.body.data.coupons.length).toBe(2);
+    });
+
+    it('D: Missing screenshot reference -> REFERENCE_NOT_READABLE', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Scenario D User', phone: '9988776603', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(303);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.reasonCodes).toContain('REFERENCE_NOT_READABLE');
+      expect(res.body.error.message).toContain("We couldn't clearly read the transaction reference from this screenshot.");
+    });
+
+    it('E: Duplicate screenshot reference -> DUPLICATE_TRANSACTION_REFERENCE', async () => {
+      const bRes1 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'User 1', phone: '9988776604', village: 'Satulur', quantity: 1 });
+      const b1 = bRes1.body.data;
+      const validImg1 = await createValidScreenshotBase64(304);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990456789012\n${getValidTestTimestampText()}`
+      );
+
+      const res1 = await request(app)
+        .post(`/api/bookings/${b1.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b1.payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg1,
+          consentGiven: true,
+        });
+      expect(res1.status).toBe(200);
+
+      const bRes2 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'User 2', phone: '9988776605', village: 'Satulur', quantity: 1 });
+      const b2 = bRes2.body.data;
+      const validImg2 = await createValidScreenshotBase64(305);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990456789012\n${getValidTestTimestampText()}`
+      );
+
+      const res2 = await request(app)
+        .post(`/api/bookings/${b2.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b2.payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg2,
+          consentGiven: true,
+        });
+
+      expect(res2.status).toBe(400);
+      expect(res2.body.error.reasonCodes).toContain('DUPLICATE_TRANSACTION_REFERENCE');
+    });
+
+    it('F: Amount mismatch -> AMOUNT_MISMATCH', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'User Qty 2', phone: '9988776606', village: 'Satulur', quantity: 2 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(306);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990656789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
+    });
+
+    it('G: Payment pending -> STATUS_NOT_SUCCESS', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Pending User', phone: '9988776607', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(307);
+
+      setMockOcrText(
+        `Payment Pending\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990756789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.reasonCodes).toContain('STATUS_NOT_SUCCESS');
+    });
+
+    it('H: Exact duplicate screenshot -> DUPLICATE_SCREENSHOT', async () => {
+      const bRes1 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Screen User 1', phone: '9988776608', village: 'Satulur', quantity: 1 });
+      const b1 = bRes1.body.data;
+      const validImg = await createValidScreenshotBase64(308);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 990856789012\n${getValidTestTimestampText()}`
+      );
+
+      const res1 = await request(app)
+        .post(`/api/bookings/${b1.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b1.payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+      expect(res1.status).toBe(200);
+
+      const bRes2 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Screen User 2', phone: '9988776609', village: 'Satulur', quantity: 1 });
+      const b2 = bRes2.body.data;
+
+      const res2 = await request(app)
+        .post(`/api/bookings/${b2.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b2.payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res2.status).toBe(400);
+      expect(res2.body.error.reasonCodes).toContain('DUPLICATE_SCREENSHOT');
+    });
+
+    it('I: Payment session is exactly 5 minutes', async () => {
+      const res = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Timer Check User', phone: '9988776610', village: 'Satulur', quantity: 1 });
+      const { payment } = res.body.data;
+
+      const createdTime = Date.now();
+      const expiresTime = new Date(payment.expiresAt).getTime();
+      const diffMinutes = Math.round((expiresTime - createdTime) / (60 * 1000));
+      expect(diffMinutes).toBe(5);
+    });
+
+    it('J & K: Payment and Verification steps share same server-authoritative timer without reset', () => {
+      const source = fs.readFileSync('src/components/BookingModal.tsx', 'utf-8');
+      expect(source).toContain('bookingData.payment.expiresAt');
+      expect(source).toContain('sessionStorage.setItem');
+      expect(source).toContain('active_upi_session');
+    });
+
+    it('L: No production UI contains Boddukuri Sanjay', () => {
+      const modalSource = fs.readFileSync('src/components/BookingModal.tsx', 'utf-8');
+      const appSource = fs.readFileSync('src/App.tsx', 'utf-8');
+      const couponSource = fs.readFileSync('src/components/CouponSection.tsx', 'utf-8');
+
+      expect(modalSource.toLowerCase()).not.toContain('boddukuri');
+      expect(modalSource.toLowerCase()).not.toContain('sanjay');
+      expect(appSource.toLowerCase()).not.toContain('boddukuri');
+      expect(appSource.toLowerCase()).not.toContain('sanjay');
+      expect(couponSource.toLowerCase()).not.toContain('boddukuri');
+      expect(couponSource.toLowerCase()).not.toContain('sanjay');
+    });
+
+    it('M: New booking form name starts empty and placeholder is Enter your full name', () => {
+      const modalSource = fs.readFileSync('src/components/BookingModal.tsx', 'utf-8');
+      expect(modalSource).toContain("placeholder=\"Enter your full name\"");
+      expect(modalSource).toContain("const [name, setName] = useState<string>(initialData?.name || '');");
+    });
+
+    it('N: Coupon uses booking participant name dynamically', async () => {
+      const participantName = 'Dynamically Entered Participant';
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: participantName, phone: '9988776611', village: 'Satulur Village', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(311);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 991156789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.coupons[0].holder_name).toBe(participantName);
+      expect(res.body.data.coupons[0].village).toBe('Satulur Village');
+    });
+
+    it('O: Successful verify generates exact coupon quantity once', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Multi Qty User', phone: '9988776612', village: 'Satulur', quantity: 3 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(312);
+
+      setMockOcrText(
+        `Payment Successful\n₹150.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 991256789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.coupons.length).toBe(3);
+    });
+
+    it('P: Double click / concurrent requests generate coupons only once (Idempotent)', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Double Click User', phone: '9988776613', village: 'Satulur', quantity: 2 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(313);
+
+      setMockOcrText(
+        `Payment Successful\n₹100.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 991356789012\n${getValidTestTimestampText()}`
+      );
+
+      const [res1, res2] = await Promise.all([
+        request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true }),
+        request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true }),
+      ]);
+
+      const successfulRes = res1.status === 200 ? res1 : res2;
+      expect(successfulRes.status).toBe(200);
+
+      const countRes = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
+      expect(countRes.rows.length).toBe(2);
+    });
+  });
 });

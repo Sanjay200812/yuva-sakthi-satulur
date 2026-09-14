@@ -271,7 +271,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                     required
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="Enter your name (e.g., Ramesh Reddy)"
+                    placeholder="Enter your full name"
                     className="w-full px-4 py-3 rounded-xl bg-slate-950/80 border border-slate-700 focus:border-amber-400 focus:ring-1 focus:ring-amber-400 outline-none text-white text-sm placeholder:text-slate-500 transition-all"
                   />
                 </div>

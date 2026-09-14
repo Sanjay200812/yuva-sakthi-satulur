@@ -443,12 +443,18 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
+    const t0 = Date.now();
+
     // 6. Clean & Decode Screenshot Buffer
     const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, '');
     const imageBuffer = Buffer.from(cleanBase64, 'base64');
+    const t1 = Date.now();
+    const imageValidationMs = t1 - t0;
 
     // 7. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
     const processed = await processPaymentScreenshot(imageBuffer, booking.id, originalFilename, originalMimeType);
+    const t2 = Date.now();
+    const imagePreprocessMs = t2 - t1;
 
     // 8. Run Local Server-Side OCR & Candidate Extraction
     const analysis = await analyzePaymentScreenshot(
@@ -462,6 +468,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         paymentExpiresAt: booking.payment_expires_at,
       }
     );
+    const t3 = Date.now();
+    const ocrMs = t3 - t2;
 
     const submissionId = crypto.randomUUID();
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
@@ -531,6 +539,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
 
       return res.status(200).json({
         success: true,
+        status: 'ocr_processing_error',
         data: {
           submissionId,
           publicId: booking.public_id,
@@ -548,9 +557,9 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 9. Extract and normalize references
+    // 9. Extract and normalize references (Screenshot-Only primary source)
     const enteredUtrField = req.body.utr ?? req.body.transactionReference ?? req.body.enteredUtr;
-    const rawEnteredRef = (enteredUtrField !== undefined ? enteredUtrField : (analysis.utrOrRrn || analysis.transactionId || '')).trim();
+    const rawEnteredRef = enteredUtrField !== undefined ? String(enteredUtrField).trim() : '';
     const normalizedEnteredRef = normalizeTransactionReference(rawEnteredRef);
     const extractedRrn = analysis.utrOrRrn ? normalizeTransactionReference(analysis.utrOrRrn) : (analysis.transactionId ? normalizeTransactionReference(analysis.transactionId) : '');
 
@@ -564,36 +573,41 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     const payerUtrHash = extractedRefHash || enteredRefHash || crypto.createHash('sha256').update(fallbackUtr).digest('hex');
     const encryptedUtr = encryptedExtractedRef || encryptedEnteredRef || encryptSensitiveField(fallbackUtr);
 
-    let isDuplicateUtr = false;
-    if (enteredRefHash) {
-      const dupEntered = await db.query(
-        `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
-        [enteredRefHash, booking.id, 'admin_rejected', 'payment_rejected']
-      );
-      if (dupEntered.rows.length > 0) isDuplicateUtr = true;
-    }
-    if (!isDuplicateUtr && extractedRefHash) {
-      const dupExtracted = await db.query(
-        `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
-        [extractedRefHash, booking.id, 'admin_rejected', 'payment_rejected']
-      );
-      if (dupExtracted.rows.length > 0) isDuplicateUtr = true;
-    }
+    const t4 = Date.now();
+    const parsingMs = t4 - t3;
 
-    // 10. Check Duplicate Screenshot Hash
-    const dupScreenRes = await db.query(
-      'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-      [processed.sha256, booking.id, 'admin_rejected', 'payment_rejected']
-    );
+    // 10. Fast Parallel Database Checks across indexed columns
+    const [dupEnteredRes, dupExtractedRes, dupScreenRes, pastSubsRes] = await Promise.all([
+      enteredRefHash
+        ? db.query(
+            `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+            [enteredRefHash, booking.id, 'admin_rejected', 'payment_rejected']
+          )
+        : Promise.resolve({ rows: [] }),
+      extractedRefHash
+        ? db.query(
+            `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+            [extractedRefHash, booking.id, 'admin_rejected', 'payment_rejected']
+          )
+        : Promise.resolve({ rows: [] }),
+      db.query(
+        'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4',
+        [processed.sha256, booking.id, 'admin_rejected', 'payment_rejected']
+      ),
+      processed.phash
+        ? db.query(
+            'SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3',
+            [booking.id, 'admin_rejected', 'payment_rejected']
+          )
+        : Promise.resolve({ rows: [] }),
+    ]);
+
+    let isDuplicateUtr = dupEnteredRes.rows.length > 0 || dupExtractedRes.rows.length > 0;
     let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
 
-    // 10b. Perceptual dHash Duplicate Detection
+    // Perceptual dHash Duplicate Detection (supporting signal)
     if (!isDuplicateScreenshot && processed.phash) {
-      const pastSubs = await db.query(
-        'SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3',
-        [booking.id, 'admin_rejected', 'payment_rejected']
-      );
-      for (const past of pastSubs.rows) {
+      for (const past of pastSubsRes.rows) {
         if (past.screenshot_phash) {
           const dist = hammingDistance(processed.phash, past.screenshot_phash);
           if (dist <= 2 && past.expected_amount_paise === booking.total_amount_paise) {
@@ -603,6 +617,9 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         }
       }
     }
+
+    const t5 = Date.now();
+    const databaseChecksMs = t5 - t4;
 
     // 11. Run Deterministic Receipt Verifier (Fail-Closed, Code-Only)
     const verification = verifyPaymentReceipt({
@@ -710,6 +727,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       ]
     );
 
+    const t6 = Date.now();
     if (isPassed) {
       // 14. AUTOMATED FINALIZATION: Atomic transaction locks booking, allocates sequential coupons, and transitions to payment_confirmed
       const finalResult = await finalizeVerifiedSubmission({
@@ -717,9 +735,20 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         bookingId: booking.id,
         decisionVersion: 'v3-local-ocr-deterministic',
       });
+      const t7 = Date.now();
+      const finalizationMs = t7 - t6;
+      const totalVerificationMs = t7 - t0;
+      console.log(`⏱️ [Verification Profile: Passed] total=${totalVerificationMs}ms (validation=${imageValidationMs}ms preprocess=${imagePreprocessMs}ms ocr=${ocrMs}ms parsing=${parsingMs}ms db=${databaseChecksMs}ms finalize=${finalizationMs}ms)`);
+
+      const maskedReference = extractedRrn ? `********${extractedRrn.slice(-4)}` : (rawEnteredRef ? `********${rawEnteredRef.slice(-4)}` : '********0000');
 
       return res.json({
         success: true,
+        status: 'payment_confirmed',
+        verification: 'verified',
+        amount: booking.total_amount_paise / 100,
+        referenceMasked: maskedReference,
+        coupons: finalResult.coupons,
         data: {
           submissionId,
           publicId: booking.public_id,
@@ -742,9 +771,16 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         ['payment_rejected', new Date().toISOString(), booking.id]
       );
 
+      const t7 = Date.now();
+      const totalVerificationMs = t7 - t0;
+      console.log(`⏱️ [Verification Profile: Rejected] total=${totalVerificationMs}ms (validation=${imageValidationMs}ms preprocess=${imagePreprocessMs}ms ocr=${ocrMs}ms parsing=${parsingMs}ms db=${databaseChecksMs}ms)`);
+
       const primaryCode = finalReasonCodes[0] || 'PROOF_VERIFICATION_FAILED';
       return res.status(400).json({
         success: false,
+        status: 'proof_verification_failed',
+        reasonCode: primaryCode,
+        message: verification.userMessage || match.userMessage,
         error: {
           code: primaryCode,
           message: verification.userMessage || match.userMessage,
