@@ -38,6 +38,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
   const [metrics, setMetrics] = useState<any>(null);
   const [coupons, setCoupons] = useState<any[]>([]);
   const [reviews, setReviews] = useState<any[]>([]);
+  const [aiHealth, setAiHealth] = useState<any>(null);
   const [reviewFilter, setReviewFilter] = useState<string>('all');
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -92,6 +93,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
       const json = await safeFetchJson<any>(`/api/admin/payment-reviews?${query.toString()}`, { credentials: 'include' }, 'Payment reviews');
       if (json.success) {
         setReviews(json.data || []);
+        if (json.aiHealth) {
+          setAiHealth(json.aiHealth);
+        }
       }
     } catch (err) {
       console.error('Error fetching verification logs', err);
@@ -454,8 +458,25 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
           <div className="space-y-4">
             <div className="p-4 rounded-2xl bg-[#0D132D] border border-purple-500/20 flex items-start gap-3">
               <ShieldCheck className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-              <div className="text-xs text-slate-300 space-y-1">
-                <p className="font-bold text-white">Automated Verification &amp; Fraud Risk Audit Log</p>
+              <div className="text-xs text-slate-300 space-y-1 w-full">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <p className="font-bold text-white">Automated Verification &amp; Fraud Risk Audit Log</p>
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-400 text-[11px]">AI Service:</span>
+                    <span
+                      className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold uppercase border ${
+                        aiHealth?.serviceStatus === 'AVAILABLE'
+                          ? 'bg-emerald-950/80 text-emerald-400 border-emerald-500/40'
+                          : 'bg-amber-950/80 text-amber-300 border-amber-500/40'
+                      }`}
+                    >
+                      {aiHealth?.serviceStatus === 'AVAILABLE' ? 'AVAILABLE' : 'TEMPORARILY UNAVAILABLE'}
+                    </span>
+                    {aiHealth?.model && (
+                      <span className="text-[10px] text-slate-500 font-mono">({aiHealth.model})</span>
+                    )}
+                  </div>
+                </div>
                 <p>
                   Every payment proof passes OCR detail extraction and deterministic verification. High-confidence verifications automatically issue coupons into the official registry without delay. View full OCR extraction details, risk signals, RRN hashes, and audit history below.
                 </p>
@@ -469,6 +490,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                   { key: 'all', label: 'All Submissions' },
                   { key: 'payment_confirmed', label: 'Payment Confirmed' },
                   { key: 'proof_verified', label: 'Proof Verified' },
+                  { key: 'ai_retry_pending', label: 'Retry Pending' },
                   { key: 'ai_check_failed', label: 'Verification Failed' },
                 ].map((f) => (
                   <button
@@ -572,7 +594,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                             </td>
 
                             <td className="p-3 sm:p-4 max-w-xs">
-                              {r.geminiExtraction ? (
+                              {r.status === 'ai_retry_pending' || r.reasonCodes?.includes('AI_UNAVAILABLE') || r.geminiExtraction?.is_fallback || r.geminiExtraction?.unavailable ? (
+                                <div className="space-y-1 text-[11px]">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-slate-400">OCR Amount:</span>
+                                    <span className="font-mono text-slate-400 italic">Not analyzed</span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-slate-400">OCR RRN:</span>
+                                    <span className="font-mono text-slate-400 italic">Not analyzed</span>
+                                  </div>
+                                  <div className="flex flex-wrap gap-1 mt-1">
+                                    <span className="px-1.5 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-500/40 text-[9px] font-mono">
+                                      AI_UNAVAILABLE
+                                    </span>
+                                  </div>
+                                </div>
+                              ) : r.geminiExtraction ? (
                                 <div className="space-y-1 text-[11px]">
                                   <div className="flex items-center gap-1.5">
                                     <span className="text-slate-400">OCR Amount:</span>
@@ -608,12 +646,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                                 className={`px-2.5 py-1 rounded-lg text-[10px] uppercase font-bold border inline-block ${
                                   isConfirmed
                                     ? 'bg-emerald-950/80 text-emerald-400 border-emerald-500/40'
+                                    : r.status === 'ai_retry_pending'
+                                    ? 'bg-amber-950/90 text-amber-300 border-amber-500/50'
                                     : isFailed
                                     ? 'bg-rose-950/80 text-rose-400 border-rose-500/40'
                                     : 'bg-purple-950 text-purple-300 border-purple-500/30'
                                 }`}
                               >
-                                {r.status.replace(/_/g, ' ')}
+                                {r.status === 'ai_retry_pending' ? 'AI SERVICE UNAVAILABLE / RETRY PENDING' : r.status.replace(/_/g, ' ')}
                               </span>
                               {r.reviewedAt && (
                                 <div className="text-[10px] text-slate-500 mt-1">

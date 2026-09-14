@@ -26,10 +26,43 @@ export interface GeminiExtractionResult {
   is_fallback?: boolean;
 }
 
+export type GeminiErrorCategory = 'auth' | 'quota' | 'model' | 'network' | 'parse' | 'server' | 'unknown';
+
+export type GeminiAnalysisResult =
+  | {
+      success: true;
+      extraction: GeminiExtractionResult;
+      model: string;
+      attempts: number;
+      retryable?: boolean;
+      errorCode?: string;
+    }
+  | {
+      success: false;
+      retryable: boolean;
+      errorCode: string;
+      errorCategory: GeminiErrorCategory;
+      safeMessage: string;
+      model: string;
+      attempts: number;
+      httpStatus?: number;
+      extraction?: GeminiExtractionResult;
+    };
+
 export interface VerificationConstraints {
   expectedMerchantName?: string;
   expectedAmount?: string;
   sessionTimestampIso?: string;
+}
+
+export interface GeminiHealthStatus {
+  configured: boolean;
+  model: string;
+  fallbackModel: string;
+  lastRequestTime: string | null;
+  lastRequestSuccess: boolean | null;
+  lastErrorCategory: GeminiErrorCategory | null;
+  serviceStatus: 'AVAILABLE' | 'TEMPORARILY_UNAVAILABLE' | 'NOT_CONFIGURED';
 }
 
 const SYSTEM_INSTRUCTION = `You are an expert fraud detection and digital forensics engine specialized in verifying Indian UPI transaction receipts (PhonePe, Google Pay, Paytm, BHIM, FamPay, Cred, Amazon Pay).
@@ -40,85 +73,253 @@ Do not guess, assume, or invent values. You must NEVER invent, hallucinate, or f
 Identify font inconsistencies, spliced text overlays, isolated compression artifacts, or synthetic AI hallmarks.
 Return your extraction strictly according to the specified JSON schema.`;
 
-let mockGeminiExtraction: GeminiExtractionResult | null = null;
+// Health diagnostic tracking (never exposes API keys or raw data)
+let lastRequestTime: string | null = null;
+let lastRequestSuccess: boolean | null = null;
+let lastErrorCategory: GeminiErrorCategory | null = null;
 
+export function getGeminiHealthStatus(): GeminiHealthStatus {
+  const isConfigured = !!config.GEMINI_API_KEY && config.GEMINI_API_KEY !== 'your_gemini_api_key_here';
+  let serviceStatus: 'AVAILABLE' | 'TEMPORARILY_UNAVAILABLE' | 'NOT_CONFIGURED' = 'AVAILABLE';
+
+  if (!isConfigured) {
+    serviceStatus = 'NOT_CONFIGURED';
+  } else if (lastRequestSuccess === false) {
+    serviceStatus = 'TEMPORARILY_UNAVAILABLE';
+  }
+
+  return {
+    configured: isConfigured,
+    model: config.GEMINI_MODEL,
+    fallbackModel: config.GEMINI_FALLBACK_MODEL,
+    lastRequestTime,
+    lastRequestSuccess,
+    lastErrorCategory,
+    serviceStatus,
+  };
+}
+
+let mockGeminiResult: GeminiAnalysisResult | null = null;
+
+export function setMockGeminiResult(mock: GeminiAnalysisResult | null): void {
+  mockGeminiResult = mock;
+}
+
+// Backward compatibility helper for existing test suites
 export function setMockGeminiExtraction(mock: GeminiExtractionResult | null): void {
-  mockGeminiExtraction = mock;
+  if (mock === null) {
+    mockGeminiResult = null;
+  } else {
+    mockGeminiResult = {
+      success: true,
+      extraction: mock,
+      model: 'mock-model',
+      attempts: 1,
+    };
+  }
+}
+
+/**
+ * Classifies an error caught from Gemini SDK into safe category, retryability, and safe message.
+ * NEVER leaks API keys or internal stack traces.
+ */
+export function classifyGeminiError(err: any): {
+  category: GeminiErrorCategory;
+  retryable: boolean;
+  errorCode: string;
+  httpStatus?: number;
+  safeMessage: string;
+} {
+  const status = typeof err?.status === 'number' ? err.status : undefined;
+  const rawMsg = (err?.message || '').toLowerCase();
+  const errCode = (err?.code || '').toLowerCase();
+
+  // 1. Authentication / Permission errors (Non-retryable)
+  if (
+    status === 401 ||
+    status === 403 ||
+    rawMsg.includes('api_key_invalid') ||
+    rawMsg.includes('permission_denied') ||
+    rawMsg.includes('invalid api key') ||
+    rawMsg.includes('unauthenticated')
+  ) {
+    return {
+      category: 'auth',
+      retryable: false,
+      errorCode: 'GEMINI_AUTH_FAILED',
+      httpStatus: status || 401,
+      safeMessage: 'Gemini authentication credentials are invalid or unauthorized.',
+    };
+  }
+
+  // 2. Quota / Rate Limiting (Retryable)
+  if (
+    status === 429 ||
+    rawMsg.includes('resource_exhausted') ||
+    rawMsg.includes('quota') ||
+    rawMsg.includes('rate limit') ||
+    rawMsg.includes('too many requests')
+  ) {
+    return {
+      category: 'quota',
+      retryable: true,
+      errorCode: 'GEMINI_RATE_LIMITED',
+      httpStatus: 429,
+      safeMessage: 'Gemini rate limit exceeded. Verification will retry automatically.',
+    };
+  }
+
+  // 3. Model Not Found / Deprecated (Retryable with fallback model)
+  if (
+    status === 404 ||
+    rawMsg.includes('not_found') ||
+    rawMsg.includes('no longer available') ||
+    rawMsg.includes('not supported') ||
+    rawMsg.includes('is not found')
+  ) {
+    return {
+      category: 'model',
+      retryable: true,
+      errorCode: 'GEMINI_MODEL_UNAVAILABLE',
+      httpStatus: 404,
+      safeMessage: 'Selected Gemini model is unavailable or discontinued.',
+    };
+  }
+
+  // 4. Server 5xx / High Demand (Retryable)
+  if (
+    (status && status >= 500 && status < 600) ||
+    rawMsg.includes('unavailable') ||
+    rawMsg.includes('high demand') ||
+    rawMsg.includes('service unavailable') ||
+    rawMsg.includes('internal error')
+  ) {
+    return {
+      category: 'server',
+      retryable: true,
+      errorCode: 'GEMINI_SERVICE_UNAVAILABLE',
+      httpStatus: status || 503,
+      safeMessage: 'Gemini verification service is temporarily busy. Retrying automatically.',
+    };
+  }
+
+  // 5. Network / Timeout (Retryable)
+  if (
+    err?.name === 'FetchError' ||
+    err?.code === 'ETIMEDOUT' ||
+    err?.code === 'ECONNRESET' ||
+    err?.code === 'ENOTFOUND' ||
+    rawMsg.includes('timeout') ||
+    rawMsg.includes('network') ||
+    rawMsg.includes('econnreset')
+  ) {
+    return {
+      category: 'network',
+      retryable: true,
+      errorCode: 'GEMINI_NETWORK_TIMEOUT',
+      safeMessage: 'Network timeout contacting Gemini verification endpoint.',
+    };
+  }
+
+  // 6. JSON Parse failure (Retryable)
+  if (err instanceof SyntaxError || rawMsg.includes('json') || rawMsg.includes('unexpected token')) {
+    return {
+      category: 'parse',
+      retryable: true,
+      errorCode: 'GEMINI_PARSE_FAILED',
+      safeMessage: 'Unable to parse structured response from Gemini.',
+    };
+  }
+
+  // Default Unknown (Retryable cautiously)
+  return {
+    category: 'unknown',
+    retryable: true,
+    errorCode: 'GEMINI_ERROR',
+    httpStatus: status,
+    safeMessage: 'An unexpected Gemini verification error occurred.',
+  };
+}
+
+/**
+ * Sanitizes and logs safe structured error information without leaking keys or raw images.
+ */
+function logSafeGeminiError(info: {
+  model: string;
+  attempt: number;
+  category: GeminiErrorCategory;
+  httpStatus?: number;
+  message: string;
+}): void {
+  // Strip any accidental key strings that might match standard formats
+  const cleanMsg = info.message.replace(/AIzaSy[A-Za-z0-9_\-]{33}/g, '[REDACTED_KEY]').replace(/AQ\.[A-Za-z0-9_\-]{40,}/g, '[REDACTED_KEY]');
+  console.warn(
+    `⚠️ [Gemini Analysis Error] model="${info.model}" attempt=${info.attempt} category="${info.category}" status=${info.httpStatus || 'N/A'} message="${cleanMsg}"`
+  );
 }
 
 export async function analyzePaymentScreenshotWithGemini(
   imageBuffer: Buffer,
   mimeType: string = 'image/jpeg',
   constraints?: VerificationConstraints
-): Promise<GeminiExtractionResult> {
-  if (mockGeminiExtraction) {
-    return { ...mockGeminiExtraction };
+): Promise<GeminiAnalysisResult> {
+  if (mockGeminiResult) {
+    return { ...mockGeminiResult };
   }
 
-  // In automated test environment, isolate OCR from external network/quota/model deprecations
+  // In automated test environment without a mock set, isolate OCR from external network
   if (process.env.VITEST || process.env.NODE_ENV === 'test') {
     return {
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '50.00',
-      currency: 'INR',
-      payee_name: config.PAYEE_DISPLAY_NAME,
-      payee_upi_id: config.PAYEE_UPI_ID,
-      payer_name: 'Satulur Participant',
-      utr_or_rrn: '984809988801',
-      transaction_id: 'T2609140001',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: {
-        amount: 0.98,
-        payee: 0.95,
-        utr: 0.96,
-        status: 0.99,
-        timestamp: 0.92,
+      success: true,
+      model: 'test-mock-gemini',
+      attempts: 1,
+      extraction: {
+        looks_like_payment_screen: true,
+        visible_payment_status: 'success',
+        app_name: 'phonepe',
+        amount: (constraints?.expectedAmount || '50.00'),
+        currency: 'INR',
+        payee_name: config.PAYEE_DISPLAY_NAME,
+        payee_upi_id: config.PAYEE_UPI_ID,
+        payer_name: 'Satulur Participant',
+        utr_or_rrn: '984809988801',
+        transaction_id: 'T2609140001',
+        transaction_timestamp: new Date().toISOString(),
+        obvious_editing_signals: [],
+        ai_generated_likelihood: 'low',
+        field_confidence: {
+          amount: 0.98,
+          payee: 0.95,
+          utr: 0.96,
+          status: 0.99,
+          timestamp: 0.92,
+        },
       },
-      is_fallback: true,
     };
   }
 
   const apiKey = config.GEMINI_API_KEY;
 
-  // Graceful fallback when Gemini API key is not configured
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
+    lastRequestTime = new Date().toISOString();
+    lastRequestSuccess = false;
+    lastErrorCategory = 'auth';
     return {
-      looks_like_payment_screen: true,
-      visible_payment_status: 'unknown',
-      app_name: 'unknown',
-      amount: null,
-      currency: 'INR',
-      payee_name: null,
-      payee_upi_id: null,
-      payer_name: null,
-      utr_or_rrn: null,
-      transaction_id: null,
-      transaction_timestamp: null,
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: {
-        amount: 0,
-        payee: 0,
-        utr: 0,
-        status: 0,
-        timestamp: 0,
-      },
-      is_fallback: true,
+      success: false,
+      retryable: false,
+      errorCode: 'GEMINI_NOT_CONFIGURED',
+      errorCategory: 'auth',
+      safeMessage: 'Gemini API key is not configured on the server.',
+      model: config.GEMINI_MODEL,
+      attempts: 0,
     };
   }
 
-  try {
-    const ai = new GoogleGenAI({ apiKey });
+  const merchantName = constraints?.expectedMerchantName || config.PAYEE_DISPLAY_NAME;
+  const expectedAmount = constraints?.expectedAmount || '50.00';
+  const sessionTime = constraints?.sessionTimestampIso || new Date().toISOString();
 
-    const merchantName = constraints?.expectedMerchantName || config.PAYEE_DISPLAY_NAME;
-    const expectedAmount = constraints?.expectedAmount || '50.00';
-    const sessionTime = constraints?.sessionTimestampIso || new Date().toISOString();
-
-    const prompt = `Inspect this screenshot meticulously and return your forensic analysis in the requested JSON structure.
+  const prompt = `Inspect this screenshot meticulously and return your forensic analysis in the requested JSON structure.
 
 ---
 ### EXPECTED TRANSACTION CONSTRAINTS
@@ -148,105 +349,151 @@ export async function analyzePaymentScreenshotWithGemini(
    - Confirm standard native UI elements: status bar (battery, network, clock), top navigation bar, tick/success badge, and payment breakdown sections.
    - Flag as invalid if it is an empty canvas, generic mockup, or web generator template.`;
 
-    const response = await ai.models.generateContent({
-      model: config.GEMINI_MODEL,
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                data: imageBuffer.toString('base64'),
-                mimeType,
-              },
-            },
-          ],
+  const schemaConfig = {
+    systemInstruction: SYSTEM_INSTRUCTION,
+    responseMimeType: 'application/json',
+    responseSchema: {
+      type: 'OBJECT' as any,
+      properties: {
+        looks_like_payment_screen: { type: 'BOOLEAN' as any },
+        visible_payment_status: {
+          type: 'STRING' as any,
+          enum: ['success', 'pending', 'failed', 'unknown'],
         },
-      ],
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: 'application/json',
-        responseSchema: {
+        app_name: {
+          type: 'STRING' as any,
+          enum: ['phonepe', 'google_pay', 'paytm', 'other', 'unknown'],
+        },
+        amount: { type: 'STRING' as any, nullable: true },
+        currency: { type: 'STRING' as any, nullable: true },
+        payee_name: { type: 'STRING' as any, nullable: true },
+        payee_upi_id: { type: 'STRING' as any, nullable: true },
+        payer_name: { type: 'STRING' as any, nullable: true },
+        utr_or_rrn: { type: 'STRING' as any, nullable: true },
+        transaction_id: { type: 'STRING' as any, nullable: true },
+        transaction_timestamp: { type: 'STRING' as any, nullable: true },
+        obvious_editing_signals: {
+          type: 'ARRAY' as any,
+          items: { type: 'STRING' as any },
+        },
+        ai_generated_likelihood: {
+          type: 'STRING' as any,
+          enum: ['low', 'medium', 'high', 'unknown'],
+        },
+        field_confidence: {
           type: 'OBJECT' as any,
           properties: {
-            looks_like_payment_screen: { type: 'BOOLEAN' as any },
-            visible_payment_status: {
-              type: 'STRING' as any,
-              enum: ['success', 'pending', 'failed', 'unknown'],
-            },
-            app_name: {
-              type: 'STRING' as any,
-              enum: ['phonepe', 'google_pay', 'paytm', 'other', 'unknown'],
-            },
-            amount: { type: 'STRING' as any, nullable: true },
-            currency: { type: 'STRING' as any, nullable: true },
-            payee_name: { type: 'STRING' as any, nullable: true },
-            payee_upi_id: { type: 'STRING' as any, nullable: true },
-            payer_name: { type: 'STRING' as any, nullable: true },
-            utr_or_rrn: { type: 'STRING' as any, nullable: true },
-            transaction_id: { type: 'STRING' as any, nullable: true },
-            transaction_timestamp: { type: 'STRING' as any, nullable: true },
-            obvious_editing_signals: {
-              type: 'ARRAY' as any,
-              items: { type: 'STRING' as any },
-            },
-            ai_generated_likelihood: {
-              type: 'STRING' as any,
-              enum: ['low', 'medium', 'high', 'unknown'],
-            },
-            field_confidence: {
-              type: 'OBJECT' as any,
-              properties: {
-                amount: { type: 'NUMBER' as any },
-                payee: { type: 'NUMBER' as any },
-                utr: { type: 'NUMBER' as any },
-                status: { type: 'NUMBER' as any },
-                timestamp: { type: 'NUMBER' as any },
-              },
-              required: ['amount', 'payee', 'utr', 'status', 'timestamp'],
-            },
+            amount: { type: 'NUMBER' as any },
+            payee: { type: 'NUMBER' as any },
+            utr: { type: 'NUMBER' as any },
+            status: { type: 'NUMBER' as any },
+            timestamp: { type: 'NUMBER' as any },
           },
-          required: [
-            'looks_like_payment_screen',
-            'visible_payment_status',
-            'app_name',
-            'obvious_editing_signals',
-            'ai_generated_likelihood',
-            'field_confidence',
-          ],
+          required: ['amount', 'payee', 'utr', 'status', 'timestamp'],
         },
       },
-    });
+      required: [
+        'looks_like_payment_screen',
+        'visible_payment_status',
+        'app_name',
+        'obvious_editing_signals',
+        'ai_generated_likelihood',
+        'field_confidence',
+      ],
+    },
+  };
 
-    const responseText = response.text || '';
-    const parsed = JSON.parse(responseText) as GeminiExtractionResult;
-    parsed.raw_response = responseText;
-    return parsed;
-  } catch (err: any) {
-    console.warn('⚠️ Gemini OCR analysis error (falling back to manual admin review):', err.message);
-    return {
-      looks_like_payment_screen: true,
-      visible_payment_status: 'unknown',
-      app_name: 'unknown',
-      amount: null,
-      currency: 'INR',
-      payee_name: null,
-      payee_upi_id: null,
-      payer_name: null,
-      utr_or_rrn: null,
-      transaction_id: null,
-      transaction_timestamp: null,
-      obvious_editing_signals: ['AI_UNAVAILABLE'],
-      ai_generated_likelihood: 'low',
-      field_confidence: {
-        amount: 0,
-        payee: 0,
-        utr: 0,
-        status: 0,
-        timestamp: 0,
-      },
-      is_fallback: true,
-    };
+  const ai = new GoogleGenAI({ apiKey });
+  const maxAttempts = 3;
+  let lastClassifiedError: ReturnType<typeof classifyGeminiError> | null = null;
+  let activeModel = config.GEMINI_MODEL;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // If model failed previously with model-unavailable, try configured fallback model
+      if (attempt > 1 && lastClassifiedError?.category === 'model' && config.GEMINI_FALLBACK_MODEL) {
+        activeModel = config.GEMINI_FALLBACK_MODEL;
+      }
+
+      const response = await ai.models.generateContent({
+        model: activeModel,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              {
+                inlineData: {
+                  data: imageBuffer.toString('base64'),
+                  mimeType,
+                },
+              },
+            ],
+          },
+        ],
+        config: schemaConfig,
+      });
+
+      const responseText = response.text || '';
+      const parsed = JSON.parse(responseText) as GeminiExtractionResult;
+      parsed.raw_response = responseText;
+
+      lastRequestTime = new Date().toISOString();
+      lastRequestSuccess = true;
+      lastErrorCategory = null;
+
+      return {
+        success: true,
+        extraction: parsed,
+        model: activeModel,
+        attempts: attempt,
+      };
+    } catch (err: any) {
+      const classified = classifyGeminiError(err);
+      lastClassifiedError = classified;
+      lastRequestTime = new Date().toISOString();
+      lastRequestSuccess = false;
+      lastErrorCategory = classified.category;
+
+      logSafeGeminiError({
+        model: activeModel,
+        attempt,
+        category: classified.category,
+        httpStatus: classified.httpStatus,
+        message: err?.message || 'Unknown error',
+      });
+
+      // Stop immediately on non-retryable errors (auth, config, permissions)
+      if (!classified.retryable) {
+        return {
+          success: false,
+          retryable: false,
+          errorCode: classified.errorCode,
+          errorCategory: classified.category,
+          safeMessage: classified.safeMessage,
+          model: activeModel,
+          attempts: attempt,
+          httpStatus: classified.httpStatus,
+        };
+      }
+
+      // If we haven't reached max attempts, pause 1-1.5s before retrying
+      if (attempt < maxAttempts) {
+        const delayMs = attempt === 1 ? 1200 : 1800;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
+
+  // All attempts exhausted
+  return {
+    success: false,
+    retryable: true,
+    errorCode: lastClassifiedError?.errorCode || 'GEMINI_ATTEMPTS_EXHAUSTED',
+    errorCategory: lastClassifiedError?.category || 'unknown',
+    safeMessage: lastClassifiedError?.safeMessage || 'Gemini service is temporarily unavailable after multiple attempts.',
+    model: activeModel,
+    attempts: maxAttempts,
+    httpStatus: lastClassifiedError?.httpStatus,
+  };
 }

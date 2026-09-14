@@ -243,7 +243,7 @@ class MemoryDB implements TransactionalDB {
     }
 
     // 9. Find submission by id
-    if (trimmed.includes('FROM payment_submissions') && trimmed.includes('id = $1')) {
+    if (trimmed.includes('FROM payment_submissions') && (trimmed.includes('WHERE id = $1') || trimmed.includes(' ps.id = $1') || (trimmed.includes('id = $1') && !trimmed.includes('booking_id')))) {
       const found = this.paymentSubmissions.get(params[0]);
       return { rows: (found ? [found] : []) as any, rowCount: found ? 1 : 0 };
     }
@@ -269,7 +269,9 @@ class MemoryDB implements TransactionalDB {
 
     // 10. Find submission by booking_id
     if (trimmed.includes('FROM payment_submissions') && trimmed.includes('booking_id = $1')) {
-      const found = Array.from(this.paymentSubmissions.values()).filter((s) => s.booking_id === params[0]);
+      const found = Array.from(this.paymentSubmissions.values())
+        .filter((s) => s.booking_id === params[0])
+        .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
       return { rows: found as any, rowCount: found.length };
     }
 

@@ -61,7 +61,8 @@ const envSchema = z.object({
     process.env.GEMINI_API_KEY ||
     Buffer.from('QVEuQWI4Uk42S2ZHejV4Nmc2NExiQlNTcnI1VWMyQUtjd2RaVElwX1A2ZlRYaS1UelVON3c=', 'base64').toString('utf-8')
   ),
-  GEMINI_MODEL: z.string().default(process.env.GEMINI_MODEL || 'gemini-flash-latest'),
+  GEMINI_MODEL: z.string().default(process.env.GEMINI_MODEL || 'gemini-3.6-flash'),
+  GEMINI_FALLBACK_MODEL: z.string().default(process.env.GEMINI_FALLBACK_MODEL || 'gemini-flash-latest'),
   GEMINI_STORE_INTERACTIONS: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(false),
   FIELD_ENCRYPTION_KEY: z.string().default(process.env.FIELD_ENCRYPTION_KEY || ''),
 
@@ -166,9 +167,12 @@ export function getSupabaseProjectRef(url: string): string {
   }
 }
 
-// Ensure GEMINI_MODEL uses environment or latest flash
+// Ensure GEMINI_MODEL and GEMINI_FALLBACK_MODEL use environment
 if (process.env.GEMINI_MODEL) {
   config.GEMINI_MODEL = process.env.GEMINI_MODEL;
+}
+if (process.env.GEMINI_FALLBACK_MODEL) {
+  config.GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL;
 }
 
 // Production Security Validation (Log actionable warnings without crashing the serverless container)

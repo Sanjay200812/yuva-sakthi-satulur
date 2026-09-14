@@ -18,6 +18,7 @@ import {
   rejectPaymentSubmission,
   requestProofResubmission,
 } from '../upi/adminReconciliation.ts';
+import { getGeminiHealthStatus } from '../upi/geminiAnalyzer.ts';
 
 const router = express.Router();
 
@@ -366,8 +367,19 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
       );
     }
 
+    const parseJson = (val: any) => {
+      if (!val) return null;
+      if (typeof val === 'object') return val;
+      try {
+        return JSON.parse(val);
+      } catch {
+        return null;
+      }
+    };
+
     res.json({
       success: true,
+      aiHealth: getGeminiHealthStatus(),
       data: items.map((s: any) => ({
         id: s.id,
         bookingId: s.booking_id,
@@ -383,8 +395,8 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
         status: s.status,
         riskScore: s.risk_score || 0,
         reasonCodes: s.reason_codes || [],
-        geminiExtraction: s.gemini_extraction,
-        deterministicComparison: s.deterministic_comparison,
+        geminiExtraction: parseJson(s.gemini_extraction),
+        deterministicComparison: parseJson(s.deterministic_comparison),
         hasScreenshot: !!s.screenshot_storage_path,
         adminReviewerId: s.admin_reviewer_id,
         adminReviewNote: s.admin_review_note,

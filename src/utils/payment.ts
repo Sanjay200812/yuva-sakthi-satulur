@@ -124,6 +124,39 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
   return data.data;
 }
 
+export interface RetryVerificationParams {
+  publicId: string;
+  statusToken?: string;
+}
+
+/**
+ * Retries automated verification for an existing payment proof without requiring a new upload or payment.
+ */
+export async function retryPaymentVerification(params: RetryVerificationParams): Promise<PaymentProofResponse> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (params.statusToken) {
+    headers['Authorization'] = `Bearer ${params.statusToken}`;
+  }
+
+  const data = await safeFetchJson<any>(
+    `/api/bookings/${params.publicId}/retry-verification`,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ statusToken: params.statusToken }),
+    },
+    'Verification retry service'
+  );
+
+  if (!data.success) {
+    throw new Error(data.error?.message || 'Failed to retry verification.');
+  }
+
+  return data.data;
+}
+
 /**
  * Polls the backend status endpoint until payment is confirmed, failed, or timed out.
  */

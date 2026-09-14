@@ -27,6 +27,7 @@ import { CouponBooking } from '../types.ts';
 import {
   createBooking,
   submitPaymentProof,
+  retryPaymentVerification,
   pollPaymentStatus,
   BookingCreationResponse,
 } from '../utils/payment.ts';
@@ -238,6 +239,68 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     reader.readAsDataURL(file);
   };
 
+  const handleBookingConfirmed = (confirmed: any) => {
+    const coupons = confirmed.coupons || [];
+    const confirmedBooking: CouponBooking = {
+      id: bookingData?.booking.publicId || confirmed.publicId,
+      ticketNumbers: coupons.map((c: any) => c.coupon_number),
+      name: coupons[0]?.holder_name || bookingData?.booking.name || 'Participant',
+      phone: coupons[0]?.phone || bookingData?.booking.phone || '',
+      village: coupons[0]?.village || bookingData?.booking.village || 'Satulur',
+      quantity: bookingData?.booking.quantity || coupons.length || 1,
+      totalAmount: bookingData?.booking.totalAmount || 50,
+      bookedAt: new Date().toLocaleDateString('en-IN', {
+        day: 'numeric',
+        month: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+      status: 'confirmed',
+      transactionRef: 'AUTOMATED_PROOF_VERIFIED',
+    };
+
+    setConfirmedBookingData(confirmedBooking);
+    setLiveStatus('payment_confirmed');
+    setStatusMessage(`Payment proof accepted! ${confirmedBooking.quantity} coupons generated.`);
+
+    setTimeout(() => {
+      onBookSuccess(confirmedBooking);
+      onClose();
+    }, 1200);
+  };
+
+  const handleManualRetry = async () => {
+    if (!bookingData) return;
+    setIsProcessing(true);
+    setLiveStatus('ai_retry_pending');
+    setStatusMessage('Verifying your payment... Checking automated AI verification.');
+
+    try {
+      const res = await retryPaymentVerification({
+        publicId: bookingData.booking.publicId,
+        statusToken: bookingData.payment.statusToken,
+      });
+
+      if ((res.status === 'payment_confirmed' || res.status === 'proof_verified') && res.coupons?.length) {
+        handleBookingConfirmed(res);
+        return;
+      }
+
+      if (res.status === 'ai_retry_pending') {
+        setLiveStatus('ai_unavailable');
+        setStatusMessage('Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.');
+      } else if (res.status === 'ai_check_failed') {
+        setLiveStatus('verification_failed');
+        setStatusMessage(res.message || 'Payment proof verification failed.');
+      }
+    } catch (err: any) {
+      setLiveStatus('ai_unavailable');
+      setStatusMessage(err.message || 'Verification service is temporarily busy. Please retry verification shortly.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   // 3. Submit Payment Proof (Screenshot + Consent, Automated OCR Reference Extraction)
   const handleSubmitProof = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -275,32 +338,45 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       });
 
       if ((res.status === 'payment_confirmed' || res.status === 'proof_verified') && res.coupons?.length) {
-        const confirmedBooking: CouponBooking = {
-          id: bookingData.booking.publicId,
-          ticketNumbers: res.coupons.map((c: any) => c.coupon_number),
-          name: res.coupons[0]?.holder_name || bookingData.booking.name,
-          phone: res.coupons[0]?.phone || bookingData.booking.phone,
-          village: res.coupons[0]?.village || bookingData.booking.village,
-          quantity: bookingData.booking.quantity,
-          totalAmount: bookingData.booking.totalAmount,
-          bookedAt: new Date().toLocaleDateString('en-IN', {
-            day: 'numeric',
-            month: 'short',
-            hour: '2-digit',
-            minute: '2-digit',
-          }),
-          status: 'confirmed',
-          transactionRef: 'AUTOMATED_PROOF_VERIFIED',
-        };
+        handleBookingConfirmed(res);
+        return;
+      }
 
-        setConfirmedBookingData(confirmedBooking);
-        setLiveStatus('payment_confirmed');
-        setStatusMessage(`Payment proof accepted! ${bookingData.booking.quantity} coupons generated.`);
+      // Requirement 2 & 7: Separate AI infrastructure retry from actual fraud failure
+      if (res.status === 'ai_retry_pending') {
+        setLiveStatus('ai_retry_pending');
+        setStatusMessage('Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.');
 
-        setTimeout(() => {
-          onBookSuccess(confirmedBooking);
-          onClose();
-        }, 1200);
+        // Bounded automatic retry with backoff: 3s, 6s, 12s
+        (async () => {
+          const delays = [3000, 6000, 12000];
+          for (let i = 0; i < delays.length; i++) {
+            await new Promise((r) => setTimeout(r, delays[i]));
+            try {
+              const retryRes = await retryPaymentVerification({
+                publicId: bookingData.booking.publicId,
+                statusToken: bookingData.payment.statusToken,
+              });
+
+              if ((retryRes.status === 'payment_confirmed' || retryRes.status === 'proof_verified') && retryRes.coupons?.length) {
+                handleBookingConfirmed(retryRes);
+                return;
+              }
+
+              if (retryRes.status === 'ai_check_failed') {
+                setLiveStatus('verification_failed');
+                setStatusMessage(retryRes.message || 'Payment proof verification failed.');
+                return;
+              }
+            } catch {
+              // Ignore transient error in polling loop
+            }
+          }
+
+          // If AI remains unavailable after retries, show guidance and Retry Verification button
+          setLiveStatus('ai_unavailable');
+          setStatusMessage('Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.');
+        })();
         return;
       }
 
@@ -896,6 +972,43 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                   {bookingData?.booking.quantity || 1} {bookingData?.booking.quantity === 1 ? 'coupon' : 'coupons'} generated!
                 </p>
                 <p className="text-xs text-slate-400">Opening your tickets...</p>
+              </div>
+            ) : liveStatus === 'ai_unavailable' ? (
+              <div className="space-y-3">
+                <div className="w-16 h-16 mx-auto rounded-full bg-amber-500/20 border-2 border-amber-400 flex items-center justify-center text-amber-400">
+                  <AlertCircle className="w-9 h-9" />
+                </div>
+                <h4 className="text-xl font-black text-white font-display">Verification Temporarily Busy</h4>
+                <p className="text-xs text-amber-300 font-medium max-w-sm mx-auto">
+                  Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.
+                </p>
+                <div className="pt-2">
+                  <button
+                    type="button"
+                    disabled={isProcessing}
+                    onClick={handleManualRetry}
+                    className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 text-xs font-bold font-display uppercase tracking-wider shadow cursor-pointer flex items-center justify-center gap-2 mx-auto disabled:opacity-50"
+                  >
+                    {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+                    <span>Retry Verification</span>
+                  </button>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 text-[11px] text-slate-400 font-mono">
+                  Order Reference: <strong className="text-white">{bookingData?.booking.publicId}</strong>
+                </div>
+              </div>
+            ) : liveStatus === 'ai_retry_pending' ? (
+              <div className="space-y-3">
+                <div className="w-16 h-16 mx-auto rounded-full bg-purple-500/20 border-2 border-amber-400 flex items-center justify-center text-amber-400">
+                  <Loader2 className="w-9 h-9 animate-spin" />
+                </div>
+                <h4 className="text-xl font-black text-white font-display">Verifying Your Payment</h4>
+                <p className="text-xs text-amber-300 font-medium max-w-sm mx-auto">
+                  Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.
+                </p>
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 text-[11px] text-slate-400 font-mono">
+                  Order Reference: <strong className="text-white">{bookingData?.booking.publicId}</strong>
+                </div>
               </div>
             ) : liveStatus === 'verification_failed' || liveStatus === 'rejected' ? (
               <div className="space-y-3">

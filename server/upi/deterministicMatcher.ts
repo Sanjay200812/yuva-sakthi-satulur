@@ -17,9 +17,10 @@ export interface MatchResult {
   passed: boolean;
   riskScore: number;
   reasonCodes: string[];
-  nextStatus: 'payment_confirmed' | 'ai_check_failed';
-  reviewStatus: 'ai_check_passed' | 'ai_check_failed';
+  nextStatus: 'payment_confirmed' | 'ai_check_failed' | 'ai_retry_pending';
+  reviewStatus: 'ai_check_passed' | 'ai_check_failed' | 'ai_retry_pending';
   userMessage: string;
+  isInfrastructureError?: boolean;
   details: {
     utrMatched: boolean | null;
     amountMatched: boolean | null;
@@ -41,6 +42,27 @@ export function isValidRrn(rrn: string): boolean {
 }
 
 export function performDeterministicComparison(input: MatchInput): MatchResult {
+  const ext = input.extraction;
+
+  // 1. Decouple Infrastructure Failure: If AI never analyzed the image, DO NOT generate screenshot failure codes
+  if (!ext || ext.is_fallback || ext.obvious_editing_signals?.includes('AI_UNAVAILABLE')) {
+    return {
+      passed: false,
+      riskScore: 0,
+      reasonCodes: ['AI_UNAVAILABLE'],
+      nextStatus: 'ai_retry_pending',
+      reviewStatus: 'ai_retry_pending',
+      userMessage: 'Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.',
+      isInfrastructureError: true,
+      details: {
+        utrMatched: null,
+        amountMatched: null,
+        statusMatched: null,
+        payeeMatched: null,
+      },
+    };
+  }
+
   const reasonCodes: string[] = [];
   let riskScore = 0;
   const details = {
@@ -50,13 +72,13 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     payeeMatched: null as boolean | null,
   };
 
-  // 0. Session Expiry Check
+  // 2. Session Expiry Check
   if (input.isExpired) {
     reasonCodes.push('PAYMENT_SESSION_EXPIRED');
     riskScore += 100;
   }
 
-  // 1. Duplicate checks (Database Uniqueness of extracted reference)
+  // 3. Duplicate checks (Database Uniqueness of extracted reference)
   if (input.isDuplicateUtr) {
     reasonCodes.push('DUPLICATE_PAYMENT_REFERENCE');
     reasonCodes.push('DUPLICATE_RRN');
@@ -69,23 +91,13 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     riskScore += 90;
   }
 
-  const ext = input.extraction;
-
-  // 2. Payment Screen Validity
+  // 4. Payment Screen Validity
   if (ext.looks_like_payment_screen === false) {
     reasonCodes.push('INVALID_PAYMENT_SCREEN');
     riskScore += 100;
   }
 
-  // 3. AI Service Availability check
-  if (ext.obvious_editing_signals?.includes('AI_UNAVAILABLE')) {
-    if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
-      reasonCodes.push('AI_UNAVAILABLE');
-      riskScore += 80;
-    }
-  }
-
-  // 4. Visible Payment Status
+  // 5. Visible Payment Status
   if (ext.visible_payment_status === 'failed') {
     reasonCodes.push('STATUS_NOT_SUCCESS');
     riskScore += 100;
@@ -97,14 +109,12 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
   } else if (ext.visible_payment_status === 'success') {
     details.statusMatched = true;
   } else if (ext.visible_payment_status === 'unknown') {
-    // Fail-closed: missing or unrecognized success status
-    if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
-      reasonCodes.push('STATUS_NOT_SUCCESS');
-      riskScore += 80;
-    }
+    reasonCodes.push('STATUS_NOT_SUCCESS');
+    riskScore += 80;
+    details.statusMatched = false;
   }
 
-  // 5. OCR-Extracted RRN Validation (Directly from Screenshot - Never trust client input)
+  // 6. OCR-Extracted RRN Validation (Directly from Screenshot - Never trust client input)
   if (!ext.utr_or_rrn) {
     reasonCodes.push('MISSING_PAYMENT_REFERENCE');
     reasonCodes.push('MISSING_RRN');
@@ -122,7 +132,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 6. Amount Comparison (Extracted vs Expected) - Do NOT allow missing amount to silently pass
+  // 7. Amount Comparison (Extracted vs Expected) - Do NOT allow missing amount to silently pass
   if (!ext.amount) {
     reasonCodes.push('MISSING_AMOUNT');
     riskScore += 80;
@@ -139,13 +149,13 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 7. Currency check if visible
+  // 8. Currency check if visible
   if (ext.currency && !['INR', 'RS', 'RS.', '₹'].includes(ext.currency.toUpperCase())) {
     reasonCodes.push('AMOUNT_MISMATCH');
     riskScore += 50;
   }
 
-  // 8. Payee Comparison (if visible in OCR)
+  // 9. Payee Comparison (if visible in OCR)
   if (ext.payee_upi_id || ext.payee_name) {
     const extPayee = `${ext.payee_upi_id || ''} ${ext.payee_name || ''}`.toLowerCase();
     const configPayeeId = input.expectedPayeeUpiId.toLowerCase();
@@ -162,7 +172,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 9. Tampering & AI-Generated Likelihood
+  // 10. Tampering & AI-Generated Likelihood
   if (ext.ai_generated_likelihood === 'high' || ext.ai_generated_likelihood === 'medium') {
     reasonCodes.push('TAMPERING_RISK');
     riskScore += 70;
@@ -174,7 +184,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     riskScore += 60;
   }
 
-  // 10. Field Confidence Thresholds
+  // 11. Field Confidence Thresholds
   if (ext.field_confidence) {
     if (ext.field_confidence.amount < 0.60 && ext.amount) {
       reasonCodes.push('LOW_OCR_CONFIDENCE');
@@ -208,7 +218,6 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     reasonCodes.includes('LOW_CONFIDENCE') ||
     reasonCodes.includes('INVALID_PAYMENT_SCREEN') ||
     reasonCodes.includes('PAYMENT_SESSION_EXPIRED') ||
-    reasonCodes.includes('AI_UNAVAILABLE') ||
     riskScore >= 50;
 
   if (hasFatalFailure) {
@@ -259,7 +268,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
         'The uploaded file does not appear to be a valid UPI payment receipt.';
     }
 
-    return {
+  return {
       passed: false,
       riskScore,
       reasonCodes,

@@ -320,6 +320,51 @@ export async function getSignedScreenshotUrl(storagePath: string, expiresIn = 30
 }
 
 /**
+ * Downloads a stored payment proof screenshot from private Supabase Storage or local filesystem.
+ * Used for automated verification retry without requiring the customer to re-upload.
+ */
+export async function downloadPaymentScreenshot(storagePath: string): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  if (!storagePath) return null;
+
+  try {
+    if (storagePath.startsWith('supabase:')) {
+      const objectPath = storagePath.replace(/^supabase:/, '');
+      const supabase = getSupabaseStorageClient();
+      const { data, error } = await supabase.storage
+        .from(config.PAYMENT_PROOF_BUCKET)
+        .download(objectPath);
+
+      if (error || !data) {
+        console.warn(`⚠️ Failed to download proof from Supabase Storage (${objectPath}):`, error?.message);
+        return null;
+      }
+
+      const arrayBuffer = await data.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const validation = validateMagicBytes(buffer);
+      return {
+        buffer,
+        mimeType: validation.detectedType || 'image/jpeg',
+      };
+    }
+
+    // Local filesystem fallback (development / test)
+    if (fs.existsSync(storagePath)) {
+      const buffer = fs.readFileSync(storagePath);
+      const validation = validateMagicBytes(buffer);
+      return {
+        buffer,
+        mimeType: validation.detectedType || 'image/jpeg',
+      };
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ Error downloading payment screenshot (${storagePath}):`, err?.message);
+  }
+
+  return null;
+}
+
+/**
  * Strips metadata, validates dimensions/size, re-encodes to clean JPEG,
  * and persists to private Supabase bucket (mandatory in production) or fallback uploads directory (dev only).
  */
