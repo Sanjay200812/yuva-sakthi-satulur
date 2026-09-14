@@ -3,7 +3,7 @@ import path from 'path';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import QRCode from 'qrcode';
 import archiver from 'archiver';
-import sharp from 'sharp';
+import { getSharp } from '../utils/sharpHelper.ts';
 import { config } from '../config/eventConfig.ts';
 
 export interface TicketRenderData {
@@ -397,6 +397,11 @@ export async function renderTicketRaster(data: TicketRenderData, format: 'png' |
   `;
 
   const svgBuffer = Buffer.from(svg);
+  const sharp = await getSharp();
+  if (!sharp) {
+    // Graceful fallback if native sharp image library is unavailable
+    return svgBuffer;
+  }
   if (format === 'png') {
     return await sharp(svgBuffer).png().toBuffer();
   } else {

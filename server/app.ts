@@ -5,7 +5,7 @@ import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 
 import { config, getPublicConfig, canAcceptPayments } from './config/eventConfig.ts';
-import { db } from './db/client.ts';
+import { db, isDatabaseConnected } from './db/client.ts';
 import { generateUpiPaymentSession } from './upi/upiUri.ts';
 import { processPaymentScreenshot, hammingDistance } from './upi/imageProcessor.ts';
 import { analyzePaymentScreenshotWithGemini } from './upi/geminiAnalyzer.ts';
@@ -67,15 +67,49 @@ function normalizeIndianPhone(phone: string): string | null {
   return null;
 }
 
-// 2. Health & Config
-app.get('/api/health', (_req: Request, res: Response) => {
+// Helpers for collision-safe ID generation
+function generateCollisionSafePublicId(): string {
+  // BK- followed by 6 cryptographically random uppercase hex characters (16.7M combinations per instant)
+  return `BK-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+}
+
+function generateCollisionSafePaymentReference(): string {
+  // YSYS-[timestamp base36]-[4 random hex chars]
+  return `YSYS-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+}
+
+// 2. Health & Diagnostic Check
+app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
   res.setHeader('Content-Type', 'application/json');
-  res.status(200).json({
-    status: 'ok',
-    service: 'yuva-shakti-portal',
-    timestamp: new Date().toISOString(),
-    database: config.DATABASE_URL ? 'postgresql' : 'memory',
-  });
+  try {
+    const dbStatus = await isDatabaseConnected();
+    return res.status(200).json({
+      status: 'ok',
+      service: 'yuva-shakti-portal',
+      timestamp: new Date().toISOString(),
+      database: dbStatus.provider,
+      databaseConnected: dbStatus.connected,
+      databaseHost: dbStatus.hostMasked,
+      ...(dbStatus.error ? { warning: 'Database connection check reported an issue' } : {}),
+    });
+  } catch (err: any) {
+    console.error('[Health Diagnostic Check Error]:', {
+      name: err?.name,
+      message: err?.message,
+    });
+    return res.status(200).json({
+      status: 'degraded',
+      service: 'yuva-shakti-portal',
+      timestamp: new Date().toISOString(),
+      database: 'postgresql',
+      databaseConnected: false,
+    });
+  }
+});
+
+// Root API handler
+app.get(['/api', '/api/'], (_req: Request, res: Response) => {
+  res.redirect('/api/health');
 });
 
 app.get('/api/config', (_req: Request, res: Response) => {
@@ -136,8 +170,8 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
     const unitPricePaise = config.EVENT_COUPON_PRICE_PAISE; // 5000 paise = ₹50.00
     const totalAmountPaise = unitPricePaise * qty;
 
-    const publicId = `BK-${Date.now().toString().slice(-6)}`;
-    const paymentReference = `YSYS-${Date.now().toString().slice(-6)}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    let publicId = generateCollisionSafePublicId();
+    let paymentReference = generateCollisionSafePaymentReference();
     const bookingId = crypto.randomUUID();
 
     // Secure tokens
@@ -148,38 +182,60 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
     const downloadTokenHash = crypto.createHash('sha256').update(downloadToken).digest('hex');
 
     // Generate canonical NPCI UPI Session & QR
-    const upiSession = await generateUpiPaymentSession({
+    let upiSession = await generateUpiPaymentSession({
       publicBookingId: publicId,
       transactionReference: paymentReference,
       totalAmountPaise,
       participantName: name.trim(),
     });
 
-    // Persist booking in PostgreSQL
-    await db.query(
-      `INSERT INTO bookings (
-        id, public_id, participant_name, phone, village, quantity,
-        unit_price_paise, total_amount_paise, status, provider_name,
-        download_token_hash, status_token_hash, selected_upi_app, payment_reference, payment_expires_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-      [
-        bookingId,
-        publicId,
-        name.trim(),
-        normalizedPhone,
-        cleanVillage,
-        qty,
-        unitPricePaise,
-        totalAmountPaise,
-        'payment_initiated',
-        'direct_upi',
-        downloadTokenHash,
-        statusTokenHash,
-        selectedApp || 'other_upi',
-        paymentReference,
-        upiSession.expiresAt,
-      ]
-    );
+    // Persist booking in PostgreSQL with collision retry safety
+    let inserted = false;
+    let attempts = 0;
+    while (!inserted && attempts < 3) {
+      attempts++;
+      try {
+        await db.query(
+          `INSERT INTO bookings (
+            id, public_id, participant_name, phone, village, quantity,
+            unit_price_paise, total_amount_paise, status, provider_name,
+            download_token_hash, status_token_hash, selected_upi_app, payment_reference, payment_expires_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+          [
+            bookingId,
+            publicId,
+            name.trim(),
+            normalizedPhone,
+            cleanVillage,
+            qty,
+            unitPricePaise,
+            totalAmountPaise,
+            'payment_initiated',
+            'direct_upi',
+            downloadTokenHash,
+            statusTokenHash,
+            selectedApp || 'other_upi',
+            paymentReference,
+            upiSession.expiresAt,
+          ]
+        );
+        inserted = true;
+      } catch (insertError: any) {
+        if (insertError?.code === '23505' && attempts < 3) {
+          console.warn(`[POST /api/bookings] Unique key collision on public_id/reference (attempt ${attempts}), regenerating IDs...`);
+          publicId = generateCollisionSafePublicId();
+          paymentReference = generateCollisionSafePaymentReference();
+          upiSession = await generateUpiPaymentSession({
+            publicBookingId: publicId,
+            transactionReference: paymentReference,
+            totalAmountPaise,
+            participantName: name.trim(),
+          });
+        } else {
+          throw insertError;
+        }
+      }
+    }
 
     return res.json({
       success: true,
@@ -213,10 +269,22 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
       },
     });
   } catch (error: any) {
-    console.error('Booking creation error:', error);
+    const errorDetails = {
+      route: 'POST /api/bookings',
+      name: error?.name || 'Error',
+      code: error?.code || 'UNKNOWN',
+      pgCode: error?.code || error?.routine || 'NONE',
+      constraint: error?.constraint || error?.detail || 'NONE',
+      safeMessage: error?.message ? String(error.message).replace(/postgres:[^@]+@/g, 'postgres:***@') : 'Booking creation error',
+    };
+    console.error('[POST /api/bookings] Booking creation failure:', errorDetails);
+
     res.status(500).json({
       success: false,
-      error: { code: 'BOOKING_CREATION_FAILED', message: error.message || 'Failed to create booking session.' },
+      error: {
+        code: 'BOOKING_CREATION_FAILED',
+        message: 'Booking service is temporarily unavailable. Please try again.',
+      },
     });
   }
 });

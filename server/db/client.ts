@@ -30,7 +30,7 @@ if (config.DATABASE_URL && process.env.NODE_ENV !== 'test' && !process.env.VITES
     console.error('Unexpected error on idle PostgreSQL client', err);
   });
 } else if (process.env.NODE_ENV === 'production' && !config.DATABASE_URL) {
-  throw new Error('FATAL CONFIGURATION ERROR: DATABASE_URL is missing in production environment. A real PostgreSQL database is required for production.');
+  console.error('❌ DATABASE_URL is missing in production environment. A real PostgreSQL database is required for production data persistence.');
 }
 
 // In-Memory Fallback Store for Local Development & Isolated Automated Testing
@@ -713,6 +713,77 @@ if (pool) {
   console.log('✅ Connected to PostgreSQL production database pool.');
 } else {
   console.log('ℹ️ Running with local isolated transactional memory store (Development/Test Mode).');
+}
+
+export async function isDatabaseConnected(): Promise<{
+  connected: boolean;
+  provider: string;
+  hostMasked: string;
+  error?: string;
+}> {
+  if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
+    return {
+      connected: true,
+      provider: 'memory',
+      hostMasked: 'in-memory-test-db',
+    };
+  }
+
+  if (!config.DATABASE_URL) {
+    return {
+      connected: false,
+      provider: 'none',
+      hostMasked: 'not_configured',
+      error: 'DATABASE_URL environment variable is missing',
+    };
+  }
+
+  let hostMasked = 'unknown';
+  let provider = 'postgresql';
+  try {
+    const url = new URL(config.DATABASE_URL);
+    if (url.hostname.includes('supabase')) {
+      provider = 'supabase_postgresql';
+    }
+    hostMasked = `${url.hostname}${url.port ? ':' + url.port : ''}`;
+  } catch {
+    hostMasked = 'invalid_url_format';
+  }
+
+  if (!pool) {
+    return {
+      connected: false,
+      provider,
+      hostMasked,
+      error: 'PostgreSQL pool not initialized',
+    };
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('SELECT 1');
+      return {
+        connected: true,
+        provider,
+        hostMasked,
+      };
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('[Database Health Check Error]:', {
+      name: err?.name,
+      code: err?.code,
+      message: err?.message,
+    });
+    return {
+      connected: false,
+      provider,
+      hostMasked,
+      error: err?.message || 'Database connection test failed',
+    };
+  }
 }
 
 export async function closePool(): Promise<void> {

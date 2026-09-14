@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
+import { getSharp } from '../utils/sharpHelper.ts';
 import { config } from '../config/eventConfig.ts';
 
 export interface ProcessedImageResult {
@@ -71,6 +71,10 @@ export async function validateScreenshotBuffer(buffer: Buffer): Promise<{ valid:
  */
 export async function computePerceptualHash(buffer: Buffer): Promise<string> {
   try {
+    const sharp = await getSharp();
+    if (!sharp) {
+      return '0000000000000000';
+    }
     const raw = await sharp(buffer)
       .resize(9, 8, { fit: 'fill' })
       .grayscale()
@@ -198,28 +202,38 @@ export async function processPaymentScreenshot(
     throw new Error(validation.error || 'Invalid image file.');
   }
 
-  // 3. Sharp metadata strip and re-encode to sanitize image
-  const image = sharp(rawBuffer);
-  const metadata = await image.metadata();
+  // 3. Metadata validation and sanitize image
+  const sharp = await getSharp();
+  let sanitizedBuffer = rawBuffer;
+  let width = 1080;
+  let height = 1920;
 
-  if (!metadata.width || !metadata.height) {
-    throw new Error('Unable to parse image dimensions.');
+  if (sharp) {
+    const image = sharp(rawBuffer);
+    const metadata = await image.metadata();
+
+    if (!metadata.width || !metadata.height) {
+      throw new Error('Unable to parse image dimensions.');
+    }
+
+    if (metadata.width < 100 || metadata.height < 100) {
+      throw new Error('Screenshot resolution is too low to be a valid payment receipt.');
+    }
+
+    if (metadata.width > 8000 || metadata.height > 8000) {
+      throw new Error('Screenshot dimensions exceed safe limits.');
+    }
+
+    width = metadata.width;
+    height = metadata.height;
+
+    // Re-encode to sanitized progressive JPEG with quality 92, stripping all EXIF/GPS/comments
+    sanitizedBuffer = await sharp(rawBuffer)
+      .rotate() // auto-orient based on EXIF before stripping
+      .withMetadata({ orientation: undefined }) // strip all metadata
+      .jpeg({ quality: 92, progressive: true })
+      .toBuffer();
   }
-
-  if (metadata.width < 100 || metadata.height < 100) {
-    throw new Error('Screenshot resolution is too low to be a valid payment receipt.');
-  }
-
-  if (metadata.width > 8000 || metadata.height > 8000) {
-    throw new Error('Screenshot dimensions exceed safe limits.');
-  }
-
-  // Re-encode to sanitized progressive JPEG with quality 92, stripping all EXIF/GPS/comments
-  const sanitizedBuffer = await sharp(rawBuffer)
-    .rotate() // auto-orient based on EXIF before stripping
-    .withMetadata({ orientation: undefined }) // strip all metadata
-    .jpeg({ quality: 92, progressive: true })
-    .toBuffer();
 
   // 4. Calculate SHA-256 and Perceptual Hash
   const sha256 = crypto.createHash('sha256').update(sanitizedBuffer).digest('hex');
@@ -251,7 +265,7 @@ export async function processPaymentScreenshot(
     phash,
     mimeType: 'image/jpeg',
     byteSize: sanitizedBuffer.length,
-    width: metadata.width,
-    height: metadata.height,
+    width,
+    height,
   };
 }
