@@ -381,7 +381,12 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     // 8. Run Gemini-Assisted OCR & Risk Analysis (Untrusted Input)
     const extraction = await analyzePaymentScreenshotWithGemini(
       processed.sanitizedBuffer,
-      processed.mimeType
+      processed.mimeType,
+      {
+        expectedMerchantName: config.PAYEE_DISPLAY_NAME,
+        expectedAmount: (booking.total_amount_paise / 100).toFixed(2),
+        sessionTimestampIso: booking.created_at || new Date().toISOString(),
+      }
     );
 
     // 9. Extract and normalize transaction reference exclusively from screenshot OCR
