@@ -342,7 +342,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   // Copy UPI ID to clipboard
   const handleCopyUpiId = () => {
     if (!bookingData) return;
-    navigator.clipboard.writeText(bookingData.payment.rawPayeeUpiId || '9574876369@ybl');
+    navigator.clipboard.writeText(bookingData.payment.rawPayeeUpiId || bookingData.payment.payeeUpiId || '');
     setCopiedUpi(true);
     setTimeout(() => setCopiedUpi(false), 2000);
   };

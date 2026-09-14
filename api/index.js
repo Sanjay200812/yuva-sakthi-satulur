@@ -10,6 +10,10 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import crypto from "crypto";
 dotenv.config();
+function isValidUpiId(upiId) {
+  if (typeof upiId !== "string") return false;
+  return /^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$/.test(upiId.trim());
+}
 var envSchema = z.object({
   // Runtime environment
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
@@ -33,7 +37,7 @@ var envSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   // Direct Merchant-UPI & Gemini Verification Configuration
   PAYMENT_MODE: z.string().default("direct_upi_automated_verification"),
-  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || "9574876369@ybl"),
+  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || (process.env.NODE_ENV === "production" ? "" : "7075920852@ybl")),
   PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || "Yuva Shakti Youth Satulur"),
   UPI_TRANSACTION_NOTE_PREFIX: z.string().default(process.env.UPI_TRANSACTION_NOTE_PREFIX || "YSYS"),
   PAYMENT_SESSION_MINUTES: z.coerce.number().int().positive().default(5),
@@ -69,10 +73,48 @@ if (!parsedEnv.success) {
   configWarnings.push("Environment validation reported unexpected formats.");
 }
 var config = parsedEnv.success ? parsedEnv.data : envSchema.parse({});
+Object.defineProperty(config, "PAYEE_UPI_ID", {
+  get() {
+    if (typeof process.env.PAYEE_UPI_ID === "string" && process.env.PAYEE_UPI_ID.trim().length > 0) {
+      return process.env.PAYEE_UPI_ID.trim();
+    }
+    return process.env.NODE_ENV === "production" ? "" : "7075920852@ybl";
+  },
+  set(val) {
+    process.env.PAYEE_UPI_ID = val;
+  },
+  configurable: true,
+  enumerable: true
+});
+Object.defineProperty(config, "PAYEE_DISPLAY_NAME", {
+  get() {
+    return (process.env.PAYEE_DISPLAY_NAME || "Yuva Shakti Youth Satulur").trim();
+  },
+  set(val) {
+    process.env.PAYEE_DISPLAY_NAME = val;
+  },
+  configurable: true,
+  enumerable: true
+});
+Object.defineProperty(config, "PAYMENT_SESSION_MINUTES", {
+  get() {
+    const mins = parseInt(process.env.PAYMENT_SESSION_MINUTES || "5", 10);
+    return isNaN(mins) || mins <= 0 ? 5 : mins;
+  },
+  set(val) {
+    process.env.PAYMENT_SESSION_MINUTES = String(val);
+  },
+  configurable: true,
+  enumerable: true
+});
 if (process.env.GEMINI_MODEL) {
   config.GEMINI_MODEL = process.env.GEMINI_MODEL;
 }
 if (config.NODE_ENV === "production") {
+  if (!config.PAYEE_UPI_ID || !isValidUpiId(config.PAYEE_UPI_ID)) {
+    console.error("\u274C CRITICAL ERROR: PAYEE_UPI_ID is not configured or invalid in production! Payments will fail-closed.");
+    configWarnings.push("CRITICAL: PAYEE_UPI_ID missing or invalid in production.");
+  }
   if (!config.FIELD_ENCRYPTION_KEY || !/^[0-9a-fA-F]{64}$/.test(config.FIELD_ENCRYPTION_KEY)) {
     console.error("\u26A0\uFE0F WARNING: In production, FIELD_ENCRYPTION_KEY should be a 64-character hex string (32 bytes). Using secure deterministic fallback.");
     configWarnings.push("FIELD_ENCRYPTION_KEY missing or not 64 hex characters; fallback applied.");
@@ -86,6 +128,9 @@ if (config.NODE_ENV === "production") {
   }
 }
 function canAcceptPayments() {
+  if (!config.PAYEE_UPI_ID || !isValidUpiId(config.PAYEE_UPI_ID)) {
+    return { allowed: false, reason: "Payment receiver UPI account is not configured or invalid." };
+  }
   if (!config.BOOKING_OPEN) {
     return { allowed: false, reason: "Bookings are currently closed for this event." };
   }
@@ -810,9 +855,12 @@ function maskUpiId(upiId) {
   return `${user.slice(0, 2)}****${user.slice(-2)}@${handle}`;
 }
 async function generateUpiPaymentSession(input) {
+  const payeeId = (config.PAYEE_UPI_ID || "").trim();
+  if (!payeeId || !isValidUpiId(payeeId)) {
+    throw new Error("CONFIG_ERROR: Valid receiver UPI ID (PAYEE_UPI_ID) is required to generate payment session.");
+  }
+  const payeeName = (config.PAYEE_DISPLAY_NAME || "Yuva Shakti Youth Satulur").trim();
   const amountInr = (input.totalAmountPaise / 100).toFixed(2);
-  const payeeId = config.PAYEE_UPI_ID;
-  const payeeName = config.PAYEE_DISPLAY_NAME;
   const note = `${config.UPI_TRANSACTION_NOTE_PREFIX} Lucky Draw ${input.publicBookingId}`;
   const params = new URLSearchParams();
   params.set("pa", payeeId);
@@ -2656,7 +2704,7 @@ router.post("/payment-reviews/:submissionId/confirm", requireAdminAuth, async (r
       bankRecordMatch: {
         bankTxnId: bankTxnId || "BANK-MATCH",
         receivedAmountPaise: Number(receivedAmountPaise) || sub.expected_amount_paise || 5e3,
-        recipientAccount: recipientAccount || sub.expected_payee_upi_id || "9574876369@ybl",
+        recipientAccount: recipientAccount || sub.expected_payee_upi_id || config.PAYEE_UPI_ID,
         matchNote: matchNote || "Confirmed against official bank/merchant statement"
       },
       auditNote: auditNote || "Payment confirmed by administrator from real bank record",

@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { config } from '../config/eventConfig.ts';
+import { config, isValidUpiId } from '../config/eventConfig.ts';
 
 export interface UpiSessionInput {
   publicBookingId: string;
@@ -58,9 +58,12 @@ export function generateCanonicalUpiUri(input: {
 }
 
 export async function generateUpiPaymentSession(input: UpiSessionInput): Promise<UpiSessionResult> {
+  const payeeId = (config.PAYEE_UPI_ID || '').trim();
+  if (!payeeId || !isValidUpiId(payeeId)) {
+    throw new Error('CONFIG_ERROR: Valid receiver UPI ID (PAYEE_UPI_ID) is required to generate payment session.');
+  }
+  const payeeName = (config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur').trim();
   const amountInr = (input.totalAmountPaise / 100).toFixed(2);
-  const payeeId = config.PAYEE_UPI_ID;
-  const payeeName = config.PAYEE_DISPLAY_NAME;
   const note = `${config.UPI_TRANSACTION_NOTE_PREFIX} Lucky Draw ${input.publicBookingId}`;
 
   // NPCI Canonical UPI URI specification

@@ -4,6 +4,11 @@ import crypto from 'crypto';
 
 dotenv.config();
 
+export function isValidUpiId(upiId: unknown): upiId is string {
+  if (typeof upiId !== 'string') return false;
+  return /^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$/.test(upiId.trim());
+}
+
 const envSchema = z.object({
   // Runtime environment
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -30,7 +35,7 @@ const envSchema = z.object({
 
   // Direct Merchant-UPI & Gemini Verification Configuration
   PAYMENT_MODE: z.string().default('direct_upi_automated_verification'),
-  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || '9574876369@ybl'),
+  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || (process.env.NODE_ENV === 'production' ? '' : '7075920852@ybl')),
   PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur'),
   UPI_TRANSACTION_NOTE_PREFIX: z.string().default(process.env.UPI_TRANSACTION_NOTE_PREFIX || 'YSYS'),
   PAYMENT_SESSION_MINUTES: z.coerce.number().int().positive().default(5),
@@ -72,6 +77,45 @@ if (!parsedEnv.success) {
 
 export const config = parsedEnv.success ? parsedEnv.data : envSchema.parse({});
 
+// Authoritative dynamic binding for receiver UPI configuration (Requirement 4 & 10)
+Object.defineProperty(config, 'PAYEE_UPI_ID', {
+  get() {
+    if (typeof process.env.PAYEE_UPI_ID === 'string' && process.env.PAYEE_UPI_ID.trim().length > 0) {
+      return process.env.PAYEE_UPI_ID.trim();
+    }
+    // Fail-closed in production: never return any hardcoded fallback
+    return process.env.NODE_ENV === 'production' ? '' : '7075920852@ybl';
+  },
+  set(val: string) {
+    process.env.PAYEE_UPI_ID = val;
+  },
+  configurable: true,
+  enumerable: true,
+});
+
+Object.defineProperty(config, 'PAYEE_DISPLAY_NAME', {
+  get() {
+    return (process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur').trim();
+  },
+  set(val: string) {
+    process.env.PAYEE_DISPLAY_NAME = val;
+  },
+  configurable: true,
+  enumerable: true,
+});
+
+Object.defineProperty(config, 'PAYMENT_SESSION_MINUTES', {
+  get() {
+    const mins = parseInt(process.env.PAYMENT_SESSION_MINUTES || '5', 10);
+    return isNaN(mins) || mins <= 0 ? 5 : mins;
+  },
+  set(val: number) {
+    process.env.PAYMENT_SESSION_MINUTES = String(val);
+  },
+  configurable: true,
+  enumerable: true,
+});
+
 // Ensure GEMINI_MODEL uses environment or latest flash
 if (process.env.GEMINI_MODEL) {
   config.GEMINI_MODEL = process.env.GEMINI_MODEL;
@@ -79,6 +123,10 @@ if (process.env.GEMINI_MODEL) {
 
 // Production Security Validation (Log actionable warnings without crashing the serverless container)
 if (config.NODE_ENV === 'production') {
+  if (!config.PAYEE_UPI_ID || !isValidUpiId(config.PAYEE_UPI_ID)) {
+    console.error('❌ CRITICAL ERROR: PAYEE_UPI_ID is not configured or invalid in production! Payments will fail-closed.');
+    configWarnings.push('CRITICAL: PAYEE_UPI_ID missing or invalid in production.');
+  }
   if (!config.FIELD_ENCRYPTION_KEY || !/^[0-9a-fA-F]{64}$/.test(config.FIELD_ENCRYPTION_KEY)) {
     console.error('⚠️ WARNING: In production, FIELD_ENCRYPTION_KEY should be a 64-character hex string (32 bytes). Using secure deterministic fallback.');
     configWarnings.push('FIELD_ENCRYPTION_KEY missing or not 64 hex characters; fallback applied.');
@@ -96,8 +144,11 @@ export function getConfigWarnings(): string[] {
   return [...configWarnings];
 }
 
-// Server validation for payment creation
+// Server validation for payment creation - Fail Closed
 export function canAcceptPayments(): { allowed: boolean; reason?: string } {
+  if (!config.PAYEE_UPI_ID || !isValidUpiId(config.PAYEE_UPI_ID)) {
+    return { allowed: false, reason: 'Payment receiver UPI account is not configured or invalid.' };
+  }
   if (!config.BOOKING_OPEN) {
     return { allowed: false, reason: 'Bookings are currently closed for this event.' };
   }

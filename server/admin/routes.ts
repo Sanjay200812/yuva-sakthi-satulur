@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { db } from '../db/client.ts';
+import { config } from '../config/eventConfig.ts';
 import {
   requireAdminAuth,
   checkLoginRateLimit,
@@ -471,7 +472,7 @@ router.post('/payment-reviews/:submissionId/confirm', requireAdminAuth, async (r
       bankRecordMatch: {
         bankTxnId: bankTxnId || 'BANK-MATCH',
         receivedAmountPaise: Number(receivedAmountPaise) || sub.expected_amount_paise || 5000,
-        recipientAccount: recipientAccount || sub.expected_payee_upi_id || '9574876369@ybl',
+        recipientAccount: recipientAccount || sub.expected_payee_upi_id || config.PAYEE_UPI_ID,
         matchNote: matchNote || 'Confirmed against official bank/merchant statement',
       },
       auditNote: auditNote || 'Payment confirmed by administrator from real bank record',

@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import request from 'supertest';
 import sharp from 'sharp';
+import QRCode from 'qrcode';
 import { app } from '../server.ts';
-import { generateCanonicalUpiUri } from '../server/upi/upiUri.ts';
+import { generateCanonicalUpiUri, generateUpiPaymentSession } from '../server/upi/upiUri.ts';
+import { canAcceptPayments } from '../server/config/eventConfig.ts';
 import { validateScreenshotBuffer } from '../server/upi/imageProcessor.ts';
 import { performDeterministicComparison } from '../server/upi/deterministicMatcher.ts';
 import { setMockGeminiExtraction } from '../server/upi/geminiAnalyzer.ts';
@@ -29,7 +31,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
   it('generates canonical NPCI UPI URI with fixed am, unique reference, and no mam', () => {
     const uri = generateCanonicalUpiUri({
-      payeeUpiId: '9574876369@ybl',
+      payeeUpiId: '7075920852@ybl',
       payeeDisplayName: 'Yuva Shakti Youth, Satulur',
       transactionReference: 'YSYS-REF-101',
       totalAmountPaise: 5000,
@@ -37,7 +39,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     });
 
     expect(uri).toContain('upi://pay?');
-    expect(uri).toContain('pa=9574876369%40ybl');
+    expect(uri).toContain('pa=7075920852%40ybl');
     expect(uri).toContain('am=50.00');
     expect(uri).toContain('cu=INR');
     expect(uri).toContain('tr=YSYS-REF-101');
@@ -390,7 +392,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     // Missing OCR amount
     const noAmountRes = performDeterministicComparison({
       expectedAmountPaise: 5000,
-      expectedPayeeUpiId: '9574876369@ybl',
+      expectedPayeeUpiId: '7075920852@ybl',
       expectedPayeeName: 'Yuva Shakti Youth, Satulur',
       selectedApp: 'phonepe',
       extraction: {
@@ -419,7 +421,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     // Missing OCR RRN
     const noRrnRes = performDeterministicComparison({
       expectedAmountPaise: 5000,
-      expectedPayeeUpiId: '9574876369@ybl',
+      expectedPayeeUpiId: '7075920852@ybl',
       expectedPayeeName: 'Yuva Shakti Youth, Satulur',
       selectedApp: 'phonepe',
       extraction: {
@@ -451,7 +453,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     // Visible status is pending or failed
     const pendingRes = performDeterministicComparison({
       expectedAmountPaise: 5000,
-      expectedPayeeUpiId: '9574876369@ybl',
+      expectedPayeeUpiId: '7075920852@ybl',
       expectedPayeeName: 'Yuva Shakti Youth, Satulur',
       selectedApp: 'phonepe',
       extraction: {
@@ -480,7 +482,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     // AI generated likelihood high
     const aiRes = performDeterministicComparison({
       expectedAmountPaise: 5000,
-      expectedPayeeUpiId: '9574876369@ybl',
+      expectedPayeeUpiId: '7075920852@ybl',
       expectedPayeeName: 'Yuva Shakti Youth, Satulur',
       selectedApp: 'phonepe',
       extraction: {
@@ -510,7 +512,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
   it('deterministic comparison catches duplicate screenshot and fails closed', () => {
     const dupScreenRes = performDeterministicComparison({
       expectedAmountPaise: 5000,
-      expectedPayeeUpiId: '9574876369@ybl',
+      expectedPayeeUpiId: '7075920852@ybl',
       expectedPayeeName: 'Yuva Shakti Youth, Satulur',
       selectedApp: 'phonepe',
       extraction: {
@@ -632,5 +634,115 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     const resRazorpay = await request(app).post('/api/razorpay/webhook').send({});
     expect(resRazorpay.status).toBe(404);
+  });
+
+  it('Requirement 12: when PAYEE_UPI_ID=7075920852@ybl, canonicalUri, QR, and all 4 UPI app intents use that exact VPA', async () => {
+    process.env.PAYEE_UPI_ID = '7075920852@ybl';
+    process.env.PAYEE_DISPLAY_NAME = 'Yuva Shakti Youth Satulur';
+    process.env.PAYMENT_SESSION_MINUTES = '5';
+
+    const res = await request(app)
+      .post('/api/bookings')
+      .send({
+        name: 'Ramesh Kumar',
+        phone: '9876543210',
+        village: 'Satulur',
+        quantity: 1,
+        selectedApp: 'phonepe',
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+
+    const { payment } = res.body.data;
+    const expectedVpaEncoded = 'pa=7075920852%40ybl';
+
+    // 1. canonicalUri contains pa=7075920852%40ybl
+    expect(payment.canonicalUri).toContain(expectedVpaEncoded);
+    expect(payment.rawPayeeUpiId).toBe('7075920852@ybl');
+
+    // 2. QR encodes that same URI
+    const expectedQr = await QRCode.toDataURL(payment.canonicalUri, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      scale: 8,
+      color: {
+        dark: '#070B19',
+        light: '#FFFFFF',
+      },
+    });
+    expect(payment.qrDataUrl).toBe(expectedQr);
+
+    // 3. PhonePe intent uses that VPA
+    expect(payment.appIntents.phonepe).toContain(expectedVpaEncoded);
+    expect(payment.appIntents.phonepe).toMatch(/^phonepe:\/\/pay\?/);
+
+    // 4. GPay intent uses that VPA
+    expect(payment.appIntents.google_pay).toContain(expectedVpaEncoded);
+    expect(payment.appIntents.google_pay).toMatch(/^gpay:\/\/upi\/pay\?/);
+
+    // 5. Paytm intent uses that VPA
+    expect(payment.appIntents.paytm).toContain(expectedVpaEncoded);
+    expect(payment.appIntents.paytm).toMatch(/^paytmmp:\/\/pay\?/);
+
+    // 6. Other UPI intent uses that VPA
+    expect(payment.appIntents.other_upi).toContain(expectedVpaEncoded);
+    expect(payment.appIntents.other_upi).toBe(payment.canonicalUri);
+
+    // 7. /api/config safely exposes it
+    const configRes = await request(app).get('/api/config');
+    expect(configRes.status).toBe(200);
+    expect(configRes.body.payeeUpiId).toBe('7075920852@ybl');
+    expect(configRes.body.payeeDisplayName).toBe('Yuva Shakti Youth Satulur');
+    expect(configRes.body.sessionMinutes).toBe(5);
+  });
+
+  it('Requirement 13: in production, refuses to create payment session if PAYEE_UPI_ID is absent and NEVER falls back to 9574876369@ybl or any other receiver', async () => {
+    const origNodeEnv = process.env.NODE_ENV;
+    const origPayeeUpiId = process.env.PAYEE_UPI_ID;
+
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.PAYEE_UPI_ID;
+
+      // 1. canAcceptPayments fails closed
+      const gate = canAcceptPayments();
+      expect(gate.allowed).toBe(false);
+      expect(gate.reason).toContain('Payment receiver UPI account is not configured');
+
+      // 2. /api/config reflects fail-closed state and NEVER shows 9574876369@ybl
+      const configRes = await request(app).get('/api/config');
+      expect(configRes.status).toBe(200);
+      expect(configRes.body.payeeUpiId).not.toBe('9574876369@ybl');
+      expect(configRes.body.canBook).toBe(false);
+
+      // 3. POST /api/bookings refuses with 403 BOOKING_UNAVAILABLE
+      const bookingRes = await request(app)
+        .post('/api/bookings')
+        .send({
+          name: 'Fail Closed User',
+          phone: '9876543210',
+          village: 'Satulur',
+          quantity: 1,
+        });
+
+      expect(bookingRes.status).toBe(403);
+      expect(bookingRes.body.success).toBe(false);
+      expect(bookingRes.body.error.code).toBe('BOOKING_UNAVAILABLE');
+      expect(JSON.stringify(bookingRes.body)).not.toContain('9574876369');
+
+      // 4. generateUpiPaymentSession directly throws CONFIG_ERROR and refuses to generate session
+      await expect(
+        generateUpiPaymentSession({
+          publicBookingId: 'BK-TEST-FAIL',
+          transactionReference: 'YSYS-FAIL',
+          totalAmountPaise: 5000,
+          participantName: 'Test',
+        })
+      ).rejects.toThrow('CONFIG_ERROR: Valid receiver UPI ID (PAYEE_UPI_ID) is required');
+    } finally {
+      process.env.NODE_ENV = origNodeEnv;
+      process.env.PAYEE_UPI_ID = origPayeeUpiId;
+    }
   });
 });
