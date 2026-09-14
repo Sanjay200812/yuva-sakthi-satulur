@@ -95,8 +95,24 @@ router.get('/auth/me', requireAdminAuth, (req: Request, res: Response) => {
 // 4. Admin Dashboard Metrics (Automatically verified payments only!)
 router.get('/dashboard', requireAdminAuth, async (req: Request, res: Response) => {
   try {
-    const metricsRes = await db.query('SELECT admin_metrics FROM event_settings');
-    const data = metricsRes.rows[0] || {
+    let data;
+    if (!process.env.DATABASE_URL) {
+      const metricsRes = await db.query('SELECT admin_metrics FROM event_settings');
+      data = metricsRes.rows[0];
+    } else {
+      const metricsRes = await db.query(`
+        SELECT 
+          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "confirmedBookingsCount",
+          (SELECT COUNT(*) FROM coupons WHERE status = 'valid')::int as "validCouponsCount",
+          (SELECT COALESCE(SUM(total_amount_paise), 0) / 100 FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "totalRevenueInr",
+          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= CURRENT_DATE)::int as "bookingsToday",
+          (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= CURRENT_DATE)::int as "couponsToday",
+          (SELECT COUNT(*) FROM payment_submissions WHERE status IN ('verification_failed', 'ai_check_failed', 'admin_rejected', 'awaiting_admin_review', 'proof_submitted', 'ai_checking'))::int as "failedOrPendingAttempts"
+      `);
+      data = metricsRes.rows[0];
+    }
+
+    data = data || {
       confirmedBookingsCount: 0,
       validCouponsCount: 0,
       totalRevenueInr: 0,
@@ -120,21 +136,28 @@ router.get('/coupons', requireAdminAuth, async (req: Request, res: Response) => 
     const page = Math.max(1, parseInt((req.query.page as string) || '1', 10));
     const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || '20', 10)));
 
+    const params: any[] = [];
+    let searchClause = '';
+    if (search && search.trim()) {
+      params.push(`%${search.trim()}%`);
+      searchClause = ` AND (c.coupon_number ILIKE $1 OR c.holder_name ILIKE $1 OR c.phone ILIKE $1 OR c.village ILIKE $1 OR b.public_id ILIKE $1)`;
+    }
+
     const sql = `
       SELECT 
         c.id, c.coupon_number, c.holder_name, c.phone, c.village, c.status,
         c.ticket_index, c.total_quantity, c.issued_at,
-        b.public_id as booking_public_id, b.status as booking_status, b.paid_at, b.verified_at,
+        b.public_id as booking_public_id, b.status as booking_status, b.paid_at,
         b.unit_price_paise as amount_paise,
         ps.payer_utr_hash
       FROM coupons c
       JOIN bookings b ON c.booking_id = b.id
-      LEFT JOIN payment_submissions ps ON b.id = ps.booking_id AND ps.status = 'proof_verified'
-      WHERE (b.status = 'proof_verified' OR b.status = 'payment_confirmed') AND c.status = 'valid'
+      LEFT JOIN payment_submissions ps ON b.id = ps.booking_id AND (ps.status = 'proof_verified' OR ps.status = 'payment_confirmed')
+      WHERE (b.status = 'proof_verified' OR b.status = 'payment_confirmed') AND c.status = 'valid'${searchClause}
       ORDER BY c.issued_at DESC
     `;
 
-    const resData = await db.query(sql, [search]);
+    const resData = await db.query(sql, params);
     let items = resData.rows;
 
     const total = items.length;

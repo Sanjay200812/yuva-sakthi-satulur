@@ -8,6 +8,11 @@ BEGIN
     ALTER TABLE bookings ADD COLUMN payment_expires_at TIMESTAMPTZ;
   END IF;
 
+  -- 1b. Add verified_at column to bookings if not present
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'bookings' AND column_name = 'verified_at') THEN
+    ALTER TABLE bookings ADD COLUMN verified_at TIMESTAMPTZ;
+  END IF;
+
   -- 2. Relax or update status check constraint on bookings to unify on payment_confirmed
   ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;
   ALTER TABLE bookings ADD CONSTRAINT bookings_status_check CHECK (status IN (
