@@ -44,6 +44,7 @@ class MemoryDB implements TransactionalDB {
   private adminUsers = new Map<string, any>();
   private auditLogs: any[] = [];
   private currentSerial = 1500;
+  private paymentSettings: any;
 
   constructor() {
     const adminId = '00000000-0000-0000-0000-000000000001';
@@ -56,6 +57,18 @@ class MemoryDB implements TransactionalDB {
       is_active: true,
       created_at: new Date().toISOString(),
     });
+
+    this.paymentSettings = {
+      id: '00000000-0000-0000-0000-000000000002',
+      payee_upi_id: config.PAYEE_UPI_ID || '7075920852@ybl',
+      payee_display_name: config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur',
+      coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5000,
+      payments_enabled: true,
+      max_quantity: config.EVENT_MAX_COUPONS_PER_BOOKING || 20,
+      payment_session_minutes: 5,
+      updated_at: new Date().toISOString(),
+      updated_by: adminId,
+    };
   }
 
   async getNextCouponSerial(): Promise<number> {
@@ -210,20 +223,26 @@ class MemoryDB implements TransactionalDB {
       return { rows: [record] as any, rowCount: 1 };
     }
 
-    // 7. Check UTR duplicate
-    if (trimmed.includes('FROM payment_submissions') && trimmed.includes('payer_utr_hash = $1')) {
+    // 7. Check UTR / Reference duplicate
+    if (trimmed.includes('FROM payment_submissions') && (
+      trimmed.includes('payer_utr_hash = $1') ||
+      trimmed.includes('entered_reference_hash = $1') ||
+      trimmed.includes('extracted_reference_hash = $1')
+    )) {
       const bookingIdToExclude = trimmed.includes('booking_id != $2') ? params[1] : null;
       const requireConfirmed = trimmed.includes("status = 'admin_confirmed'") || trimmed.includes("status = 'payment_confirmed'") || trimmed.includes("status IN ('payment_confirmed', 'proof_verified')");
       const requireVerified = trimmed.includes("status = 'proof_verified'") || trimmed.includes("status = 'payment_confirmed'");
       const found = Array.from(this.paymentSubmissions.values()).find(
         (s) =>
-          s.payer_utr_hash === params[0] &&
+          (s.payer_utr_hash === params[0] || s.entered_reference_hash === params[0] || s.extracted_reference_hash === params[0]) &&
           (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) &&
           (!requireConfirmed || s.status === 'payment_confirmed' || s.status === 'admin_confirmed' || s.status === 'proof_verified') &&
           (!requireVerified || s.status === 'proof_verified' || s.status === 'payment_confirmed') &&
           s.status !== 'admin_rejected' &&
           s.status !== 'verification_failed' &&
-          s.status !== 'ai_check_failed'
+          s.status !== 'ai_check_failed' &&
+          s.status !== 'ocr_check_failed' &&
+          s.status !== 'proof_verification_failed'
       );
       return { rows: (found ? [found] : []) as any, rowCount: found ? 1 : 0 };
     }
@@ -675,6 +694,30 @@ class MemoryDB implements TransactionalDB {
         .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
 
       return { rows: list as any, rowCount: list.length };
+    }
+
+    // 21. Payment Settings
+    if (trimmed.includes('FROM payment_settings')) {
+      return { rows: [this.paymentSettings] as any, rowCount: 1 };
+    }
+
+    if (trimmed.startsWith('UPDATE payment_settings')) {
+      const matchSet = trimmed.match(/SET\s+(.*?)(?:\s+WHERE|$)/is);
+      if (matchSet && matchSet[1]) {
+        const assignments = matchSet[1].split(',').map((a) => a.trim());
+        assignments.forEach((assignment) => {
+          const parts = assignment.split('=').map((p) => p.trim());
+          const col = parts[0].toLowerCase();
+          const valExpr = parts[1];
+          const paramMatch = valExpr?.match(/\$(\d+)/);
+          if (paramMatch) {
+            const pIdx = parseInt(paramMatch[1], 10) - 1;
+            this.paymentSettings[col] = params[pIdx];
+          }
+        });
+      }
+      this.paymentSettings.updated_at = new Date().toISOString();
+      return { rows: [this.paymentSettings] as any, rowCount: 1 };
     }
 
     // Default fallback

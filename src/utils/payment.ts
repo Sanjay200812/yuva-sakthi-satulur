@@ -51,6 +51,10 @@ export interface PaymentProofParams {
   consentGiven: boolean;
   statusToken?: string;
   isRecovery?: boolean;
+  utr?: string;
+  transactionReference?: string;
+  originalFilename?: string;
+  originalMimeType?: string;
 }
 
 export interface PaymentProofResponse {
@@ -59,6 +63,8 @@ export interface PaymentProofResponse {
   status: string;
   message: string;
   coupons?: any[];
+  reasonCode?: string;
+  reasons?: string[];
   details: {
     utrMatched: boolean | null;
     amountMatched: boolean | null;
@@ -91,7 +97,7 @@ export async function createBooking(params: BookingCreationParams): Promise<Book
 }
 
 /**
- * Submits mandatory payment proof (payment screenshot and user consent) for automated verification.
+ * Submits mandatory payment proof (payment screenshot, entered UTR, and user consent) for automated verification.
  */
 export async function submitPaymentProof(params: PaymentProofParams): Promise<PaymentProofResponse> {
   const headers: Record<string, string> = {
@@ -112,6 +118,10 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
         consentGiven: params.consentGiven,
         statusToken: params.statusToken,
         isRecovery: params.isRecovery,
+        utr: params.utr,
+        transactionReference: params.transactionReference,
+        originalFilename: params.originalFilename,
+        originalMimeType: params.originalMimeType,
       }),
     },
     'Payment proof service'

@@ -10,6 +10,7 @@ import { generateUpiPaymentSession } from './upi/upiUri.ts';
 import { processPaymentScreenshot, hammingDistance, checkStorageHealth, downloadPaymentScreenshot } from './upi/imageProcessor.ts';
 import { analyzePaymentScreenshot } from './upi/localOcrAnalyzer.ts';
 import { performDeterministicComparison, normalizeUtr } from './upi/deterministicMatcher.ts';
+import { verifyPaymentReceipt, normalizeTransactionReference } from './upi/deterministicReceiptVerifier.ts';
 import { finalizeVerifiedSubmission } from './upi/automatedFinalizer.ts';
 import { encryptSensitiveField } from './utils/crypto.ts';
 import { getAdminSession } from './admin/auth.ts';
@@ -74,8 +75,8 @@ function generateCollisionSafePublicId(): string {
 }
 
 function generateCollisionSafePaymentReference(): string {
-  // YSYS-[timestamp base36]-[4 random hex chars]
-  return `YSYS-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  // YSYS- followed by 8 cryptographically secure uppercase hex characters (4.29B combinations)
+  return `YSYS-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
 // 2. Health & Diagnostic Check (Requirement 12: Safe Storage & DB Health Diagnostic)
@@ -321,7 +322,7 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
 app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
-    const { screenshotBase64, selectedApp, consentGiven } = req.body;
+    const { screenshotBase64, utr, transactionReference, selectedApp, consentGiven, originalFilename, originalMimeType } = req.body;
 
     // 0. Secure Token Authentication
     const authHeader = req.headers.authorization;
@@ -447,7 +448,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     const imageBuffer = Buffer.from(cleanBase64, 'base64');
 
     // 7. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
-    const processed = await processPaymentScreenshot(imageBuffer, booking.id);
+    const processed = await processPaymentScreenshot(imageBuffer, booking.id, originalFilename, originalMimeType);
 
     // 8. Run Local Server-Side OCR & Candidate Extraction
     const analysis = await analyzePaymentScreenshot(
@@ -538,7 +539,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           retryable: true,
           message: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
           details: {
-            utrMatched: null,
+            referenceMatched: null,
             amountMatched: null,
             statusMatched: null,
             payeeMatched: null,
@@ -547,24 +548,36 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 9. Extract and normalize transaction reference exclusively from screenshot OCR
-    const extractedRrn = analysis.utrOrRrn ? normalizeUtr(analysis.utrOrRrn) : '';
-    let utrHash: string;
-    let encryptedUtr: string;
-    let isDuplicateUtr = false;
+    // 9. Extract and normalize references
+    const enteredUtrField = req.body.utr ?? req.body.transactionReference ?? req.body.enteredUtr;
+    const rawEnteredRef = (enteredUtrField !== undefined ? enteredUtrField : (analysis.utrOrRrn || analysis.transactionId || '')).trim();
+    const normalizedEnteredRef = normalizeTransactionReference(rawEnteredRef);
+    const extractedRrn = analysis.utrOrRrn ? normalizeTransactionReference(analysis.utrOrRrn) : (analysis.transactionId ? normalizeTransactionReference(analysis.transactionId) : '');
 
-    if (extractedRrn) {
-      utrHash = crypto.createHash('sha256').update(extractedRrn).digest('hex');
-      const dupUtrRes = await db.query(
-        'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-        [utrHash, booking.id, 'admin_rejected', 'payment_rejected']
+    const enteredRefHash = normalizedEnteredRef ? crypto.createHash('sha256').update(normalizedEnteredRef).digest('hex') : null;
+    const encryptedEnteredRef = normalizedEnteredRef ? encryptSensitiveField(normalizedEnteredRef) : null;
+
+    const extractedRefHash = extractedRrn ? crypto.createHash('sha256').update(extractedRrn).digest('hex') : null;
+    const encryptedExtractedRef = extractedRrn ? encryptSensitiveField(extractedRrn) : null;
+
+    const fallbackUtr = `UNEXTRACTED_${submissionId}`;
+    const payerUtrHash = extractedRefHash || enteredRefHash || crypto.createHash('sha256').update(fallbackUtr).digest('hex');
+    const encryptedUtr = encryptedExtractedRef || encryptedEnteredRef || encryptSensitiveField(fallbackUtr);
+
+    let isDuplicateUtr = false;
+    if (enteredRefHash) {
+      const dupEntered = await db.query(
+        `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+        [enteredRefHash, booking.id, 'admin_rejected', 'payment_rejected']
       );
-      isDuplicateUtr = dupUtrRes.rows.length > 0;
-      encryptedUtr = encryptSensitiveField(extractedRrn);
-    } else {
-      const fallbackRef = `UNEXTRACTED_${submissionId}`;
-      utrHash = crypto.createHash('sha256').update(fallbackRef).digest('hex');
-      encryptedUtr = encryptSensitiveField(fallbackRef);
+      if (dupEntered.rows.length > 0) isDuplicateUtr = true;
+    }
+    if (!isDuplicateUtr && extractedRefHash) {
+      const dupExtracted = await db.query(
+        `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+        [extractedRefHash, booking.id, 'admin_rejected', 'payment_rejected']
+      );
+      if (dupExtracted.rows.length > 0) isDuplicateUtr = true;
     }
 
     // 10. Check Duplicate Screenshot Hash
@@ -591,12 +604,30 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       }
     }
 
-    // 11. Run Deterministic Comparison Engine (Fail-Closed)
+    // 11. Run Deterministic Receipt Verifier (Fail-Closed, Code-Only)
+    const verification = verifyPaymentReceipt({
+      expectedAmountPaise: booking.total_amount_paise,
+      expectedPayeeUpiId: config.PAYEE_UPI_ID,
+      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      enteredReference: normalizedEnteredRef || undefined,
+      selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      ocrAnalysis: analysis,
+      isDuplicateReference: isDuplicateUtr,
+      isDuplicateScreenshot,
+      isExpired: false,
+      originalFilename: processed.originalFilename,
+      isSuspiciousFilename: processed.isSuspiciousFilename,
+      isValidScreenshotFormat: true,
+    });
+
+    // Also run legacy matcher for backwards compatibility
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: extractedRrn,
+      enteredUtr: normalizedEnteredRef || extractedRrn,
       selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
       bookingCreatedAt: booking.created_at,
       paymentExpiresAt: booking.payment_expires_at,
@@ -606,15 +637,23 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       isExpired: false,
     });
 
-    // 12. Persist payment submission record
+    const isPassed = verification.verified && match.passed;
+    const finalReasonCodes = Array.from(new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
+
+    // 12. Persist payment submission record with extended columns
     await db.query(
       `INSERT INTO payment_submissions (
         id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
         expected_payee_name, expected_amount_paise, payer_utr_hash, encrypted_utr,
-        screenshot_storage_path, screenshot_sha256, screenshot_phash, mime_type,
-        byte_size, width, height, status, ocr_extraction, deterministic_comparison,
-        risk_score, reason_codes, ocr_engine, extracted_transaction_timestamp
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+        entered_reference_hash, encrypted_entered_reference,
+        extracted_reference_hash, encrypted_extracted_reference,
+        original_filename, screenshot_storage_path, screenshot_sha256, screenshot_phash,
+        mime_type, byte_size, width, height, status, ocr_extraction, deterministic_comparison,
+        verification_result, verification_reason_codes, extracted_amount_paise,
+        extracted_status, extracted_payee_upi_id, extracted_transaction_timestamp,
+        risk_score, reason_codes, ocr_engine, verified_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)`,
       [
         submissionId,
         booking.id,
@@ -623,8 +662,13 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         config.PAYEE_UPI_ID,
         config.PAYEE_DISPLAY_NAME,
         booking.total_amount_paise,
-        utrHash,
+        payerUtrHash,
         encryptedUtr,
+        enteredRefHash,
+        encryptedEnteredRef,
+        extractedRefHash,
+        encryptedExtractedRef,
+        processed.originalFilename || null,
         processed.storagePath,
         processed.sha256,
         processed.phash,
@@ -632,13 +676,19 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         processed.byteSize,
         processed.width,
         processed.height,
-        match.nextStatus,
+        isPassed ? 'payment_confirmed' : 'payment_rejected',
         JSON.stringify(analysis),
         JSON.stringify(match),
-        match.riskScore,
-        match.reasonCodes,
-        'tesseract.js',
+        JSON.stringify(verification),
+        finalReasonCodes,
+        extractedPaise,
+        analysis.paymentStatus,
+        analysis.payeeUpiId || null,
         analysis.transactionTimestamp || null,
+        Math.max(verification.riskScore, match.riskScore),
+        finalReasonCodes,
+        'tesseract.js',
+        isPassed ? new Date().toISOString() : null,
       ]
     );
 
@@ -660,7 +710,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       ]
     );
 
-    if (match.passed) {
+    if (isPassed) {
       // 14. AUTOMATED FINALIZATION: Atomic transaction locks booking, allocates sequential coupons, and transitions to payment_confirmed
       const finalResult = await finalizeVerifiedSubmission({
         submissionId,
@@ -675,11 +725,14 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           publicId: booking.public_id,
           status: 'payment_confirmed',
           reviewStatus: 'ocr_verified',
-          message: 'Payment proof verified successfully. Coupons issued.',
+          message: verification.userMessage || 'Payment proof verified successfully. Coupons issued.',
           coupons: finalResult.coupons,
           couponsIssuedCount: finalResult.couponsIssuedCount,
           downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
-          details: match.details,
+          details: {
+            ...match.details,
+            ...verification.details,
+          },
         },
       });
     } else {
@@ -689,19 +742,23 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         ['payment_rejected', new Date().toISOString(), booking.id]
       );
 
+      const primaryCode = finalReasonCodes[0] || 'PROOF_VERIFICATION_FAILED';
       return res.status(400).json({
         success: false,
         error: {
-          code: match.reasonCodes[0] || 'PROOF_VERIFICATION_FAILED',
-          message: match.userMessage,
-          reasonCodes: match.reasonCodes,
+          code: primaryCode,
+          message: verification.userMessage || match.userMessage,
+          reasonCodes: finalReasonCodes,
         },
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: match.nextStatus,
-          message: match.userMessage,
-          details: match.details,
+          status: 'payment_rejected',
+          message: verification.userMessage || match.userMessage,
+          details: {
+            ...match.details,
+            ...verification.details,
+          },
         },
       });
     }
@@ -763,7 +820,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         data: {
           publicId: booking.public_id,
           status: 'payment_confirmed',
-          reviewStatus: 'ai_check_passed',
+          reviewStatus: 'ocr_verified',
           message: 'Payment proof already verified and confirmed.',
           coupons: existingCoupons.rows,
           couponsIssuedCount: existingCoupons.rows.length,
@@ -865,7 +922,23 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       encryptedUtr = encryptSensitiveField(extractedRrn);
     }
 
-    // Run Deterministic Comparison Engine
+    // Run Deterministic Receipt Verifier
+    const verification = verifyPaymentReceipt({
+      expectedAmountPaise: booking.total_amount_paise,
+      expectedPayeeUpiId: config.PAYEE_UPI_ID,
+      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      enteredReference: extractedRrn,
+      selectedApp: submission.selected_upi_app || 'other_upi',
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      ocrAnalysis: analysis,
+      isDuplicateReference: isDuplicateUtr,
+      isDuplicateScreenshot: false,
+      isExpired: false,
+      originalFilename: submission.original_filename,
+      isValidScreenshotFormat: true,
+    });
+
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
@@ -880,7 +953,11 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       isExpired: false,
     });
 
-    // Update existing submission with genuine OCR results
+    const isPassed = verification.verified && match.passed;
+    const finalReasonCodes = Array.from(new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
+
+    // Update existing submission with genuine OCR results and extended columns
     await db.query(
       `UPDATE payment_submissions SET
         payer_utr_hash = $1,
@@ -888,22 +965,32 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         status = $3,
         ocr_extraction = $4,
         deterministic_comparison = $5,
-        risk_score = $6,
-        reason_codes = $7,
-        ocr_engine = $8,
-        extracted_transaction_timestamp = $9,
-        updated_at = $10
-      WHERE id = $11`,
+        verification_result = $6,
+        verification_reason_codes = $7,
+        risk_score = $8,
+        reason_codes = $9,
+        ocr_engine = $10,
+        extracted_amount_paise = $11,
+        extracted_status = $12,
+        extracted_transaction_timestamp = $13,
+        verified_at = $14,
+        updated_at = $15
+      WHERE id = $16`,
       [
         utrHash,
         encryptedUtr,
-        match.nextStatus,
+        isPassed ? 'payment_confirmed' : 'payment_rejected',
         JSON.stringify(analysis),
         JSON.stringify(match),
-        match.riskScore,
-        match.reasonCodes,
+        JSON.stringify(verification),
+        finalReasonCodes,
+        Math.max(verification.riskScore, match.riskScore),
+        finalReasonCodes,
         'tesseract.js',
+        extractedPaise,
+        analysis.paymentStatus,
         analysis.transactionTimestamp || null,
+        isPassed ? new Date().toISOString() : null,
         new Date().toISOString(),
         submission.id,
       ]

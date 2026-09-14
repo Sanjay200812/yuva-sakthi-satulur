@@ -1,15 +1,18 @@
-# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Automated Local OCR Verification)
+# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Deterministic Proof Verification)
 
-An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and **Direct Merchant-UPI Collection with Automated Local Server OCR Verification**:
-1. **Server-Authoritative Pricing & 5-Minute Payment Session**: Server locks ₹50/coupon (`5000` integer paise), generates intent deep links for PhonePe, Google Pay, Paytm, and generic Other UPI Apps, and enforces a strict 5-minute session expiry.
-2. **Deterministic Server-Side OCR & Consistency Verification**: Local server-side OCR (Tesseract.js) with Sharp multi-variant preprocessing, candidate-scoring parsing, and fail-closed deterministic verification without any external AI or LLM API calls.
-3. **Atomic Instant Coupon Finalization**: High-confidence verified submissions immediately call atomic finalization inside a database transaction, allocating unique coupon numbers without manual human bottlenecks.
+An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and **Direct Merchant-UPI Collection with Automated Local Server OCR & Deterministic Verification**:
+1. **Server-Authoritative Pricing & 5-Minute Payment Session**: Server calculates and locks ₹50/coupon (`5000` integer paise), generates canonical UPI intent deep links for PhonePe, Google Pay, Paytm, FamPay, and Other UPI Apps, and enforces a strict 5-minute session expiry (`AUTHORITATIVE_PAYMENT_SESSION_MINUTES = 5`).
+2. **Two Mandatory Verification Inputs**: Customer enters their 12-digit UPI UTR / Transaction ID and uploads their payment confirmation receipt screenshot.
+3. **Deterministic Local OCR & Cross-Checking**: Local server-side OCR (Tesseract.js) with Sharp multi-variant preprocessing, candidate scoring, entered UTR vs OCR UTR cross-checking, AI generator watermark detection, and fail-closed deterministic verification without any external AI or cloud LLM APIs.
+4. **Instant Atomic Concurrency-Safe Coupon Finalization**: Passing submissions instantly call atomic PostgreSQL transaction finalization, allocating unique coupon numbers without manual human bottlenecks or admin approvals.
+5. **Private Supabase Storage**: Sanitized payment receipts are stored securely in a private Supabase bucket (`payment-proofs`) with short-lived signed URLs. Production serverless environments never persist uploads to `/var/task` or the local filesystem.
 
 ---
 
 > [!IMPORTANT]
 > **Architecture & Receipt Verification Disclaimer**:
-> Server-side receipt analysis via local OCR and the deterministic comparison engine is an **automated consistency and fraud-screening mechanism**, not proof of bank settlement. Image receipts, OCR text, and client devices are untrusted inputs. The system verifies visible receipt status, expected amount, unique 12-digit RRN, payee VPA, and timestamp consistency before issuing coupons. Authoritative automatic settlement verification requires a supported bank/merchant PSP transaction-status API.
+> Server-side receipt analysis via local OCR and the deterministic comparison engine is an **automated consistency and payment-proof verification mechanism**, NOT proof of bank settlement. The system verifies visible receipt status, expected amount, entered vs extracted 12-digit UTR/RRN, payee VPA, timestamp consistency, and duplicate fraud protection before issuing coupons.
+> Never display "Bank Verified" or "Bank Settlement Confirmed" in user-facing messaging; always state **"Payment Proof Verified"** or **"Receipt Verified"**. Authoritative independent bank settlement verification requires a dedicated bank/merchant PSP transaction-status API.
 
 ---
 
@@ -18,7 +21,8 @@ An official, production-grade event coupon booking portal for **Yuva Shakti Yout
 - **Event**: Yuva Shakti Youth Satulur Lucky Draw
 - **Organizer**: Yuva Shakti Youth, Satulur
 - **1st Prize**: 🏆 **20 KG Maha Laddu**
-- **Coupon Price**: **₹50 per ticket** (stored server-side as `5000` integer paise)
+- **Coupon Price**: **₹50 per ticket** (represented server-side as `5000` integer paise)
+- **Authoritative Receiver**: `7075920852@ybl` (Yuva Shakti Youth Satulur)
 - **Venue**: Satulur Center, Guntur District, Andhra Pradesh
 - **Helpline**: +91 95748 76369
 - **Timezone**: `Asia/Kolkata`
@@ -28,95 +32,108 @@ An official, production-grade event coupon booking portal for **Yuva Shakti Yout
 
 ## 🏗️ Architecture & Core System Design
 
-### 1. Customer Payment Flow
+### 1. Customer Payment & Verification Flow
 ```text
 Participant Details
-  → Select Quantity
-  → Server Calculates & Locks Amount (₹50 × quantity)
-  → Server Initiates 5-Minute Session (`payment_expires_at`)
-  → Customer Selects UPI App (PhonePe / Google Pay / Paytm / Other UPI Apps)
-  → Launch App Intent / Scan Prominent QR
+  → Select Dynamic Quantity
+  → Server Calculates & Locks Amount (₹50 × quantity = total_amount_paise)
+  → Server Initiates 5-Minute Session (`payment_expires_at = now() + 5 mins`)
+  → Customer Selects UPI App (PhonePe / Google Pay / Paytm / FamPay / Other UPI)
+  → Launch App Intent / Scan Canonical Dynamic QR
   → Customer Pays in UPI App
-  → Return to Website
-  → Upload Payment Screenshot Proof (Zero Manual UTR Entry Required)
+  → Return to Website ("I have completed payment")
+  → Verification Page: TWO Mandatory Inputs:
+      1. UTR / Transaction ID (Text Entry)
+      2. Payment Screenshot (File Upload)
   → Server Magic-Bytes, Sharp Sanitization, SHA-256 & Perceptual dHash Check
   → Multi-Variant Sharp Preprocessing & Local Tesseract.js OCR
-  → Candidate Scoring for Amount, 12-Digit RRN/UTR, Status, Payee & Timestamp
-  → Fail-Closed Deterministic Matcher & Duplicate Protection
-  → Atomic Concurrency-Safe Finalizer
-  → Immediate Coupon Issuance & TicketModal Download (PDF, PNG, JPEG, ZIP)
+  → Candidate Scoring for Amount, Status, 12-Digit RRN/UTR, Payee, & Timestamp
+  → Entered UTR vs Screenshot UTR Cross-Check
+  → Fail-Closed Deterministic Decision Engine & Duplicate Protections
+  → Atomic Concurrency-Safe PostgreSQL Transaction
+  → Immediate Coupon Issuance & Customer Success UI
+  → Multi-format Downloads (PDF, PNG, JPEG, ZIP)
 ```
 
 ### 2. Direct Merchant-UPI Collection & App Intents
-- **No Hosted Gateways**: Third-party hosted gateways (Razorpay, VyaparGateway, Cashfree, PhonePe Gateway) are absent. All payments go directly to the merchant UPI VPA.
+- **No Third-Party Hosted Gateways**: Third-party hosted gateways (Razorpay, Cashfree, PhonePe Gateway API, bank APIs) are absent. All payments go directly to the merchant UPI VPA.
 - **Server-Authoritative Pricing**: The client never controls the price. Total amount is calculated server-side: `totalAmountPaise = EVENT_COUPON_PRICE_PAISE * quantity`. Client request amounts are ignored.
-- **5-Minute Payment Session**: The server computes `payment_expires_at = now() + 5 minutes`. The client displays a live MM:SS countdown driven strictly by this server timestamp. Proof submitted after expiry is rejected with `PAYMENT_SESSION_EXPIRED`.
-- **4 Dedicated Payment Choices**:
-  1. **PhonePe**: Official deep link intent `phonepe://pay?...`
-  2. **Google Pay**: Official deep link intent `gpay://upi/pay?...`
-  3. **Paytm**: Official deep link intent `paytmmp://pay?...`
-  4. **Other UPI Apps**: Canonical generic `upi://pay?...` for system UPI app selection.
+- **5-Minute Payment Session**: The server computes `payment_expires_at = now() + 5 minutes`. The client displays a live MM:SS countdown driven strictly by this server timestamp.
+- **5 Dedicated Payment Choices**:
+  1. **PhonePe**: Deep link intent `phonepe://pay?...`
+  2. **Google Pay**: Deep link intent `gpay://upi/pay?...`
+  3. **Paytm**: Deep link intent `paytmmp://pay?...`
+  4. **FamPay**: Deep link intent or standard UPI fallback `upi://pay?...`
+  5. **Other UPI Apps**: Canonical generic `upi://pay?...` for system UPI app selection.
 - **Fixed Amount Parameter**: Uses exact fixed `am` parameter and omits `mam` to prevent partial amount tampering.
 - **Responsive Presentation**: Prominent QR code on desktop devices; dynamic payment launch button on mobile devices.
 
-### 3. Strict 12-Digit RRN & Screenshot Processing
-- **Automatic RRN Extraction**: The user is never prompted to type a manual UTR. The backend extracts the 12-digit numeric RRN directly from the receipt.
+### 3. Verification Page (Two Mandatory Inputs)
+- **Mandatory Input 1: UTR / Transaction ID**: User manually enters their 12-digit UPI RRN / UTR / Reference ID from their payment app.
+- **Mandatory Input 2: Payment Receipt Screenshot**: User uploads their payment confirmation screen.
+- **Cross-Check**: Server extracts visible reference from OCR and cross-checks with entered UTR. Mismatch triggers `TRANSACTION_REFERENCE_MISMATCH`.
 - **Magic Bytes & Raster Sanitization**: Validates raster magic bytes (PNG, JPEG, WebP, max 5MB).
 - **Sharp Re-Encoding**: Strips all EXIF/GPS metadata and comments.
-- **Deduplication & Perceptual Hashing**: Computes SHA-256 for byte-level duplicate detection and 64-bit dHash (difference hash) for perceptual layout similarity comparison. Rejects duplicate confirmed RRNs and identical screenshots.
-- **Production Screenshot Storage**: When Supabase is configured, sanitized screenshots are stored in a private bucket (`PAYMENT_PROOF_BUCKET`) and accessed only via short-lived signed URLs. Local filesystem fallback is used in offline development.
-- **Authenticated Encryption (AES-256-GCM)**: Sensitive raw RRN data is encrypted at rest using AES-256-GCM with a random 12-byte IV and authentication tag (`v1:<iv>:<tag>:<ciphertext>`).
+- **Deduplication & Forensics**: SHA-256 for exact duplicate detection and 64-bit dHash for perceptual layout similarity. Blocks duplicate confirmed UTRs (`DUPLICATE_TRANSACTION_REFERENCE`) and duplicate screenshots (`DUPLICATE_SCREENSHOT`).
+- **Production Screenshot Storage**: Sanitized screenshots are stored in private Supabase Storage (`payment-proofs`) and accessed only via short-lived signed URLs. Local filesystem fallback is permitted only in offline development (`NODE_ENV === 'development' && VERCEL !== '1'`).
+- **Authenticated Encryption (AES-256-GCM)**: Sensitive raw transaction references are encrypted at rest using authenticated AES-256-GCM encryption (`v1:<iv>:<tag>:<ciphertext>`).
 
 ### 4. Local Server-Side OCR (Tesseract.js) & Preprocessing
-- **100% Local & Code-Only**: Zero external AI APIs, LLMs, or cloud OCR services. Runs entirely within the Node.js serverless execution environment.
+- **100% Local & Code-Only**: Zero external AI APIs, LLMs, or cloud OCR services. Runs entirely within the serverless execution environment.
 - **Multi-Variant Sharp Preprocessing**: Generates in-memory candidates (grayscale, contrast-enhanced, sharpened/upscaled) without writing temporary files to disk.
 - **Candidate Scoring Engine**:
   - **Payment Reference**: Labels scored by proximity (`UTR`, `RRN`, `UPI Ref`, `Bank Reference`). 12-digit numeric sequences prioritized.
   - **Amount**: Proximity scoring near "Paid", "Amount", "Sent", "Total" with INR / ₹ symbol parsing.
   - **Payment Status**: Explicit status priority (`FAILED` > `PENDING` > `SUCCESS`).
   - **Transaction Timestamp**: Indian receipt formats parsed in `Asia/Kolkata` time zone and checked against the 5-minute booking window.
-  - **Payee & App Detection**: Checks recipient UPI ID against `PAYEE_UPI_ID` and identifies app signatures (PhonePe, Google Pay, Paytm).
+  - **Payee & App Detection**: Checks recipient UPI ID against `PAYEE_UPI_ID` and identifies app signatures (PhonePe, Google Pay, Paytm, FamPay).
+  - **AI Generator Watermark Detection**: Checks for explicit generator watermarks (`Generated with AI`, `ChatGPT`, `OpenAI`, `DALL-E`, `Midjourney`, `Adobe Firefly`, `Generated with Gemini`) while allowing normal app branding (`Google Pay`).
 
-### 5. Fail-Closed Deterministic Matcher & Reason Codes
+### 5. Fail-Closed Deterministic Decision Engine & Reason Codes
 Every automated verification must satisfy all mandatory signals before coupon issuance:
-- Sufficient readable text from OCR (`OCR_UNREADABLE` if empty/blurry)
+- Readable text from OCR (`OCR_UNREADABLE` if unreadable)
 - `paymentStatus === "success"`
-- Extracted 12-digit RRN exists and matches format
-- Extracted amount exists and matches booking `total_amount_paise`
-- No duplicate RRN or duplicate screenshot across finalized bookings
-- Payee VPA must not be positively identified as a different UPI account
-- Explicit failure reason codes:
-  - `MISSING_PAYMENT_REFERENCE`
-  - `INVALID_PAYMENT_REFERENCE`
+- Extracted reference matches entered UTR (`TRANSACTION_REFERENCE_MISMATCH` if disparate)
+- Extracted amount matches booking `total_amount_paise` (`AMOUNT_MISMATCH` if disparate)
+- No duplicate UTR across confirmed bookings (`DUPLICATE_TRANSACTION_REFERENCE`)
+- No duplicate screenshot SHA across confirmed bookings (`DUPLICATE_SCREENSHOT`)
+- Payee VPA must not be a different account (`WRONG_PAYEE`)
+- No explicit AI generator watermark (`AI_GENERATOR_WATERMARK`)
+- All 18 exact reason codes supported:
+  - `INVALID_SCREENSHOT_FORMAT`
+  - `OCR_UNREADABLE`
+  - `OCR_PROCESSING_ERROR`
+  - `MISSING_TRANSACTION_REFERENCE`
+  - `REFERENCE_NOT_READABLE`
+  - `TRANSACTION_REFERENCE_MISMATCH`
+  - `INVALID_TRANSACTION_REFERENCE`
+  - `DUPLICATE_TRANSACTION_REFERENCE`
   - `MISSING_AMOUNT`
   - `AMOUNT_MISMATCH`
   - `STATUS_NOT_SUCCESS`
-  - `DUPLICATE_PAYMENT_REFERENCE`
   - `DUPLICATE_SCREENSHOT`
   - `WRONG_PAYEE`
   - `TRANSACTION_TIME_MISMATCH`
-  - `OCR_UNREADABLE`
-  - `OCR_PROCESSING_ERROR` (allows customer retry on stored proof)
+  - `AI_GENERATOR_WATERMARK`
+  - `SUSPICIOUS_FILENAME`
+  - `SCREENSHOT_SECURITY_RISK`
+  - `PAYMENT_SESSION_EXPIRED`
 
-### 6. Atomic Instant Finalizer & Secure Access Tokens
-- **Instant Automatic Finalization**: High-confidence verification immediately calls `finalizeVerifiedSubmission(...)`.
+### 6. Atomic Instant Finalizer & Concurrency Safety
+- **Instant Automatic Finalization**: Verification pass immediately finalizes the booking without human intervention.
 - **Database Transaction & Concurrency Safety**:
   - Locks booking and payment submission rows (`FOR UPDATE`).
-  - Confirms booking has not already been finalized (idempotent for retries).
-  - Enforces global uniqueness on confirmed RRN hash.
+  - Idempotent: safe against double-clicks and network retries.
+  - Partial unique index on confirmed reference hashes prevents race conditions.
   - Generates exact quantity of coupons paid for with sequential numbers (`YSYS-2026-XXXXXX`).
   - Updates booking to authoritative completed status: `payment_confirmed`.
-  - Records an immutable audit log entry.
-- **Secure Access Tokens**: Status polling and proof submission require the cryptographically random `statusToken` (stored as SHA-256 hash). Guessing a public booking ID (`BK-XXXXXX`) does not expose participant data or coupons.
-- **Authenticated Downloads**: Coupon downloads require a secure download token or admin authentication.
+- **Retry Endpoint**: `POST /api/bookings/:publicId/retry-verification` allows rerunning verification on already-stored proofs without requiring duplicate payment.
 
-### 7. Multi-Format Personalized Ticket Generation
-- **Supported Formats**: PDF (printable with vector QR), lossless PNG, crisp JPEG, and multi-ticket ZIP bundles.
-- **Multilingual Support**: Supports both English and Telugu participant names and village names.
-
-### 8. Admin Portal (`/admin`)
-- **Genuine Issued Coupons**: Shows genuine issued coupons with applicant details, booking reference, amount, and download passes.
-- **Verification & Audit Logs**: Shows all proof submissions, OCR engine metadata (Tesseract.js), extracted amounts, masked RRNs, transaction timestamps, detected apps, reason codes, and short-lived signed screenshot previews.
+### 7. Admin Portal (`/admin`)
+- **Monitoring Only**: No manual payment approval or confirmation in the normal flow.
+- **Genuine Issued Coupons**: Registry of genuine issued coupons with download links.
+- **Verification & Audit Logs**: Detailed audit records showing entered UTR (masked), OCR reference (masked), OCR amount, status, timestamp, original filename, and signed screenshot preview.
+- **Payment Settings**: Admin can configure payee UPI ID, business name, coupon price, and maximum quantity. Payment session duration is strictly locked to **5 Minutes — Security Rule**.
 
 ---
 
@@ -128,20 +145,22 @@ Every automated verification must satisfy all mandatory signals before coupon is
 │   ├── 002_direct_upi_schema.sql           # Direct UPI tables & RRN hash index
 │   ├── 003_automated_upi_verification.sql   # payment_expires_at, unified constraints
 │   ├── 004_fix_admin_users.sql             # Admin user schema hardening
-│   └── 005_local_ocr_verification.sql      # ocr_extraction, ocr_engine, extracted_transaction_timestamp
+│   ├── 005_local_ocr_verification.sql      # ocr_extraction, ocr_engine, timestamp
+│   └── 006_deterministic_receipt_verification.sql # Payment settings table, reference hashes, forensics
 ├── server/
 │   ├── admin/
 │   │   ├── auth.ts                         # Admin bcrypt auth & sessions
-│   │   └── routes.ts                       # Admin APIs (coupons, verification logs, signed screenshot URLs)
+│   │   └── routes.ts                       # Admin APIs (coupons, audit logs, payment settings)
 │   ├── config/
 │   │   └── eventConfig.ts                  # Zod config, 5-min session, AES-GCM key validation
 │   ├── db/
 │   │   └── client.ts                       # PostgreSQL pool & in-memory store
 │   ├── upi/
-│   │   ├── upiUri.ts                       # NPCI UPI URI generator (PhonePe, GPay, Paytm, Other UPI)
+│   │   ├── upiUri.ts                       # Canonical UPI URI generator (PhonePe, GPay, Paytm, FamPay, Other)
 │   │   ├── imageProcessor.ts               # Sharp sanitization, magic bytes, SHA256, dHash, Supabase Storage
-│   │   ├── localOcrAnalyzer.ts             # In-memory Sharp multi-variant & local Tesseract.js OCR engine
-│   │   ├── deterministicMatcher.ts         # Fail-closed comparison engine & reason codes
+│   │   ├── localOcrAnalyzer.ts             # Sharp multi-variant & local Tesseract.js OCR engine
+│   │   ├── deterministicReceiptVerifier.ts # Standalone 18-reason deterministic decision engine
+│   │   ├── deterministicMatcher.ts         # Deterministic matching & UTR cross-check
 │   │   └── automatedFinalizer.ts           # Concurrency-safe atomic coupon finalizer
 │   ├── utils/
 │   │   └── crypto.ts                       # AES-256-GCM authenticated encryption

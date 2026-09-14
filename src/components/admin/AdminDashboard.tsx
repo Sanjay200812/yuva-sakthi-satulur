@@ -23,7 +23,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   FileText,
-  Image as ImageIcon,
+  CreditCard,
 } from 'lucide-react';
 import { safeFetchJson } from '../../utils/api.ts';
 
@@ -34,7 +34,7 @@ interface AdminDashboardProps {
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLogout, onBackToSite }) => {
-  const [activeTab, setActiveTab] = useState<'applied_coupons' | 'verification_audit'>('applied_coupons');
+  const [activeTab, setActiveTab] = useState<'applied_coupons' | 'verification_audit' | 'payment_settings'>('applied_coupons');
   const [metrics, setMetrics] = useState<any>(null);
   const [coupons, setCoupons] = useState<any[]>([]);
   const [reviews, setReviews] = useState<any[]>([]);
@@ -45,11 +45,70 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, limit: 20, total: 0, totalPages: 1 });
 
+  // Payment Settings State
+  const [paymentSettings, setPaymentSettings] = useState<any>({
+    payeeUpiId: '7075920852@ybl',
+    payeeDisplayName: 'Yuva Shakti Youth Satulur',
+    couponPriceInr: 50,
+    paymentsEnabled: true,
+    maxQuantity: 20,
+    paymentSessionMinutes: 5,
+    sessionDurationLabel: '5 Minutes — Security Rule',
+  });
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+
   // Screenshot preview modal
   const [screenshotModal, setScreenshotModal] = useState<{ open: boolean; submissionId: string | null }>({
     open: false,
     submissionId: null,
   });
+
+  const fetchPaymentSettings = async () => {
+    setSettingsLoading(true);
+    setSettingsError(null);
+    try {
+      const json = await safeFetchJson<any>('/api/admin/payment-settings', { credentials: 'include' }, 'Payment settings');
+      if (json.success && json.data) {
+        setPaymentSettings(json.data);
+      }
+    } catch (err: any) {
+      setSettingsError(err.message || 'Failed to load payment settings.');
+    } finally {
+      setSettingsLoading(false);
+    }
+  };
+
+  const handleSaveSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!paymentSettings) return;
+    setSettingsLoading(true);
+    setSettingsMessage(null);
+    setSettingsError(null);
+    try {
+      const json = await safeFetchJson<any>(
+        '/api/admin/payment-settings',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(paymentSettings),
+        },
+        'Save payment settings'
+      );
+      if (json.success) {
+        setSettingsMessage('Payment settings updated successfully.');
+        setTimeout(() => setSettingsMessage(null), 3500);
+      } else {
+        setSettingsError(json.error?.message || 'Failed to update settings.');
+      }
+    } catch (err: any) {
+      setSettingsError(err.message || 'Failed to update settings.');
+    } finally {
+      setSettingsLoading(false);
+    }
+  };
 
   const fetchMetrics = async () => {
     try {
@@ -108,8 +167,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
     fetchMetrics();
     if (activeTab === 'applied_coupons') {
       fetchCoupons();
-    } else {
+    } else if (activeTab === 'verification_audit') {
       fetchReviews();
+    } else if (activeTab === 'payment_settings') {
+      fetchPaymentSettings();
     }
   }, [activeTab, page, reviewFilter]);
 
@@ -264,6 +325,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
               <ShieldCheck className="w-4 h-4 text-amber-300" />
               <span>Verification &amp; Audit Logs</span>
             </button>
+
+            <button
+              onClick={() => {
+                setActiveTab('payment_settings');
+              }}
+              className={`px-4 py-2 rounded-xl font-bold text-xs sm:text-sm transition cursor-pointer flex items-center gap-2 ${
+                activeTab === 'payment_settings'
+                  ? 'bg-amber-500 text-slate-950 shadow-md'
+                  : 'text-slate-400 hover:text-white bg-slate-900'
+              }`}
+            >
+              <CreditCard className="w-4 h-4" />
+              <span>Payment Settings</span>
+            </button>
           </div>
 
           {activeTab === 'applied_coupons' && (
@@ -400,7 +475,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                                 rel="noopener noreferrer"
                                 title="Download PNG"
                               >
-                                <ImageIcon className="w-3 h-3" />
+                                <FileText className="w-3 h-3" />
                                 <span>PNG</span>
                               </a>
                               <a
@@ -410,7 +485,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                                 rel="noopener noreferrer"
                                 title="Download JPG"
                               >
-                                <ImageIcon className="w-3 h-3" />
+                                <FileText className="w-3 h-3" />
                                 <span>JPG</span>
                               </a>
                             </div>
@@ -464,7 +539,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                   <div className="flex items-center gap-2">
                     <span className="text-slate-400 text-[11px]">Verification Engine:</span>
                     <span className="px-2 py-0.5 rounded font-mono text-[10px] font-bold uppercase border bg-emerald-950/80 text-emerald-400 border-emerald-500/40">
-                      CODE OCR (Tesseract.js)
+                      LOCAL DETERMINISTIC OCR (Tesseract.js)
                     </span>
                   </div>
                 </div>
@@ -517,7 +592,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                       <th className="p-3 sm:p-4">Booking &amp; Time</th>
                       <th className="p-3 sm:p-4">Applicant</th>
                       <th className="p-3 sm:p-4">Expected ₹ / App</th>
-                      <th className="p-3 sm:p-4">Payer RRN / Screenshot</th>
+                      <th className="p-3 sm:p-4">Payer UTR / Screenshot</th>
                       <th className="p-3 sm:p-4">Extracted OCR Data</th>
                       <th className="p-3 sm:p-4">Verification</th>
                     </tr>
@@ -571,9 +646,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                             </td>
 
                             <td className="p-3 sm:p-4 font-mono">
-                              <span className="font-bold text-amber-300 bg-slate-900 px-2 py-1 rounded border border-purple-500/20 inline-block text-[11px]">
-                                {r.utrMasked}
-                              </span>
+                              <div className="space-y-1">
+                                <div>
+                                  <span className="text-[9px] text-slate-400 block uppercase">Entered UTR:</span>
+                                  <span className="font-bold text-amber-300 bg-slate-900 px-2 py-0.5 rounded border border-purple-500/20 inline-block text-[11px]">
+                                    {r.enteredReferenceMasked || r.utrMasked || 'N/A'}
+                                  </span>
+                                </div>
+                                {r.extractedReferenceMasked && (
+                                  <div>
+                                    <span className="text-[9px] text-slate-400 block uppercase">OCR UTR:</span>
+                                    <span className="font-mono text-emerald-400 bg-slate-900 px-2 py-0.5 rounded border border-emerald-500/20 inline-block text-[11px]">
+                                      {r.extractedReferenceMasked}
+                                    </span>
+                                  </div>
+                                )}
+                                {r.originalFilename && (
+                                  <div className="text-[10px] text-slate-400 truncate max-w-[140px]" title={r.originalFilename}>
+                                    📄 {r.originalFilename}
+                                  </div>
+                                )}
+                              </div>
                               {r.hasScreenshot && (
                                 <button
                                   type="button"
@@ -668,6 +761,140 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                 </table>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* 3. Payment Settings Screen (Section 4 & 52) */}
+        {activeTab === 'payment_settings' && (
+          <div className="max-w-2xl mx-auto space-y-6">
+            <div className="p-4 rounded-2xl bg-[#0D132D] border border-purple-500/20 flex items-start gap-3">
+              <CreditCard className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="text-xs text-slate-300 space-y-1">
+                <p className="font-bold text-white text-sm">Direct UPI Gateway &amp; Event Settings</p>
+                <p>
+                  Configure server-authoritative receiver details, coupon prices, and booking limits.
+                  All payment links, dynamic QR codes, and verification engines strictly use these settings.
+                </p>
+              </div>
+            </div>
+
+            {settingsMessage && (
+              <div className="p-3 rounded-xl bg-emerald-950/80 border border-emerald-500/50 text-emerald-200 text-xs flex items-center gap-2">
+                <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>{settingsMessage}</span>
+              </div>
+            )}
+
+            {settingsError && (
+              <div className="p-3 rounded-xl bg-red-950/80 border border-red-500/50 text-red-200 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                <span>{settingsError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSaveSettings} className="p-6 rounded-2xl bg-[#0D132D] border border-purple-500/20 space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  Authoritative Payee UPI ID (VPA) <span className="text-amber-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. 7075920852@ybl"
+                  value={paymentSettings?.payeeUpiId || ''}
+                  onChange={(e) => setPaymentSettings({ ...paymentSettings, payeeUpiId: e.target.value.trim() })}
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                />
+                <p className="text-[10px] text-slate-400">
+                  Every QR code and app intent drives funds directly into this UPI ID.
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  Business / Payee Display Name <span className="text-amber-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Yuva Shakti Youth Satulur"
+                  value={paymentSettings?.payeeDisplayName || ''}
+                  onChange={(e) => setPaymentSettings({ ...paymentSettings, payeeDisplayName: e.target.value })}
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 text-white text-sm focus:outline-none focus:border-amber-400"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-300 block">
+                    Authoritative Coupon Price (₹) <span className="text-amber-400">*</span>
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    required
+                    value={paymentSettings?.couponPriceInr || 50}
+                    onChange={(e) => setPaymentSettings({ ...paymentSettings, couponPriceInr: Number(e.target.value) })}
+                    className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                  />
+                  <p className="text-[10px] text-slate-400">Server stores this as paise (₹50 = 5000 paise).</p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-300 block">
+                    Maximum Coupons Per Booking
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    required
+                    value={paymentSettings?.maxQuantity || 20}
+                    onChange={(e) => setPaymentSettings({ ...paymentSettings, maxQuantity: Number(e.target.value) })}
+                    className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 text-white font-mono text-sm focus:outline-none focus:border-amber-400"
+                  />
+                </div>
+              </div>
+
+              {/* PAYMENT SESSION DURATION: LOCKED TO 5 MINUTES */}
+              <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-amber-300">Payment Session Duration</span>
+                  <span className="px-2.5 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-300 font-mono text-[11px] font-bold">
+                    5 Minutes — Security Rule
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-snug">
+                  This duration is strictly locked to <strong>5 minutes</strong> across all environments to prevent payment session replay and stale amount attacks. Admin cannot alter this rule.
+                </p>
+              </div>
+
+              {/* Payments Enabled Toggle */}
+              <div className="p-3 rounded-xl bg-slate-950 border border-purple-500/20 flex items-center justify-between">
+                <div>
+                  <span className="text-xs font-semibold text-white block">Payments Enabled</span>
+                  <span className="text-[10px] text-slate-400">Allow customers to create new bookings and pay via UPI.</span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={paymentSettings?.paymentsEnabled ?? true}
+                  onChange={(e) => setPaymentSettings({ ...paymentSettings, paymentsEnabled: e.target.checked })}
+                  className="w-5 h-5 rounded border-purple-500 text-amber-500 focus:ring-0 cursor-pointer"
+                />
+              </div>
+
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  disabled={settingsLoading}
+                  className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-slate-950 font-bold text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {settingsLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                  <span>Save Payment Settings</span>
+                </button>
+              </div>
+            </form>
           </div>
         )}
       </main>

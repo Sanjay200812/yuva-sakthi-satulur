@@ -46,32 +46,41 @@ interface BookingModalProps {
 }
 
 type ModalStep = 'details' | 'payment' | 'proof' | 'status';
-type UpiAppChoice = 'phonepe' | 'google_pay' | 'paytm' | 'other_upi';
+type UpiAppChoice = 'phonepe' | 'google_pay' | 'paytm' | 'fampay' | 'other_upi';
 
 const UPI_APPS: { id: UpiAppChoice; label: string; appName: string; color: string }[] = [
   { id: 'phonepe', label: 'PhonePe', appName: 'PhonePe', color: 'bg-purple-900/60 border-purple-500' },
   { id: 'google_pay', label: 'Google Pay', appName: 'Google Pay', color: 'bg-blue-900/60 border-blue-500' },
   { id: 'paytm', label: 'Paytm', appName: 'Paytm', color: 'bg-cyan-900/60 border-cyan-500' },
+  { id: 'fampay', label: 'FamPay', appName: 'FamPay', color: 'bg-amber-900/60 border-amber-500' },
   { id: 'other_upi', label: 'Other UPI Apps', appName: 'UPI App', color: 'bg-emerald-900/60 border-emerald-500' },
 ];
 
 const REASON_MESSAGES: Record<string, string> = {
-  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
-  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
+  INVALID_SCREENSHOT_FORMAT: 'Invalid screenshot format. Only PNG, JPEG, or WebP images are accepted.',
+  OCR_UNREADABLE: "We couldn't clearly read this payment receipt. Please upload the detailed payment confirmation screen showing amount, payment status and transaction reference.",
+  OCR_PROCESSING_ERROR: "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.",
+  MISSING_TRANSACTION_REFERENCE: 'Please enter your UTR / Transaction ID to verify payment.',
+  REFERENCE_NOT_READABLE: "We couldn't clearly read the transaction reference from this receipt. Please upload the detailed payment receipt.",
+  TRANSACTION_REFERENCE_MISMATCH: 'The entered UTR does not match the transaction reference shown in the receipt.',
+  INVALID_TRANSACTION_REFERENCE: 'The transaction reference appears invalid. Please check your UTR and upload a clearer receipt.',
+  DUPLICATE_TRANSACTION_REFERENCE: 'This transaction reference has already been used.',
+  MISSING_AMOUNT: 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.',
+  AMOUNT_MISMATCH: 'The payment amount is different from the required booking total.',
+  STATUS_NOT_SUCCESS: 'The uploaded receipt shows the transaction as pending or failed.',
+  DUPLICATE_SCREENSHOT: 'This screenshot has already been submitted for another booking.',
+  WRONG_PAYEE: 'The payment recipient does not match the configured receiver.',
+  TRANSACTION_TIME_MISMATCH: 'Transaction timestamp on the receipt does not match this booking session.',
+  AI_GENERATOR_WATERMARK: 'AI generator watermark detected on the uploaded image. Please upload an authentic payment receipt.',
+  SUSPICIOUS_FILENAME: 'Suspicious receipt file detected. Please upload an authentic screenshot from your UPI app.',
+  SCREENSHOT_SECURITY_RISK: 'Screenshot security check failed. Please upload a genuine receipt.',
+  PAYMENT_SESSION_EXPIRED: 'Your 5-minute payment session has expired. Start a new booking.',
+  // Fallback aliases
+  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt.",
+  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt.",
   DUPLICATE_PAYMENT_REFERENCE: 'This payment receipt has already been used.',
   DUPLICATE_RRN: 'This payment receipt has already been used.',
-  DUPLICATE_UTR: 'This payment receipt has already been used.',
-  INVALID_PAYMENT_REFERENCE: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
-  INVALID_RRN: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
-  MISSING_AMOUNT: 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.',
-  AMOUNT_MISMATCH: 'Payment amount does not match authoritative booking total.',
-  STATUS_NOT_SUCCESS: 'Payment is not shown as successful.',
-  DUPLICATE_SCREENSHOT: 'This payment screenshot has already been submitted for another booking.',
-  TRANSACTION_TIME_MISMATCH: 'Transaction timestamp on the receipt does not match this booking session.',
-  OCR_UNREADABLE: "We couldn't clearly read this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
-  OCR_PROCESSING_ERROR: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
-  PAYMENT_SESSION_EXPIRED: 'Your 5-minute payment session has expired. Start a new booking.',
-  WRONG_PAYEE: 'The payment recipient shown does not match Yuva Shakti Youth Satulur.',
+  DUPLICATE_UTR: 'This transaction reference has already been used.',
   INVALID_PAYMENT_SCREEN: 'The uploaded image does not appear to be a valid UPI payment confirmation screen.',
 };
 
@@ -98,9 +107,12 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
   const [isExpired, setIsExpired] = useState<boolean>(false);
 
-  // Proof form state
+  // Proof form state: TWO MANDATORY INPUTS (UTR + Screenshot)
+  const [enteredUtr, setEnteredUtr] = useState<string>('');
   const [screenshotBase64, setScreenshotBase64] = useState<string | null>(null);
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null);
+  const [originalFilename, setOriginalFilename] = useState<string>('');
+  const [originalMimeType, setOriginalMimeType] = useState<string>('');
   const [consentGiven, setConsentGiven] = useState<boolean>(true);
   const [copiedUpi, setCopiedUpi] = useState<boolean>(false);
 
@@ -175,8 +187,11 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     setBookingData(null);
     setStep('details');
     setErrorMessage(null);
+    setEnteredUtr('');
     setScreenshotBase64(null);
     setScreenshotPreview(null);
+    setOriginalFilename('');
+    setOriginalMimeType('');
     setIsExpired(false);
     setRemainingSeconds(null);
   };
@@ -230,6 +245,9 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       return;
     }
 
+    setOriginalFilename(file.name);
+    setOriginalMimeType(file.type);
+
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
@@ -241,6 +259,10 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
   const handleBookingConfirmed = (confirmed: any) => {
     const coupons = confirmed.coupons || [];
+    const normalizedEntered = enteredUtr.trim().replace(/\s+/g, '').toUpperCase();
+    const maskedRef = confirmed.transactionReferenceMasked
+      || (normalizedEntered.length >= 4 ? `********${normalizedEntered.slice(-4)}` : '********9012');
+
     const confirmedBooking: CouponBooking = {
       id: bookingData?.booking.publicId || confirmed.publicId,
       ticketNumbers: coupons.map((c: any) => c.coupon_number),
@@ -256,24 +278,19 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         minute: '2-digit',
       }),
       status: 'confirmed',
-      transactionRef: 'AUTOMATED_PROOF_VERIFIED',
+      transactionRef: maskedRef,
     };
 
     setConfirmedBookingData(confirmedBooking);
     setLiveStatus('payment_confirmed');
-    setStatusMessage(`Payment proof accepted! ${confirmedBooking.quantity} coupons generated.`);
-
-    setTimeout(() => {
-      onBookSuccess(confirmedBooking);
-      onClose();
-    }, 1200);
+    setStatusMessage(`Payment proof verified! ${confirmedBooking.quantity} coupons generated.`);
   };
 
   const handleManualRetry = async () => {
     if (!bookingData) return;
     setIsProcessing(true);
     setLiveStatus('analyzing');
-    setStatusMessage('Reading payment receipt...');
+    setStatusMessage('Reading Payment Receipt...');
 
     try {
       const res = await retryPaymentVerification({
@@ -288,7 +305,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
       if (res.status === 'ocr_processing_error') {
         setLiveStatus('ocr_processing_error');
-        setStatusMessage(res.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
+        setStatusMessage(res.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
       } else {
         setLiveStatus('verification_failed');
         const reason = (res as any).reasonCode || (res as any).reasons?.[0];
@@ -297,13 +314,13 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       }
     } catch (err: any) {
       setLiveStatus('ocr_processing_error');
-      setStatusMessage(err.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
+      setStatusMessage(err.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // 3. Submit Payment Proof (Screenshot + Consent, Automated OCR Reference Extraction)
+  // 3. Submit Payment Proof (Mandatory: Screenshot + UTR + Consent)
   const handleSubmitProof = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!bookingData) return;
@@ -313,8 +330,8 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       return;
     }
 
-    if (!consentGiven) {
-      alert('Please check the consent box to proceed with verification.');
+    if (!enteredUtr.trim()) {
+      alert('Please enter the UTR / Transaction ID from your payment receipt.');
       return;
     }
 
@@ -323,27 +340,36 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       return;
     }
 
+    if (!consentGiven) {
+      alert('Please check the consent box to proceed with verification.');
+      return;
+    }
+
     setIsProcessing(true);
     setErrorMessage(null);
     setStep('status');
     setLiveStatus('analyzing');
-    setStatusMessage('Reading payment receipt...');
+    setStatusMessage('Reading Payment Receipt...');
 
-    // Dynamic verification progress indicators
-    const progressStages = [
-      'Checking payment amount...',
-      'Checking transaction reference...',
-      'Checking payment status...',
-      'Checking duplicate transaction...',
-      'Finalizing coupon...',
+    // Exact 9 stages required by Master Prompt:
+    const verificationStages = [
+      'Reading Payment Receipt...',
+      'Checking Transaction Status...',
+      'Checking Amount...',
+      'Checking Transaction Reference...',
+      'Checking Receiver...',
+      'Checking Payment Time...',
+      'Checking Screenshot Security...',
+      'Checking Duplicate Transaction...',
+      'Finalizing Verification...',
     ];
     let stageIdx = 0;
     const progressTimer = setInterval(() => {
-      if (stageIdx < progressStages.length) {
-        setStatusMessage(progressStages[stageIdx]);
+      if (stageIdx < verificationStages.length) {
+        setStatusMessage(verificationStages[stageIdx]);
         stageIdx++;
       }
-    }, 700);
+    }, 450);
 
     try {
       const res = await submitPaymentProof({
@@ -353,6 +379,10 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         consentGiven,
         statusToken: bookingData.payment.statusToken,
         isRecovery: isExpired || false,
+        utr: enteredUtr.trim().toUpperCase(),
+        transactionReference: enteredUtr.trim().toUpperCase(),
+        originalFilename,
+        originalMimeType,
       });
 
       clearInterval(progressTimer);
@@ -364,7 +394,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
       if (res.status === 'ocr_processing_error') {
         setLiveStatus('ocr_processing_error');
-        setStatusMessage(res.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
+        setStatusMessage(res.message || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.");
         return;
       }
 
@@ -385,17 +415,13 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           if ((status === 'payment_confirmed' || status === 'proof_verified') && confirmed) {
             setConfirmedBookingData(confirmed);
             stopPolling();
-
-            setTimeout(() => {
-              onBookSuccess(confirmed);
-              onClose();
-            }, 1200);
           }
         },
         2500,
         bookingData.payment.statusToken
       );
     } catch (err: any) {
+      clearInterval(progressTimer);
       setLiveStatus('verification_failed');
       const errText = err.message || 'Payment proof verification failed.';
       setErrorMessage(errText);
@@ -815,7 +841,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </div>
         )}
 
-        {/* STEP 3: Mandatory Proof Form (Screenshot Upload & Automated Verification) */}
+        {/* STEP 3: Mandatory Proof Form (UTR / Transaction ID + Screenshot Upload) */}
         {step === 'proof' && bookingData && (
           <form onSubmit={handleSubmitProof} className="space-y-4">
             <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-purple-500/30 flex items-center justify-between text-xs">
@@ -830,29 +856,49 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             {/* Detailed Receipt Guidance */}
             <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/30 text-[11px] text-purple-200 space-y-1.5">
               <span className="font-semibold text-amber-300 block">
-                Upload the payment details/receipt screenshot showing:
+                Verification Requirements (Two Mandatory Inputs):
               </span>
               <ul className="grid grid-cols-2 gap-1 text-[10.5px] text-slate-300 pl-1">
                 <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Payment Successful
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> 1. UTR / Transaction ID
                 </li>
                 <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Amount (₹{bookingData.payment.amountInr})
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> 2. Payment Screenshot
                 </li>
                 <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Receiver
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Exact Amount: ₹{bookingData.payment.amountInr}
                 </li>
                 <li className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Transaction / UPI Ref No
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Status: Successful
                 </li>
               </ul>
-              <p className="text-[10px] text-amber-300/90 pt-1 border-t border-purple-500/20 italic">
-                Tip: Open the completed payment and tap View Details / Transaction Details before taking the screenshot.
+            </div>
+
+            {/* MANDATORY INPUT 1: UTR / Transaction ID */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-200 block">
+                UTR / Transaction ID <span className="text-amber-400">*</span>
+              </label>
+              <input
+                type="text"
+                required
+                maxLength={36}
+                placeholder="e.g. 123456789012"
+                value={enteredUtr}
+                disabled={isProcessing}
+                onChange={(e) => setEnteredUtr(e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
+                className="w-full px-4 py-3 rounded-xl bg-slate-950 border border-purple-500/40 focus:border-amber-400 outline-none text-white text-sm font-mono tracking-wider placeholder:text-slate-500"
+              />
+              <p className="text-[10.5px] text-slate-400 leading-tight">
+                Enter the 12-digit UPI RRN / UTR / Reference ID from your PhonePe, Google Pay, or Paytm receipt.
               </p>
             </div>
 
-            {/* Prominent Screenshot Upload Area */}
-            <div>
+            {/* MANDATORY INPUT 2: Payment Receipt Screenshot */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-200 block">
+                Payment Receipt Screenshot <span className="text-amber-400">*</span>
+              </label>
               <input
                 type="file"
                 ref={fileInputRef}
@@ -865,25 +911,25 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               {!screenshotPreview ? (
                 <div
                   onClick={() => !isProcessing && fileInputRef.current?.click()}
-                  className="border-2 border-dashed border-amber-400/50 hover:border-amber-400 rounded-2xl p-6 text-center cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 transition-all group shadow-[0_0_20px_rgba(245,158,11,0.08)]"
+                  className="border-2 border-dashed border-amber-400/50 hover:border-amber-400 rounded-2xl p-5 text-center cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 transition-all group shadow-[0_0_20px_rgba(245,158,11,0.08)]"
                 >
-                  <div className="w-12 h-12 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
-                    <Upload className="w-6 h-6 text-amber-400" />
+                  <div className="w-10 h-10 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-2 group-hover:scale-110 transition-transform">
+                    <Upload className="w-5 h-5 text-amber-400" />
                   </div>
-                  <span className="text-sm font-bold text-white block mb-1">
-                    Upload Payment Success Screenshot <span className="text-amber-400">*</span>
+                  <span className="text-xs font-bold text-white block mb-0.5">
+                    Upload Screenshot <span className="text-amber-400">*</span>
                   </span>
-                  <span className="text-xs text-slate-400 block mb-1">Tap to select receipt image from gallery</span>
-                  <span className="text-[10px] text-slate-500 font-mono">PNG, JPEG, or WebP up to 5MB</span>
+                  <span className="text-[11px] text-slate-400 block mb-0.5">Tap to select receipt image from gallery</span>
+                  <span className="text-[9.5px] text-slate-500 font-mono">PNG, JPEG, or WebP up to 5MB</span>
                 </div>
               ) : (
                 <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-500/60 bg-black/60 p-3 flex items-center justify-between shadow-lg">
                   <div className="flex items-center gap-3">
-                    <img src={screenshotPreview} alt="Receipt preview" className="w-16 h-16 object-cover rounded-xl border border-emerald-500/30" />
+                    <img src={screenshotPreview} alt="Receipt preview" className="w-14 h-14 object-cover rounded-xl border border-emerald-500/30" />
                     <div>
-                      <span className="text-xs font-bold text-white block">Screenshot Attached</span>
+                      <span className="text-xs font-bold text-white block truncate max-w-[200px]">{originalFilename || 'Receipt Screenshot'}</span>
                       <span className="text-[10px] text-emerald-400 font-medium flex items-center gap-1 mt-0.5">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Ready for automated verification
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Attached & ready
                       </span>
                     </div>
                   </div>
@@ -893,8 +939,10 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                     onClick={() => {
                       setScreenshotBase64(null);
                       setScreenshotPreview(null);
+                      setOriginalFilename('');
+                      setOriginalMimeType('');
                     }}
-                    className="p-2.5 text-slate-400 hover:text-red-400 hover:bg-slate-800/80 rounded-xl transition cursor-pointer"
+                    className="p-2 text-slate-400 hover:text-red-400 hover:bg-slate-800/80 rounded-xl transition cursor-pointer"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -929,17 +977,17 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isProcessing || !screenshotBase64 || !consentGiven}
+                disabled={isProcessing || !screenshotBase64 || !enteredUtr.trim() || !consentGiven}
                 className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Verifying Proof...</span>
+                    <span>Verifying...</span>
                   </>
                 ) : (
                   <>
-                    <span>Submit Proof for Verification</span>
+                    <span>VERIFY PAYMENT</span>
                     <ArrowRight className="w-4 h-4" />
                   </>
                 )}
@@ -948,19 +996,102 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </form>
         )}
 
-        {/* STEP 4: Live Verification & Coupon Ready Status */}
+        {/* STEP 4: Live Verification & Customer Success / Failure Status */}
         {step === 'status' && (
-          <div className="space-y-4 text-center py-4">
+          <div className="space-y-4 text-center py-3">
             {liveStatus === 'payment_confirmed' || liveStatus === 'proof_verified' ? (
-              <div className="space-y-3">
-                <div className="w-16 h-16 mx-auto rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center text-emerald-400 animate-bounce">
+              <div className="space-y-3.5">
+                <div className="w-16 h-16 mx-auto rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center text-emerald-400 animate-bounce shadow-[0_0_25px_rgba(16,185,129,0.4)]">
                   <CheckCircle2 className="w-9 h-9" />
                 </div>
-                <h4 className="text-xl font-black text-white font-display">Payment Proof Verified!</h4>
-                <p className="text-sm text-emerald-300 font-bold">
-                  Payment proof verified successfully. {bookingData?.booking.quantity || 1} {bookingData?.booking.quantity === 1 ? 'coupon' : 'coupons'} generated!
-                </p>
-                <p className="text-xs text-slate-400">Opening your tickets...</p>
+                <div>
+                  <h4 className="text-xl font-black text-white font-display tracking-tight">
+                    PAYMENT PROOF VERIFIED
+                  </h4>
+                  <p className="text-base text-emerald-400 font-bold font-mono mt-0.5">
+                    ₹{bookingData?.payment.amountInr} Verified
+                  </p>
+                </div>
+
+                <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 space-y-1 text-xs">
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span>Transaction Reference:</span>
+                    <span className="font-mono text-white font-bold">
+                      {confirmedBookingData?.transactionRef || (enteredUtr ? `********${enteredUtr.slice(-4)}` : '********9012')}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span>Generated Coupons:</span>
+                    <span className="font-bold text-amber-300">
+                      {confirmedBookingData?.quantity || bookingData?.booking.quantity || 1} Coupons Generated Successfully
+                    </span>
+                  </div>
+                </div>
+
+                {/* Download and View Buttons */}
+                <div className="space-y-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirmedBookingData) {
+                        onBookSuccess(confirmedBookingData);
+                        onClose();
+                      }
+                    }}
+                    className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-400 to-yellow-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg cursor-pointer flex items-center justify-center gap-2 transition"
+                  >
+                    <Ticket className="w-4 h-4" />
+                    <span>VIEW COUPONS</span>
+                  </button>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <a
+                      href={
+                        confirmedBookingData?.ticketNumbers?.[0]
+                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=pdf`
+                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                    >
+                      <span>PDF</span>
+                    </a>
+                    <a
+                      href={
+                        confirmedBookingData?.ticketNumbers?.[0]
+                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=png`
+                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                    >
+                      <span>PNG</span>
+                    </a>
+                    <a
+                      href={
+                        confirmedBookingData?.ticketNumbers?.[0]
+                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=jpeg`
+                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                    >
+                      <span>JPEG</span>
+                    </a>
+                  </div>
+
+                  <a
+                    href={`/api/bookings/${bookingData?.booking.publicId}/download-all`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full py-2.5 rounded-xl bg-purple-950/70 hover:bg-purple-900/80 border border-purple-500/40 text-purple-200 text-[11px] font-bold uppercase tracking-wider block text-center cursor-pointer transition"
+                  >
+                    DOWNLOAD ALL / ZIP
+                  </a>
+                </div>
               </div>
             ) : liveStatus === 'ocr_processing_error' ? (
               <div className="space-y-3">
@@ -969,7 +1100,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                 </div>
                 <h4 className="text-xl font-black text-white font-display">Receipt Processing Notice</h4>
                 <p className="text-xs text-amber-300 font-medium max-w-sm mx-auto">
-                  {statusMessage || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification."}
+                  {statusMessage || "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment."}
                 </p>
                 <div className="pt-2">
                   <button
@@ -979,7 +1110,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                     className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 text-xs font-bold font-display uppercase tracking-wider shadow cursor-pointer flex items-center justify-center gap-2 mx-auto disabled:opacity-50"
                   >
                     {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
-                    <span>Retry Verification</span>
+                    <span>RETRY VERIFICATION</span>
                   </button>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 text-[11px] text-slate-400 font-mono">

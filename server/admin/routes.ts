@@ -390,15 +390,21 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
         amountInr: (s.expected_amount_paise || 5000) / 100,
         selectedApp: s.selected_upi_app,
         paymentReference: s.payment_reference,
-        utrMasked: s.payer_utr_hash ? `UTR-${s.payer_utr_hash.slice(0, 8)}...` : 'Unknown',
+        utrMasked: s.entered_reference_hash ? `UTR-***${s.entered_reference_hash.slice(-4)}` : (s.payer_utr_hash ? `UTR-${s.payer_utr_hash.slice(0, 8)}...` : 'Unknown'),
+        enteredReferenceMasked: s.entered_reference_hash ? `********${s.entered_reference_hash.slice(-4)}` : (s.payer_utr_hash ? `********${s.payer_utr_hash.slice(-4)}` : 'N/A'),
+        extractedReferenceMasked: s.extracted_reference_hash ? `********${s.extracted_reference_hash.slice(-4)}` : (s.payer_utr_hash ? `********${s.payer_utr_hash.slice(-4)}` : 'N/A'),
+        originalFilename: s.original_filename || null,
+        ocrStatus: s.extracted_status || (parseJson(s.ocr_extraction)?.paymentStatus) || 'unknown',
+        ocrAmount: s.extracted_amount_paise ? s.extracted_amount_paise / 100 : (parseJson(s.ocr_extraction)?.amount || null),
         status: s.status,
         riskScore: s.risk_score || 0,
-        reasonCodes: s.reason_codes || [],
+        reasonCodes: s.verification_reason_codes && s.verification_reason_codes.length > 0 ? s.verification_reason_codes : (s.reason_codes || []),
         ocrExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
         geminiExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
         ocrEngine: s.ocr_engine || 'tesseract.js',
         extractedTransactionTimestamp: s.extracted_transaction_timestamp,
-        deterministicComparison: parseJson(s.deterministic_comparison),
+        deterministicComparison: parseJson(s.verification_result || s.deterministic_comparison),
+        verificationResult: parseJson(s.verification_result || s.deterministic_comparison),
         hasScreenshot: !!s.screenshot_storage_path,
         adminReviewerId: s.admin_reviewer_id,
         adminReviewNote: s.admin_review_note,
@@ -572,6 +578,89 @@ router.get('/bookings/:publicId', requireAdminAuth, async (req: Request, res: Re
     });
   } catch (error: any) {
     res.status(500).json({ success: false, error: { message: error.message } });
+  }
+});
+
+// 16. Admin Payment Settings (Section 4 & 52 of Master Implementation Prompt)
+router.get('/payment-settings', requireAdminAuth, async (_req: Request, res: Response) => {
+  try {
+    const result = await db.query('SELECT * FROM payment_settings LIMIT 1');
+    const settings = result.rows[0] || {
+      payee_upi_id: config.PAYEE_UPI_ID || '7075920852@ybl',
+      payee_display_name: config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur',
+      coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5000,
+      payments_enabled: true,
+      max_quantity: config.EVENT_MAX_COUPONS_PER_BOOKING || 20,
+      payment_session_minutes: 5,
+    };
+
+    res.json({
+      success: true,
+      data: {
+        payeeUpiId: settings.payee_upi_id,
+        payeeDisplayName: settings.payee_display_name,
+        couponPricePaise: settings.coupon_price_paise,
+        couponPriceInr: settings.coupon_price_paise / 100,
+        paymentsEnabled: settings.payments_enabled,
+        maxQuantity: settings.max_quantity,
+        paymentSessionMinutes: 5, // Strictly locked to 5 minutes
+        sessionDurationLabel: '5 Minutes — Security Rule',
+        updatedAt: settings.updated_at,
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: { message: 'Failed to fetch payment settings.' } });
+  }
+});
+
+router.put('/payment-settings', requireAdminAuth, async (req: Request, res: Response) => {
+  try {
+    const { payeeUpiId, payeeDisplayName, couponPriceInr, paymentsEnabled, maxQuantity } = req.body;
+
+    // Validate payee UPI ID
+    if (payeeUpiId && !/^[a-zA-Z0-9._\-]{2,256}@[a-zA-Z]{2,64}$/.test(payeeUpiId.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_UPI_ID', message: 'Invalid UPI VPA format. Example: 7075920852@ybl' },
+      });
+    }
+
+    const cleanUpi = payeeUpiId ? payeeUpiId.trim() : config.PAYEE_UPI_ID;
+    const cleanName = payeeDisplayName ? payeeDisplayName.trim() : config.PAYEE_DISPLAY_NAME;
+    const cleanPrice = couponPriceInr ? Math.round(Number(couponPriceInr) * 100) : 5000;
+    const cleanEnabled = paymentsEnabled !== undefined ? Boolean(paymentsEnabled) : true;
+    const cleanMaxQty = maxQuantity ? Math.min(Math.max(1, parseInt(maxQuantity, 10)), 100) : 20;
+    const adminUser = (req as any).adminUser;
+
+    await db.query(
+      `UPDATE payment_settings SET
+        payee_upi_id = $1,
+        payee_display_name = $2,
+        coupon_price_paise = $3,
+        payments_enabled = $4,
+        max_quantity = $5,
+        payment_session_minutes = 5,
+        updated_at = $6,
+        updated_by = $7`,
+      [cleanUpi, cleanName, cleanPrice, cleanEnabled, cleanMaxQty, new Date().toISOString(), adminUser?.id || null]
+    );
+
+    res.json({
+      success: true,
+      message: 'Payment settings updated successfully.',
+      data: {
+        payeeUpiId: cleanUpi,
+        payeeDisplayName: cleanName,
+        couponPricePaise: cleanPrice,
+        couponPriceInr: cleanPrice / 100,
+        paymentsEnabled: cleanEnabled,
+        maxQuantity: cleanMaxQty,
+        paymentSessionMinutes: 5,
+        sessionDurationLabel: '5 Minutes — Security Rule',
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: { message: 'Failed to update payment settings.' } });
   }
 });
 

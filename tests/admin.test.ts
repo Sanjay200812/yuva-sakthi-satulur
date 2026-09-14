@@ -263,6 +263,45 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       // Cookie is either expired or emptied
       expect(rawCookie).toMatch(/admin_session=;.*(expires=|max-age=0)/i);
     });
+
+    it('Section 4 & 52: fetches payment settings with locked 5-minute session rule', async () => {
+      const res = await request(app)
+        .get('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.paymentSessionMinutes).toBe(5);
+      expect(res.body.data.sessionDurationLabel).toBe('5 Minutes — Security Rule');
+      expect(res.body.data.payeeUpiId).toBe('7075920852@ybl');
+    });
+
+    it('Section 4 & 52: updates payment settings and preserves 5-minute locked session duration', async () => {
+      // 1. Invalid UPI ID is rejected
+      const invalidRes = await request(app)
+        .put('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ payeeUpiId: 'invalid-vpa-no-handle' });
+
+      expect(invalidRes.status).toBe(400);
+      expect(invalidRes.body.error?.code).toBe('INVALID_UPI_ID');
+
+      // 2. Valid settings update
+      const validRes = await request(app)
+        .put('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          payeeUpiId: '7075920852@ybl',
+          payeeDisplayName: 'Yuva Shakti Youth Satulur',
+          couponPriceInr: 50,
+          paymentsEnabled: true,
+          maxQuantity: 20,
+        });
+
+      expect(validRes.status).toBe(200);
+      expect(validRes.body.success).toBe(true);
+      expect(validRes.body.data.paymentSessionMinutes).toBe(5);
+    });
   });
 });
 

@@ -278,7 +278,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
     expect(res.body.error.reasonCodes).toContain('MISSING_PAYMENT_REFERENCE');
-    expect(res.body.error.message).toContain("We couldn't clearly read the transaction reference from this screenshot");
+    expect(res.body.error.message).toContain("We couldn't clearly read the transaction reference");
   });
 
   it('rejects duplicate extracted RRN across different bookings', async () => {
@@ -360,7 +360,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     expect(res2.status).toBe(400);
     expect(res2.body.error.reasonCodes).toContain('DUPLICATE_PAYMENT_REFERENCE');
-    expect(res2.body.error.message).toContain('This payment receipt has already been used');
+    expect(res2.body.error.message).toMatch(/This (?:transaction reference|payment receipt) has already been used/);
   });
 
   it('rejects payment when screenshot amount does not match server-calculated total', async () => {
@@ -402,7 +402,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     expect(res.status).toBe(400);
     expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
-    expect(res.body.error.message).toContain('Payment amount');
+    expect(res.body.error.message.toLowerCase()).toContain('payment amount');
   });
 
   it('deterministic comparison fails when OCR amount or OCR RRN is missing', () => {
@@ -921,7 +921,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
         transactionId: 'TXN-REC-1',
         transactionDate: null,
         transactionTime: null,
-        transactionTimestamp: new Date().toISOString(),
+        transactionTimestamp: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
         payeeName: config.PAYEE_DISPLAY_NAME,
         payeeUpiId: config.PAYEE_UPI_ID,
         payerName: 'Real Paid User',
@@ -1553,7 +1553,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
         expect(res.status).toBe(400);
         expect(res.body.error.reasonCodes).toContain('OCR_UNREADABLE');
-        expect(res.body.error.message).toContain("We couldn't clearly read this screenshot");
+        expect(res.body.error.message).toContain("We couldn't clearly read");
       });
 
       it('Scenario 11: OCR engine crash -> ocr_processing_error (NOT payment rejection)', async () => {
@@ -1761,6 +1761,268 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
         const coupons = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
         expect(coupons.rows.length).toBe(2);
       });
+    });
+  });
+
+  describe('Master Implementation Prompt Scenarios (Sections 60–75)', () => {
+    beforeEach(() => {
+      setMockOcrResult(null);
+      setMockOcrText(null);
+    });
+
+    function getValidTestTimestampText(): string {
+      const d = new Date();
+      const day = d.getDate();
+      const month = d.toLocaleString('en-US', { month: 'short' });
+      const year = d.getFullYear();
+      const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+      return `${day} ${month} ${year}, ${timeStr}`;
+    }
+
+    it('Section 61: Test — PhonePe OCR fixture extracts status, ₹50, and 12-digit UTR', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'PhonePe Participant', phone: '9988776655', village: 'Satulur', quantity: 1, selectedApp: 'phonepe' });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(201);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900156789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900156789012',
+          originalFilename: 'PhonePe_Receipt_01.jpg',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.status).toBe('payment_confirmed');
+      expect(res.body.data.coupons.length).toBe(1);
+    });
+
+    it('Section 62: Test — Quantity 2: amount mismatch fails with AMOUNT_MISMATCH', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Quantity Two User', phone: '9988776654', village: 'Satulur', quantity: 2 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(202);
+
+      // Receipt only shows ₹50 instead of expected ₹100
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900256789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900256789012',
+          originalFilename: 'Receipt_50.jpg',
+        });
+
+      expect(res.body.data.status).toBe('payment_rejected');
+      expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
+    });
+
+    it('Section 63: Test — Entered UTR does not match screenshot UTR -> TRANSACTION_REFERENCE_MISMATCH', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Mismatch UTR User', phone: '9988776653', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(203);
+
+      // Screenshot has 900356789099, user entered 900356789012
+      setMockOcrText(
+        'Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900356789099\n15 Sep 2026, 1:25 AM'
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900356789012',
+          originalFilename: 'screenshot.png',
+        });
+
+      expect(res.body.data.status).toBe('payment_rejected');
+      expect(res.body.error.reasonCodes).toContain('TRANSACTION_REFERENCE_MISMATCH');
+    });
+
+    it('Section 64: Test — Duplicate transaction reference is blocked', async () => {
+      // Booking A confirms with reference 900456789012
+      const b1 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'User A', phone: '9988776652', village: 'Satulur', quantity: 1 });
+      const imgA = await createValidScreenshotBase64(204);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900456789012\n${getValidTestTimestampText()}`
+      );
+
+      const res1 = await request(app)
+        .post(`/api/bookings/${b1.body.data.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b1.body.data.payment.statusToken}`)
+        .send({
+          screenshotBase64: imgA,
+          consentGiven: true,
+          utr: '900456789012',
+          originalFilename: 'proofA.jpg',
+        });
+      expect(res1.body.data.status).toBe('payment_confirmed');
+
+      // Booking B attempts to reuse the same UTR
+      const b2 = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'User B', phone: '9988776651', village: 'Satulur', quantity: 1 });
+      const imgB = await createValidScreenshotBase64(205);
+
+      const res2 = await request(app)
+        .post(`/api/bookings/${b2.body.data.booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${b2.body.data.payment.statusToken}`)
+        .send({
+          screenshotBase64: imgB,
+          consentGiven: true,
+          utr: '900456789012',
+          originalFilename: 'proofB.jpg',
+        });
+
+      expect(res2.body.data.status).toBe('payment_rejected');
+      expect(res2.body.error.reasonCodes).toContain('DUPLICATE_TRANSACTION_REFERENCE');
+    });
+
+    it('Section 66 & 67: Test — Payment status Pending or Failed is rejected with STATUS_NOT_SUCCESS', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Pending User', phone: '9988776650', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(206);
+
+      setMockOcrText(
+        `Payment Pending\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900556789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900556789012',
+          originalFilename: 'pending.png',
+        });
+
+      expect(res.body.data.status).toBe('payment_rejected');
+      expect(res.body.error.reasonCodes).toContain('STATUS_NOT_SUCCESS');
+    });
+
+    it('Section 68: Test — Clearly wrong full payee UPI fails with WRONG_PAYEE', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Wrong Payee User', phone: '9988776649', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(207);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nUPI ID: 9999999999@ybl\nUPI Ref No: 900656789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900656789012',
+          originalFilename: 'wrong_payee.png',
+        });
+
+      expect(res.body.data.status).toBe('payment_rejected');
+      expect(res.body.error.reasonCodes).toContain('WRONG_PAYEE');
+    });
+
+    it('Section 69: Test — Masked payee UPI (70****52@ybl) matches successfully', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Masked Payee User', phone: '9988776648', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(208);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nUPI ID: 70****52@ybl\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900756789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900756789012',
+          originalFilename: 'masked_receipt.jpg',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('payment_confirmed');
+    });
+
+    it('Section 70 & 71: Test — AI generator watermark is rejected with AI_GENERATOR_WATERMARK', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'Watermark User', phone: '9988776647', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(209);
+
+      setMockOcrText(
+        `Payment Successful\n₹50.00\nGenerated with Gemini\nUPI Ref No: 900856789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900856789012',
+          originalFilename: 'gemini-generated-receipt.png',
+        });
+
+      expect(res.body.data.status).toBe('payment_rejected');
+      expect(res.body.error.reasonCodes).toContain('AI_GENERATOR_WATERMARK');
+    });
+
+    it('Section 70: Test — Normal file000.jpg and Google Pay branding must NOT be falsely rejected', async () => {
+      const bRes = await request(app)
+        .post('/api/bookings')
+        .send({ name: 'GPay User', phone: '9988776646', village: 'Satulur', quantity: 1 });
+      const { booking, payment } = bRes.body.data;
+      const validImg = await createValidScreenshotBase64(210);
+
+      setMockOcrText(
+        `Google Pay\nPayment Successful\n₹50.00\nPaid to Yuva Shakti Youth Satulur\nUPI transaction ID: 900956789012\n${getValidTestTimestampText()}`
+      );
+
+      const res = await request(app)
+        .post(`/api/bookings/${booking.publicId}/payment-proof`)
+        .set('Authorization', `Bearer ${payment.statusToken}`)
+        .send({
+          screenshotBase64: validImg,
+          consentGiven: true,
+          utr: '900956789012',
+          originalFilename: 'file000.jpg',
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data.status).toBe('payment_confirmed');
     });
   });
 });

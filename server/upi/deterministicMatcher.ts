@@ -124,12 +124,19 @@ export function performDeterministicOcrComparison(input: OcrMatchInput): OcrMatc
   // 4. Duplicate checks (Database Uniqueness of extracted reference & image hash)
   if (input.isDuplicateUtr) {
     reasonCodes.push('DUPLICATE_PAYMENT_REFERENCE');
+    reasonCodes.push('DUPLICATE_TRANSACTION_REFERENCE');
     riskScore += 100;
   }
 
   if (input.isDuplicateScreenshot) {
     reasonCodes.push('DUPLICATE_SCREENSHOT');
     riskScore += 90;
+  }
+
+  // 4b. AI Generator Watermark Check
+  if (analysis.warnings?.includes('AI_GENERATOR_WATERMARK')) {
+    reasonCodes.push('AI_GENERATOR_WATERMARK');
+    riskScore += 100;
   }
 
   // 5. Visible Payment Status
@@ -151,11 +158,12 @@ export function performDeterministicOcrComparison(input: OcrMatchInput): OcrMatc
     details.statusMatched = false;
   }
 
-  // 6. Extracted RRN Validation (Directly from Screenshot OCR)
+  // 6. Extracted RRN Validation & Entered UTR Cross-Check
   if (!analysis.utrOrRrn) {
     if (!isUnreadable) {
       reasonCodes.push('MISSING_PAYMENT_REFERENCE');
       reasonCodes.push('MISSING_RRN');
+      reasonCodes.push('REFERENCE_NOT_READABLE');
       riskScore += 80;
     }
     details.utrMatched = false;
@@ -167,6 +175,16 @@ export function performDeterministicOcrComparison(input: OcrMatchInput): OcrMatc
       details.utrMatched = false;
     } else {
       details.utrMatched = true;
+    }
+
+    // Cross-check with entered UTR if supplied
+    if (input.enteredUtr) {
+      const normalizedEntered = normalizeUtr(input.enteredUtr);
+      if (normalizedEntered && normalizedEntered !== normalizedExtRrn) {
+        reasonCodes.push('TRANSACTION_REFERENCE_MISMATCH');
+        details.utrMatched = false;
+        riskScore += 80;
+      }
     }
   }
 

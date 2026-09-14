@@ -14,6 +14,32 @@ export interface ProcessedImageResult {
   byteSize: number;
   width: number;
   height: number;
+  originalFilename?: string;
+  originalMime?: string;
+  detectedMime?: string;
+  isSuspiciousFilename?: boolean;
+}
+
+/**
+ * Checks if the current execution context is a production/serverless environment.
+ */
+export function isProductionEnvironment(): boolean {
+  return (
+    config.NODE_ENV === 'production' ||
+    process.env.VERCEL === '1' ||
+    process.env.VERCEL_ENV === 'production'
+  );
+}
+
+/**
+ * Checks if a filename contains explicit AI generator signatures.
+ * Does NOT flag generic filenames such as file000.jpg, IMG_2026.jpg, screenshot.png.
+ */
+export function checkSuspiciousFilename(filename?: string): boolean {
+  if (!filename || typeof filename !== 'string') return false;
+  const lower = filename.toLowerCase();
+  const suspiciousRegex = /(?:chatgpt|openai[-_]generated|gemini[-_]generated|dall[-_]?e|midjourney|firefly|ai[-_]generated)/i;
+  return suspiciousRegex.test(lower);
 }
 
 /**
@@ -370,7 +396,9 @@ export async function downloadPaymentScreenshot(storagePath: string): Promise<{ 
  */
 export async function processPaymentScreenshot(
   rawBuffer: Buffer,
-  bookingId: string
+  bookingId: string,
+  originalFilename?: string,
+  originalMimeType?: string
 ): Promise<ProcessedImageResult> {
   // 1. Size check
   if (rawBuffer.length > config.PAYMENT_SCREENSHOT_MAX_BYTES) {
@@ -431,7 +459,7 @@ export async function processPaymentScreenshot(
     storagePath = `supabase:${objectPath}`;
   } else {
     // In production, NEVER fall back to /var/task or process.cwd()
-    if (config.NODE_ENV === 'production') {
+    if (isProductionEnvironment()) {
       throw new Error('PAYMENT_PROOF_STORAGE_FAILED: Supabase storage is mandatory in production. Local filesystem writes are prohibited.');
     }
     // Local filesystem fallback strictly for local development / testing
@@ -443,6 +471,8 @@ export async function processPaymentScreenshot(
     fs.writeFileSync(storagePath, sanitizedBuffer);
   }
 
+  const isSuspiciousFilename = checkSuspiciousFilename(originalFilename);
+
   return {
     sanitizedBuffer,
     storagePath,
@@ -452,5 +482,9 @@ export async function processPaymentScreenshot(
     byteSize: sanitizedBuffer.length,
     width,
     height,
+    originalFilename,
+    originalMime: originalMimeType,
+    detectedMime: validation.detectedType,
+    isSuspiciousFilename,
   };
 }

@@ -253,6 +253,17 @@ var MemoryDB = class {
       is_active: true,
       created_at: (/* @__PURE__ */ new Date()).toISOString()
     });
+    this.paymentSettings = {
+      id: "00000000-0000-0000-0000-000000000002",
+      payee_upi_id: config.PAYEE_UPI_ID || "7075920852@ybl",
+      payee_display_name: config.PAYEE_DISPLAY_NAME || "Yuva Shakti Youth Satulur",
+      coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5e3,
+      payments_enabled: true,
+      max_quantity: config.EVENT_MAX_COUPONS_PER_BOOKING || 20,
+      payment_session_minutes: 5,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_by: adminId
+    };
   }
   async getNextCouponSerial() {
     this.currentSerial += 1;
@@ -402,12 +413,12 @@ var MemoryDB = class {
       this.paymentSubmissions.set(record.id, record);
       return { rows: [record], rowCount: 1 };
     }
-    if (trimmed.includes("FROM payment_submissions") && trimmed.includes("payer_utr_hash = $1")) {
+    if (trimmed.includes("FROM payment_submissions") && (trimmed.includes("payer_utr_hash = $1") || trimmed.includes("entered_reference_hash = $1") || trimmed.includes("extracted_reference_hash = $1"))) {
       const bookingIdToExclude = trimmed.includes("booking_id != $2") ? params[1] : null;
       const requireConfirmed = trimmed.includes("status = 'admin_confirmed'") || trimmed.includes("status = 'payment_confirmed'") || trimmed.includes("status IN ('payment_confirmed', 'proof_verified')");
       const requireVerified = trimmed.includes("status = 'proof_verified'") || trimmed.includes("status = 'payment_confirmed'");
       const found = Array.from(this.paymentSubmissions.values()).find(
-        (s) => s.payer_utr_hash === params[0] && (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) && (!requireConfirmed || s.status === "payment_confirmed" || s.status === "admin_confirmed" || s.status === "proof_verified") && (!requireVerified || s.status === "proof_verified" || s.status === "payment_confirmed") && s.status !== "admin_rejected" && s.status !== "verification_failed" && s.status !== "ai_check_failed"
+        (s) => (s.payer_utr_hash === params[0] || s.entered_reference_hash === params[0] || s.extracted_reference_hash === params[0]) && (!bookingIdToExclude || s.booking_id !== bookingIdToExclude) && (!requireConfirmed || s.status === "payment_confirmed" || s.status === "admin_confirmed" || s.status === "proof_verified") && (!requireVerified || s.status === "proof_verified" || s.status === "payment_confirmed") && s.status !== "admin_rejected" && s.status !== "verification_failed" && s.status !== "ai_check_failed" && s.status !== "ocr_check_failed" && s.status !== "proof_verification_failed"
       );
       return { rows: found ? [found] : [], rowCount: found ? 1 : 0 };
     }
@@ -783,6 +794,27 @@ var MemoryDB = class {
       }).sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
       return { rows: list, rowCount: list.length };
     }
+    if (trimmed.includes("FROM payment_settings")) {
+      return { rows: [this.paymentSettings], rowCount: 1 };
+    }
+    if (trimmed.startsWith("UPDATE payment_settings")) {
+      const matchSet = trimmed.match(/SET\s+(.*?)(?:\s+WHERE|$)/is);
+      if (matchSet && matchSet[1]) {
+        const assignments = matchSet[1].split(",").map((a) => a.trim());
+        assignments.forEach((assignment) => {
+          const parts = assignment.split("=").map((p) => p.trim());
+          const col = parts[0].toLowerCase();
+          const valExpr = parts[1];
+          const paramMatch = valExpr?.match(/\$(\d+)/);
+          if (paramMatch) {
+            const pIdx = parseInt(paramMatch[1], 10) - 1;
+            this.paymentSettings[col] = params[pIdx];
+          }
+        });
+      }
+      this.paymentSettings.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+      return { rows: [this.paymentSettings], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
   }
 };
@@ -979,6 +1011,15 @@ async function getSharp() {
 }
 
 // server/upi/imageProcessor.ts
+function isProductionEnvironment() {
+  return config.NODE_ENV === "production" || process.env.VERCEL === "1" || process.env.VERCEL_ENV === "production";
+}
+function checkSuspiciousFilename(filename) {
+  if (!filename || typeof filename !== "string") return false;
+  const lower = filename.toLowerCase();
+  const suspiciousRegex = /(?:chatgpt|openai[-_]generated|gemini[-_]generated|dall[-_]?e|midjourney|firefly|ai[-_]generated)/i;
+  return suspiciousRegex.test(lower);
+}
 function getSupabaseStorageClient() {
   const url = (config.SUPABASE_URL || "").trim();
   const key = (config.SUPABASE_SERVICE_ROLE_KEY || "").trim();
@@ -1213,7 +1254,7 @@ async function downloadPaymentScreenshot(storagePath) {
   }
   return null;
 }
-async function processPaymentScreenshot(rawBuffer, bookingId) {
+async function processPaymentScreenshot(rawBuffer, bookingId, originalFilename, originalMimeType) {
   if (rawBuffer.length > config.PAYMENT_SCREENSHOT_MAX_BYTES) {
     throw new Error(`Screenshot exceeds maximum allowed size of ${config.PAYMENT_SCREENSHOT_MAX_BYTES / (1024 * 1024)}MB.`);
   }
@@ -1250,7 +1291,7 @@ async function processPaymentScreenshot(rawBuffer, bookingId) {
   if (uploadedToSupabase) {
     storagePath = `supabase:${objectPath}`;
   } else {
-    if (config.NODE_ENV === "production") {
+    if (isProductionEnvironment()) {
       throw new Error("PAYMENT_PROOF_STORAGE_FAILED: Supabase storage is mandatory in production. Local filesystem writes are prohibited.");
     }
     const uploadDir = path.resolve(process.cwd(), "uploads", "payment-proofs", bookingId);
@@ -1260,6 +1301,7 @@ async function processPaymentScreenshot(rawBuffer, bookingId) {
     storagePath = path.join(uploadDir, filename);
     fs.writeFileSync(storagePath, sanitizedBuffer);
   }
+  const isSuspiciousFilename = checkSuspiciousFilename(originalFilename);
   return {
     sanitizedBuffer,
     storagePath,
@@ -1268,7 +1310,11 @@ async function processPaymentScreenshot(rawBuffer, bookingId) {
     mimeType: "image/jpeg",
     byteSize: sanitizedBuffer.length,
     width,
-    height
+    height,
+    originalFilename,
+    originalMime: originalMimeType,
+    detectedMime: validation.detectedType,
+    isSuspiciousFilename
   };
 }
 
@@ -1492,11 +1538,11 @@ function extractTransactionTimestamp(text, referenceDateIso) {
 }
 function extractUpiId(text) {
   if (!text) return { upiId: null, payeeName: null, confidence: 0 };
-  const vpaRegex = /\b([a-zA-Z0-9._\-]{2,256}@[a-zA-Z]{2,64})\b/g;
-  const matches = text.match(vpaRegex) || [];
-  const maskedVpaRegex = /\b([a-zA-Z0-9._\-]{2,4}\*+[a-zA-Z0-9._\-]{2,4}@[a-zA-Z]{2,64})\b/g;
+  const maskedVpaRegex = /\b([a-zA-Z0-9._\-]{1,6}\*+[a-zA-Z0-9._\-]{1,6}@[a-zA-Z]{2,64})\b/g;
   const maskedMatches = text.match(maskedVpaRegex) || [];
-  const candidateUpiId = matches[0] || maskedMatches[0] || null;
+  const vpaRegex = /\b([a-zA-Z0-9._\-]{2,256}@[a-zA-Z]{2,64})\b/g;
+  const matches = (text.match(vpaRegex) || []).filter((m) => !text.includes(`*${m}`));
+  const candidateUpiId = maskedMatches[0] || matches[0] || null;
   let payeeName = null;
   if (/yuva\s*shakti/i.test(text)) {
     payeeName = "Yuva Shakti Youth Satulur";
@@ -1504,13 +1550,22 @@ function extractUpiId(text) {
   const confidence = candidateUpiId ? candidateUpiId.includes("*") ? 0.7 : 0.9 : payeeName ? 0.6 : 0;
   return { upiId: candidateUpiId, payeeName, confidence };
 }
+function detectAiGeneratorWatermark(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (lower.includes("generated with ai") || lower.includes("generated by ai") || lower.includes("chatgpt") || lower.includes("openai") || lower.includes("dall-e") || lower.includes("dalle") || lower.includes("midjourney") || lower.includes("adobe firefly") || lower.includes("generated with gemini") || lower.includes("generated by gemini")) {
+    return true;
+  }
+  return false;
+}
 function detectPaymentApp(text) {
   if (!text) return "unknown";
   const lower = text.toLowerCase();
   if (lower.includes("phonepe")) return "phonepe";
   if (lower.includes("google pay") || lower.includes("gpay") || lower.includes("g pay")) return "google_pay";
   if (lower.includes("paytm")) return "paytm";
-  if (lower.includes("bhim") || lower.includes("cred") || lower.includes("fampay") || lower.includes("amazon pay")) return "other";
+  if (lower.includes("fampay") || lower.includes("fam pay") || lower.includes("famapp")) return "fampay";
+  if (lower.includes("bhim") || lower.includes("cred") || lower.includes("amazon pay")) return "other";
   return "unknown";
 }
 async function analyzePaymentScreenshot(sanitizedBuffer, bookingContext) {
@@ -1632,6 +1687,9 @@ async function analyzePaymentScreenshot(sanitizedBuffer, bookingContext) {
   if (normalizedText.length < 15) {
     warnings.push("OCR_UNREADABLE");
   }
+  if (detectAiGeneratorWatermark(normalizedText)) {
+    warnings.push("AI_GENERATOR_WATERMARK");
+  }
   const extractedFields = {
     paymentStatus: statusRes.status,
     amount: amountRes.amount,
@@ -1743,11 +1801,16 @@ function performDeterministicOcrComparison(input) {
   }
   if (input.isDuplicateUtr) {
     reasonCodes.push("DUPLICATE_PAYMENT_REFERENCE");
+    reasonCodes.push("DUPLICATE_TRANSACTION_REFERENCE");
     riskScore += 100;
   }
   if (input.isDuplicateScreenshot) {
     reasonCodes.push("DUPLICATE_SCREENSHOT");
     riskScore += 90;
+  }
+  if (analysis.warnings?.includes("AI_GENERATOR_WATERMARK")) {
+    reasonCodes.push("AI_GENERATOR_WATERMARK");
+    riskScore += 100;
   }
   if (analysis.paymentStatus === "failed") {
     reasonCodes.push("STATUS_NOT_SUCCESS");
@@ -1770,6 +1833,7 @@ function performDeterministicOcrComparison(input) {
     if (!isUnreadable) {
       reasonCodes.push("MISSING_PAYMENT_REFERENCE");
       reasonCodes.push("MISSING_RRN");
+      reasonCodes.push("REFERENCE_NOT_READABLE");
       riskScore += 80;
     }
     details.utrMatched = false;
@@ -1781,6 +1845,14 @@ function performDeterministicOcrComparison(input) {
       details.utrMatched = false;
     } else {
       details.utrMatched = true;
+    }
+    if (input.enteredUtr) {
+      const normalizedEntered = normalizeUtr(input.enteredUtr);
+      if (normalizedEntered && normalizedEntered !== normalizedExtRrn) {
+        reasonCodes.push("TRANSACTION_REFERENCE_MISMATCH");
+        details.utrMatched = false;
+        riskScore += 80;
+      }
     }
   }
   if (analysis.amount === null || isNaN(analysis.amount)) {
@@ -1885,6 +1957,227 @@ function performDeterministicOcrComparison(input) {
   };
 }
 var performDeterministicComparison = performDeterministicOcrComparison;
+
+// server/upi/deterministicReceiptVerifier.ts
+function normalizeTransactionReference(ref) {
+  if (!ref) return "";
+  return ref.trim().replace(/[\s\-_:]/g, "").toUpperCase();
+}
+function isMaskedUpiMatch(maskedUpi, expectedUpi) {
+  if (!maskedUpi || !expectedUpi) return false;
+  const mLower = maskedUpi.toLowerCase().trim();
+  const eLower = expectedUpi.toLowerCase().trim();
+  if (mLower === eLower) return true;
+  const [mUser, mBank] = mLower.split("@");
+  const [eUser, eBank] = eLower.split("@");
+  if (!mBank || !eBank || mBank !== eBank) return false;
+  if (!mUser.includes("*")) return mUser === eUser;
+  const prefixMatch = mUser.match(/^([^*]+)/);
+  const suffixMatch = mUser.match(/([^*]+)$/);
+  const prefix = prefixMatch ? prefixMatch[1] : "";
+  const suffix = suffixMatch ? suffixMatch[1] : "";
+  if (prefix && !eUser.startsWith(prefix)) return false;
+  if (suffix && !eUser.endsWith(suffix)) return false;
+  return true;
+}
+function verifyPaymentReceipt(input) {
+  if (input.isValidScreenshotFormat === false) {
+    return {
+      verified: false,
+      riskScore: 100,
+      reasonCodes: ["INVALID_SCREENSHOT_FORMAT"],
+      nextStatus: "payment_rejected",
+      reviewStatus: "ocr_check_failed",
+      userMessage: "Invalid screenshot file format. Please upload a clear PNG, JPEG, or WebP payment receipt.",
+      details: {
+        referenceMatched: false,
+        amountMatched: null,
+        statusMatched: null,
+        payeeMatched: null,
+        timestampMatched: null
+      }
+    };
+  }
+  if (input.isExpired) {
+    return {
+      verified: false,
+      riskScore: 90,
+      reasonCodes: ["PAYMENT_SESSION_EXPIRED"],
+      nextStatus: "payment_rejected",
+      reviewStatus: "ocr_check_failed",
+      userMessage: "Payment session has expired. Please start a new booking.",
+      details: {
+        referenceMatched: null,
+        amountMatched: null,
+        statusMatched: null,
+        payeeMatched: null,
+        timestampMatched: null
+      }
+    };
+  }
+  const analysis = input.ocrAnalysis;
+  if (!analysis || !analysis.analysisCompleted || analysis.warnings?.includes("OCR_PROCESSING_ERROR")) {
+    return {
+      verified: false,
+      riskScore: 0,
+      reasonCodes: ["OCR_PROCESSING_ERROR"],
+      nextStatus: "ocr_processing_error",
+      reviewStatus: "ocr_processing_error",
+      userMessage: "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.",
+      isOcrProcessingError: true,
+      details: {
+        referenceMatched: null,
+        amountMatched: null,
+        statusMatched: null,
+        payeeMatched: null,
+        timestampMatched: null
+      }
+    };
+  }
+  const reasonCodes = [];
+  let riskScore = 0;
+  const details = {
+    referenceMatched: null,
+    amountMatched: null,
+    statusMatched: null,
+    payeeMatched: null,
+    timestampMatched: null
+  };
+  const normalizedEnteredRef = normalizeTransactionReference(input.enteredReference);
+  const ocrExtractedRef = analysis.utrOrRrn || analysis.transactionId;
+  const normalizedOcrRef = normalizeTransactionReference(ocrExtractedRef);
+  if (analysis.warnings?.includes("OCR_UNREADABLE") || !analysis.normalizedText || analysis.normalizedText.trim().length < 15) {
+    reasonCodes.push("OCR_UNREADABLE");
+    riskScore += 40;
+  }
+  if (analysis.warnings?.includes("AI_GENERATOR_WATERMARK")) {
+    reasonCodes.push("AI_GENERATOR_WATERMARK");
+    riskScore += 100;
+  }
+  if (input.isSuspiciousFilename && (reasonCodes.includes("AI_GENERATOR_WATERMARK") || riskScore > 30)) {
+    reasonCodes.push("SUSPICIOUS_FILENAME");
+    riskScore += 30;
+  }
+  if (analysis.paymentStatus === "success") {
+    details.statusMatched = true;
+  } else {
+    details.statusMatched = false;
+    reasonCodes.push("STATUS_NOT_SUCCESS");
+    riskScore += 50;
+  }
+  if (!normalizedEnteredRef) {
+    reasonCodes.push("MISSING_TRANSACTION_REFERENCE");
+    riskScore += 40;
+  } else if (normalizedEnteredRef.length < 6 || normalizedEnteredRef.length > 36) {
+    reasonCodes.push("INVALID_TRANSACTION_REFERENCE");
+    riskScore += 40;
+  }
+  if (!normalizedOcrRef) {
+    reasonCodes.push("REFERENCE_NOT_READABLE");
+    riskScore += 40;
+    details.referenceMatched = false;
+  } else if (normalizedEnteredRef && normalizedEnteredRef !== normalizedOcrRef) {
+    details.referenceMatched = false;
+    reasonCodes.push("TRANSACTION_REFERENCE_MISMATCH");
+    riskScore += 60;
+  } else {
+    details.referenceMatched = true;
+  }
+  if (analysis.amount == null) {
+    details.amountMatched = false;
+    reasonCodes.push("MISSING_AMOUNT");
+    riskScore += 40;
+  } else {
+    const extractedPaise = Math.round(Number(analysis.amount) * 100);
+    if (extractedPaise === input.expectedAmountPaise) {
+      details.amountMatched = true;
+    } else {
+      details.amountMatched = false;
+      reasonCodes.push("AMOUNT_MISMATCH");
+      riskScore += 60;
+    }
+  }
+  if (input.isDuplicateReference) {
+    reasonCodes.push("DUPLICATE_TRANSACTION_REFERENCE");
+    riskScore += 90;
+    details.referenceMatched = false;
+  }
+  if (input.isDuplicateScreenshot) {
+    reasonCodes.push("DUPLICATE_SCREENSHOT");
+    riskScore += 90;
+  }
+  if (analysis.payeeUpiId) {
+    const rawPayee = analysis.payeeUpiId.toLowerCase().trim();
+    const expPayee = input.expectedPayeeUpiId.toLowerCase().trim();
+    if (rawPayee === expPayee || isMaskedUpiMatch(rawPayee, expPayee)) {
+      details.payeeMatched = true;
+    } else {
+      details.payeeMatched = false;
+      reasonCodes.push("WRONG_PAYEE");
+      riskScore += 60;
+    }
+  } else {
+    details.payeeMatched = true;
+  }
+  if (analysis.transactionTimestamp && input.bookingCreatedAt) {
+    const txnMs = new Date(analysis.transactionTimestamp).getTime();
+    const createdMs = new Date(input.bookingCreatedAt).getTime();
+    const expiresMs = input.paymentExpiresAt ? new Date(input.paymentExpiresAt).getTime() : createdMs + 5 * 60 * 1e3;
+    const twoMinutesMs = 2 * 60 * 1e3;
+    const isWithinWindow = txnMs >= createdMs - twoMinutesMs && txnMs <= expiresMs + twoMinutesMs;
+    if (isWithinWindow) {
+      details.timestampMatched = true;
+    } else {
+      details.timestampMatched = false;
+      reasonCodes.push("TRANSACTION_TIME_MISMATCH");
+      riskScore += 30;
+    }
+  } else {
+    details.timestampMatched = null;
+  }
+  const verified = reasonCodes.length === 0 && details.statusMatched === true && details.amountMatched === true && details.referenceMatched === true && details.payeeMatched === true && !input.isDuplicateReference && !input.isDuplicateScreenshot;
+  const nextStatus = verified ? "payment_confirmed" : "payment_rejected";
+  const reviewStatus = verified ? "ocr_verified" : "ocr_check_failed";
+  let userMessage = "Payment proof verified successfully.";
+  if (!verified) {
+    if (reasonCodes.includes("DUPLICATE_TRANSACTION_REFERENCE")) {
+      userMessage = "This transaction reference has already been used for another booking.";
+    } else if (reasonCodes.includes("DUPLICATE_SCREENSHOT")) {
+      userMessage = "This screenshot has already been submitted for another booking.";
+    } else if (reasonCodes.includes("TRANSACTION_REFERENCE_MISMATCH")) {
+      userMessage = "The entered UTR does not match the transaction reference shown in the receipt.";
+    } else if (reasonCodes.includes("AMOUNT_MISMATCH")) {
+      const expInr = (input.expectedAmountPaise / 100).toFixed(2);
+      const gotInr = analysis.amount != null ? Number(analysis.amount).toFixed(2) : "0";
+      userMessage = `The payment amount is \u20B9${gotInr} but this booking requires \u20B9${expInr}.`;
+    } else if (reasonCodes.includes("OCR_UNREADABLE")) {
+      userMessage = "We couldn't clearly read this payment receipt. Please upload the detailed payment confirmation screen showing amount, payment status and transaction reference.";
+    } else if (reasonCodes.includes("STATUS_NOT_SUCCESS")) {
+      userMessage = `The uploaded receipt shows the transaction as ${analysis.paymentStatus || "not successful"}. Please upload a successful receipt.`;
+    } else if (reasonCodes.includes("WRONG_PAYEE")) {
+      userMessage = "The payment recipient does not match the configured receiver (Yuva Shakti Youth Satulur).";
+    } else if (reasonCodes.includes("AI_GENERATOR_WATERMARK")) {
+      userMessage = "This image appears to be an AI-generated mock receipt and cannot be verified.";
+    } else if (reasonCodes.includes("REFERENCE_NOT_READABLE")) {
+      userMessage = "We couldn't clearly read the transaction reference from this receipt. Please upload the detailed payment receipt.";
+    } else if (reasonCodes.includes("TRANSACTION_TIME_MISMATCH")) {
+      userMessage = "The transaction time on the receipt does not match your active payment session.";
+    } else if (reasonCodes.includes("MISSING_TRANSACTION_REFERENCE")) {
+      userMessage = "Please enter the 12-digit UPI UTR / Transaction ID from your payment app.";
+    } else {
+      userMessage = "Payment verification could not be completed with the provided screenshot. Please upload a clear, unedited payment confirmation screen.";
+    }
+  }
+  return {
+    verified,
+    riskScore,
+    reasonCodes,
+    nextStatus,
+    reviewStatus,
+    userMessage,
+    details
+  };
+}
 
 // server/upi/automatedFinalizer.ts
 import crypto4 from "crypto";
@@ -3053,15 +3346,21 @@ router.get(["/payment-reviews", "/payment-diagnostics"], requireAdminAuth, async
         amountInr: (s.expected_amount_paise || 5e3) / 100,
         selectedApp: s.selected_upi_app,
         paymentReference: s.payment_reference,
-        utrMasked: s.payer_utr_hash ? `UTR-${s.payer_utr_hash.slice(0, 8)}...` : "Unknown",
+        utrMasked: s.entered_reference_hash ? `UTR-***${s.entered_reference_hash.slice(-4)}` : s.payer_utr_hash ? `UTR-${s.payer_utr_hash.slice(0, 8)}...` : "Unknown",
+        enteredReferenceMasked: s.entered_reference_hash ? `********${s.entered_reference_hash.slice(-4)}` : s.payer_utr_hash ? `********${s.payer_utr_hash.slice(-4)}` : "N/A",
+        extractedReferenceMasked: s.extracted_reference_hash ? `********${s.extracted_reference_hash.slice(-4)}` : s.payer_utr_hash ? `********${s.payer_utr_hash.slice(-4)}` : "N/A",
+        originalFilename: s.original_filename || null,
+        ocrStatus: s.extracted_status || parseJson(s.ocr_extraction)?.paymentStatus || "unknown",
+        ocrAmount: s.extracted_amount_paise ? s.extracted_amount_paise / 100 : parseJson(s.ocr_extraction)?.amount || null,
         status: s.status,
         riskScore: s.risk_score || 0,
-        reasonCodes: s.reason_codes || [],
+        reasonCodes: s.verification_reason_codes && s.verification_reason_codes.length > 0 ? s.verification_reason_codes : s.reason_codes || [],
         ocrExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
         geminiExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
         ocrEngine: s.ocr_engine || "tesseract.js",
         extractedTransactionTimestamp: s.extracted_transaction_timestamp,
-        deterministicComparison: parseJson(s.deterministic_comparison),
+        deterministicComparison: parseJson(s.verification_result || s.deterministic_comparison),
+        verificationResult: parseJson(s.verification_result || s.deterministic_comparison),
         hasScreenshot: !!s.screenshot_storage_path,
         adminReviewerId: s.admin_reviewer_id,
         adminReviewNote: s.admin_review_note,
@@ -3213,6 +3512,81 @@ router.get("/bookings/:publicId", requireAdminAuth, async (req, res) => {
     res.status(500).json({ success: false, error: { message: error.message } });
   }
 });
+router.get("/payment-settings", requireAdminAuth, async (_req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM payment_settings LIMIT 1");
+    const settings = result.rows[0] || {
+      payee_upi_id: config.PAYEE_UPI_ID || "7075920852@ybl",
+      payee_display_name: config.PAYEE_DISPLAY_NAME || "Yuva Shakti Youth Satulur",
+      coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5e3,
+      payments_enabled: true,
+      max_quantity: config.EVENT_MAX_COUPONS_PER_BOOKING || 20,
+      payment_session_minutes: 5
+    };
+    res.json({
+      success: true,
+      data: {
+        payeeUpiId: settings.payee_upi_id,
+        payeeDisplayName: settings.payee_display_name,
+        couponPricePaise: settings.coupon_price_paise,
+        couponPriceInr: settings.coupon_price_paise / 100,
+        paymentsEnabled: settings.payments_enabled,
+        maxQuantity: settings.max_quantity,
+        paymentSessionMinutes: 5,
+        // Strictly locked to 5 minutes
+        sessionDurationLabel: "5 Minutes \u2014 Security Rule",
+        updatedAt: settings.updated_at
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: { message: "Failed to fetch payment settings." } });
+  }
+});
+router.put("/payment-settings", requireAdminAuth, async (req, res) => {
+  try {
+    const { payeeUpiId, payeeDisplayName, couponPriceInr, paymentsEnabled, maxQuantity } = req.body;
+    if (payeeUpiId && !/^[a-zA-Z0-9._\-]{2,256}@[a-zA-Z]{2,64}$/.test(payeeUpiId.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "INVALID_UPI_ID", message: "Invalid UPI VPA format. Example: 7075920852@ybl" }
+      });
+    }
+    const cleanUpi = payeeUpiId ? payeeUpiId.trim() : config.PAYEE_UPI_ID;
+    const cleanName = payeeDisplayName ? payeeDisplayName.trim() : config.PAYEE_DISPLAY_NAME;
+    const cleanPrice = couponPriceInr ? Math.round(Number(couponPriceInr) * 100) : 5e3;
+    const cleanEnabled = paymentsEnabled !== void 0 ? Boolean(paymentsEnabled) : true;
+    const cleanMaxQty = maxQuantity ? Math.min(Math.max(1, parseInt(maxQuantity, 10)), 100) : 20;
+    const adminUser = req.adminUser;
+    await db.query(
+      `UPDATE payment_settings SET
+        payee_upi_id = $1,
+        payee_display_name = $2,
+        coupon_price_paise = $3,
+        payments_enabled = $4,
+        max_quantity = $5,
+        payment_session_minutes = 5,
+        updated_at = $6,
+        updated_by = $7`,
+      [cleanUpi, cleanName, cleanPrice, cleanEnabled, cleanMaxQty, (/* @__PURE__ */ new Date()).toISOString(), adminUser?.id || null]
+    );
+    res.json({
+      success: true,
+      message: "Payment settings updated successfully.",
+      data: {
+        payeeUpiId: cleanUpi,
+        payeeDisplayName: cleanName,
+        couponPricePaise: cleanPrice,
+        couponPriceInr: cleanPrice / 100,
+        paymentsEnabled: cleanEnabled,
+        maxQuantity: cleanMaxQty,
+        paymentSessionMinutes: 5,
+        sessionDurationLabel: "5 Minutes \u2014 Security Rule"
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: { message: "Failed to update payment settings." } });
+  }
+});
 var routes_default = router;
 
 // server/app.ts
@@ -3247,7 +3621,7 @@ function generateCollisionSafePublicId() {
   return `BK-${crypto8.randomBytes(3).toString("hex").toUpperCase()}`;
 }
 function generateCollisionSafePaymentReference() {
-  return `YSYS-${Date.now().toString(36).toUpperCase()}-${crypto8.randomBytes(2).toString("hex").toUpperCase()}`;
+  return `YSYS-${crypto8.randomBytes(4).toString("hex").toUpperCase()}`;
 }
 app.get(["/api/health", "/health"], async (_req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -3462,7 +3836,7 @@ app.post("/api/bookings", async (req, res) => {
 app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
   try {
     const { publicId } = req.params;
-    const { screenshotBase64, selectedApp, consentGiven } = req.body;
+    const { screenshotBase64, utr, transactionReference, selectedApp, consentGiven, originalFilename, originalMimeType } = req.body;
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : req.headers["x-booking-token"] || req.body.statusToken || req.query.token;
     if (!token) {
@@ -3545,7 +3919,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
     }
     const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, "");
     const imageBuffer = Buffer.from(cleanBase64, "base64");
-    const processed = await processPaymentScreenshot(imageBuffer, booking.id);
+    const processed = await processPaymentScreenshot(imageBuffer, booking.id, originalFilename, originalMimeType);
     const analysis = await analyzePaymentScreenshot(
       processed.sanitizedBuffer,
       {
@@ -3561,7 +3935,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
     if (!analysis.analysisCompleted || analysis.warnings?.includes("OCR_PROCESSING_ERROR")) {
       const fallbackRef = `PENDING_OCR_${submissionId}`;
-      const utrHash2 = crypto8.createHash("sha256").update(fallbackRef).digest("hex");
+      const utrHash = crypto8.createHash("sha256").update(fallbackRef).digest("hex");
       const encryptedUtr2 = encryptSensitiveField(fallbackRef);
       await db.query(
         `INSERT INTO payment_submissions (
@@ -3579,7 +3953,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
           config.PAYEE_UPI_ID,
           config.PAYEE_DISPLAY_NAME,
           booking.total_amount_paise,
-          utrHash2,
+          utrHash,
           encryptedUtr2,
           processed.storagePath,
           processed.sha256,
@@ -3626,7 +4000,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
           retryable: true,
           message: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
           details: {
-            utrMatched: null,
+            referenceMatched: null,
             amountMatched: null,
             statusMatched: null,
             payeeMatched: null
@@ -3634,22 +4008,31 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         }
       });
     }
-    const extractedRrn = analysis.utrOrRrn ? normalizeUtr(analysis.utrOrRrn) : "";
-    let utrHash;
-    let encryptedUtr;
+    const enteredUtrField = req.body.utr ?? req.body.transactionReference ?? req.body.enteredUtr;
+    const rawEnteredRef = (enteredUtrField !== void 0 ? enteredUtrField : analysis.utrOrRrn || analysis.transactionId || "").trim();
+    const normalizedEnteredRef = normalizeTransactionReference(rawEnteredRef);
+    const extractedRrn = analysis.utrOrRrn ? normalizeTransactionReference(analysis.utrOrRrn) : analysis.transactionId ? normalizeTransactionReference(analysis.transactionId) : "";
+    const enteredRefHash = normalizedEnteredRef ? crypto8.createHash("sha256").update(normalizedEnteredRef).digest("hex") : null;
+    const encryptedEnteredRef = normalizedEnteredRef ? encryptSensitiveField(normalizedEnteredRef) : null;
+    const extractedRefHash = extractedRrn ? crypto8.createHash("sha256").update(extractedRrn).digest("hex") : null;
+    const encryptedExtractedRef = extractedRrn ? encryptSensitiveField(extractedRrn) : null;
+    const fallbackUtr = `UNEXTRACTED_${submissionId}`;
+    const payerUtrHash = extractedRefHash || enteredRefHash || crypto8.createHash("sha256").update(fallbackUtr).digest("hex");
+    const encryptedUtr = encryptedExtractedRef || encryptedEnteredRef || encryptSensitiveField(fallbackUtr);
     let isDuplicateUtr = false;
-    if (extractedRrn) {
-      utrHash = crypto8.createHash("sha256").update(extractedRrn).digest("hex");
-      const dupUtrRes = await db.query(
-        "SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4",
-        [utrHash, booking.id, "admin_rejected", "payment_rejected"]
+    if (enteredRefHash) {
+      const dupEntered = await db.query(
+        `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+        [enteredRefHash, booking.id, "admin_rejected", "payment_rejected"]
       );
-      isDuplicateUtr = dupUtrRes.rows.length > 0;
-      encryptedUtr = encryptSensitiveField(extractedRrn);
-    } else {
-      const fallbackRef = `UNEXTRACTED_${submissionId}`;
-      utrHash = crypto8.createHash("sha256").update(fallbackRef).digest("hex");
-      encryptedUtr = encryptSensitiveField(fallbackRef);
+      if (dupEntered.rows.length > 0) isDuplicateUtr = true;
+    }
+    if (!isDuplicateUtr && extractedRefHash) {
+      const dupExtracted = await db.query(
+        `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
+        [extractedRefHash, booking.id, "admin_rejected", "payment_rejected"]
+      );
+      if (dupExtracted.rows.length > 0) isDuplicateUtr = true;
     }
     const dupScreenRes = await db.query(
       "SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4",
@@ -3671,11 +4054,27 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         }
       }
     }
+    const verification = verifyPaymentReceipt({
+      expectedAmountPaise: booking.total_amount_paise,
+      expectedPayeeUpiId: config.PAYEE_UPI_ID,
+      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      enteredReference: normalizedEnteredRef || void 0,
+      selectedApp: selectedApp || booking.selected_upi_app || "other_upi",
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      ocrAnalysis: analysis,
+      isDuplicateReference: isDuplicateUtr,
+      isDuplicateScreenshot,
+      isExpired: false,
+      originalFilename: processed.originalFilename,
+      isSuspiciousFilename: processed.isSuspiciousFilename,
+      isValidScreenshotFormat: true
+    });
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: extractedRrn,
+      enteredUtr: normalizedEnteredRef || extractedRrn,
       selectedApp: selectedApp || booking.selected_upi_app || "other_upi",
       bookingCreatedAt: booking.created_at,
       paymentExpiresAt: booking.payment_expires_at,
@@ -3684,14 +4083,21 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
       isDuplicateScreenshot,
       isExpired: false
     });
+    const isPassed = verification.verified && match.passed;
+    const finalReasonCodes = Array.from(/* @__PURE__ */ new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
     await db.query(
       `INSERT INTO payment_submissions (
         id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
         expected_payee_name, expected_amount_paise, payer_utr_hash, encrypted_utr,
-        screenshot_storage_path, screenshot_sha256, screenshot_phash, mime_type,
-        byte_size, width, height, status, ocr_extraction, deterministic_comparison,
-        risk_score, reason_codes, ocr_engine, extracted_transaction_timestamp
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+        entered_reference_hash, encrypted_entered_reference,
+        extracted_reference_hash, encrypted_extracted_reference,
+        original_filename, screenshot_storage_path, screenshot_sha256, screenshot_phash,
+        mime_type, byte_size, width, height, status, ocr_extraction, deterministic_comparison,
+        verification_result, verification_reason_codes, extracted_amount_paise,
+        extracted_status, extracted_payee_upi_id, extracted_transaction_timestamp,
+        risk_score, reason_codes, ocr_engine, verified_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)`,
       [
         submissionId,
         booking.id,
@@ -3700,8 +4106,13 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         config.PAYEE_UPI_ID,
         config.PAYEE_DISPLAY_NAME,
         booking.total_amount_paise,
-        utrHash,
+        payerUtrHash,
         encryptedUtr,
+        enteredRefHash,
+        encryptedEnteredRef,
+        extractedRefHash,
+        encryptedExtractedRef,
+        processed.originalFilename || null,
         processed.storagePath,
         processed.sha256,
         processed.phash,
@@ -3709,13 +4120,19 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         processed.byteSize,
         processed.width,
         processed.height,
-        match.nextStatus,
+        isPassed ? "payment_confirmed" : "payment_rejected",
         JSON.stringify(analysis),
         JSON.stringify(match),
-        match.riskScore,
-        match.reasonCodes,
+        JSON.stringify(verification),
+        finalReasonCodes,
+        extractedPaise,
+        analysis.paymentStatus,
+        analysis.payeeUpiId || null,
+        analysis.transactionTimestamp || null,
+        Math.max(verification.riskScore, match.riskScore),
+        finalReasonCodes,
         "tesseract.js",
-        analysis.transactionTimestamp || null
+        isPassed ? (/* @__PURE__ */ new Date()).toISOString() : null
       ]
     );
     const runId = crypto8.randomUUID();
@@ -3734,7 +4151,7 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         (/* @__PURE__ */ new Date()).toISOString()
       ]
     );
-    if (match.passed) {
+    if (isPassed) {
       const finalResult = await finalizeVerifiedSubmission({
         submissionId,
         bookingId: booking.id,
@@ -3747,11 +4164,14 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
           publicId: booking.public_id,
           status: "payment_confirmed",
           reviewStatus: "ocr_verified",
-          message: "Payment proof verified successfully. Coupons issued.",
+          message: verification.userMessage || "Payment proof verified successfully. Coupons issued.",
           coupons: finalResult.coupons,
           couponsIssuedCount: finalResult.couponsIssuedCount,
           downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
-          details: match.details
+          details: {
+            ...match.details,
+            ...verification.details
+          }
         }
       });
     } else {
@@ -3759,19 +4179,23 @@ app.post("/api/bookings/:publicId/payment-proof", async (req, res) => {
         "UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3",
         ["payment_rejected", (/* @__PURE__ */ new Date()).toISOString(), booking.id]
       );
+      const primaryCode = finalReasonCodes[0] || "PROOF_VERIFICATION_FAILED";
       return res.status(400).json({
         success: false,
         error: {
-          code: match.reasonCodes[0] || "PROOF_VERIFICATION_FAILED",
-          message: match.userMessage,
-          reasonCodes: match.reasonCodes
+          code: primaryCode,
+          message: verification.userMessage || match.userMessage,
+          reasonCodes: finalReasonCodes
         },
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: match.nextStatus,
-          message: match.userMessage,
-          details: match.details
+          status: "payment_rejected",
+          message: verification.userMessage || match.userMessage,
+          details: {
+            ...match.details,
+            ...verification.details
+          }
         }
       });
     }
@@ -3819,7 +4243,7 @@ app.post("/api/bookings/:publicId/retry-verification", async (req, res) => {
         data: {
           publicId: booking.public_id,
           status: "payment_confirmed",
-          reviewStatus: "ai_check_passed",
+          reviewStatus: "ocr_verified",
           message: "Payment proof already verified and confirmed.",
           coupons: existingCoupons.rows,
           couponsIssuedCount: existingCoupons.rows.length,
@@ -3907,6 +4331,21 @@ app.post("/api/bookings/:publicId/retry-verification", async (req, res) => {
       isDuplicateUtr = dupUtrRes.rows.length > 0;
       encryptedUtr = encryptSensitiveField(extractedRrn);
     }
+    const verification = verifyPaymentReceipt({
+      expectedAmountPaise: booking.total_amount_paise,
+      expectedPayeeUpiId: config.PAYEE_UPI_ID,
+      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      enteredReference: extractedRrn,
+      selectedApp: submission.selected_upi_app || "other_upi",
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      ocrAnalysis: analysis,
+      isDuplicateReference: isDuplicateUtr,
+      isDuplicateScreenshot: false,
+      isExpired: false,
+      originalFilename: submission.original_filename,
+      isValidScreenshotFormat: true
+    });
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
@@ -3920,6 +4359,9 @@ app.post("/api/bookings/:publicId/retry-verification", async (req, res) => {
       isDuplicateScreenshot: false,
       isExpired: false
     });
+    const isPassed = verification.verified && match.passed;
+    const finalReasonCodes = Array.from(/* @__PURE__ */ new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
     await db.query(
       `UPDATE payment_submissions SET
         payer_utr_hash = $1,
@@ -3927,22 +4369,32 @@ app.post("/api/bookings/:publicId/retry-verification", async (req, res) => {
         status = $3,
         ocr_extraction = $4,
         deterministic_comparison = $5,
-        risk_score = $6,
-        reason_codes = $7,
-        ocr_engine = $8,
-        extracted_transaction_timestamp = $9,
-        updated_at = $10
-      WHERE id = $11`,
+        verification_result = $6,
+        verification_reason_codes = $7,
+        risk_score = $8,
+        reason_codes = $9,
+        ocr_engine = $10,
+        extracted_amount_paise = $11,
+        extracted_status = $12,
+        extracted_transaction_timestamp = $13,
+        verified_at = $14,
+        updated_at = $15
+      WHERE id = $16`,
       [
         utrHash,
         encryptedUtr,
-        match.nextStatus,
+        isPassed ? "payment_confirmed" : "payment_rejected",
         JSON.stringify(analysis),
         JSON.stringify(match),
-        match.riskScore,
-        match.reasonCodes,
+        JSON.stringify(verification),
+        finalReasonCodes,
+        Math.max(verification.riskScore, match.riskScore),
+        finalReasonCodes,
         "tesseract.js",
+        extractedPaise,
+        analysis.paymentStatus,
         analysis.transactionTimestamp || null,
+        isPassed ? (/* @__PURE__ */ new Date()).toISOString() : null,
         (/* @__PURE__ */ new Date()).toISOString(),
         submission.id
       ]
