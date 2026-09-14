@@ -27,7 +27,7 @@ export async function finalizeVerifiedSubmission(
   const {
     submissionId,
     bookingId,
-    decisionVersion = 'v1-gemini-deterministic-auto',
+    decisionVersion = 'v1-ocr-deterministic-auto',
   } = params;
 
   // Use a transactional boundary
@@ -77,6 +77,7 @@ export async function finalizeVerifiedSubmission(
     await client.query(
       `UPDATE payment_submissions 
        SET status = 'payment_confirmed', 
+           ocr_engine = $1,
            ai_model_version = $1, 
            updated_at = $2
        WHERE id = $3`,

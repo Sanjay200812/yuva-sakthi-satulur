@@ -1,15 +1,15 @@
-# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Automated Verification)
+# 🎟️ Yuva Shakti Youth Satulur - Lucky Draw Portal (Direct Merchant-UPI & Automated Local OCR Verification)
 
-An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and **Direct Merchant-UPI Collection with Automated Verification**:
+An official, production-grade event coupon booking portal for **Yuva Shakti Youth Satulur**. Built with **React 19**, **Vite 6**, **TypeScript**, **Tailwind CSS**, **Express 4**, **PostgreSQL / Supabase**, and **Direct Merchant-UPI Collection with Automated Local Server OCR Verification**:
 1. **Server-Authoritative Pricing & 5-Minute Payment Session**: Server locks ₹50/coupon (`5000` integer paise), generates intent deep links for PhonePe, Google Pay, Paytm, and generic Other UPI Apps, and enforces a strict 5-minute session expiry.
-2. **Automated AI Consistency & Fraud Screening**: Google Gemini structured OCR text extraction and fail-closed deterministic verification.
+2. **Deterministic Server-Side OCR & Consistency Verification**: Local server-side OCR (Tesseract.js) with Sharp multi-variant preprocessing, candidate-scoring parsing, and fail-closed deterministic verification without any external AI or LLM API calls.
 3. **Atomic Instant Coupon Finalization**: High-confidence verified submissions immediately call atomic finalization inside a database transaction, allocating unique coupon numbers without manual human bottlenecks.
 
 ---
 
 > [!IMPORTANT]
-> **Architecture & Settlement Verification Disclaimer**:
-> Screenshot analysis via Google Gemini and the server deterministic comparison engine is an **automated consistency and fraud-screening mechanism**, not proof of bank settlement. Image receipts, OCR text, and client devices are untrusted inputs. Authoritative automatic settlement verification requires a supported bank/merchant PSP transaction-status API (e.g. NPCI/bank merchant settlement callbacks or UPI transaction status inquiry API).
+> **Architecture & Receipt Verification Disclaimer**:
+> Server-side receipt analysis via local OCR and the deterministic comparison engine is an **automated consistency and fraud-screening mechanism**, not proof of bank settlement. Image receipts, OCR text, and client devices are untrusted inputs. The system verifies visible receipt status, expected amount, unique 12-digit RRN, payee VPA, and timestamp consistency before issuing coupons. Authoritative automatic settlement verification requires a supported bank/merchant PSP transaction-status API.
 
 ---
 
@@ -38,10 +38,11 @@ Participant Details
   → Launch App Intent / Scan Prominent QR
   → Customer Pays in UPI App
   → Return to Website
-  → Enter 12-Digit UPI RRN + Upload Screenshot Proof
+  → Upload Payment Screenshot Proof (Zero Manual UTR Entry Required)
   → Server Magic-Bytes, Sharp Sanitization, SHA-256 & Perceptual dHash Check
-  → Gemini Structured OCR & Risk Analysis
-  → Fail-Closed Deterministic Matcher
+  → Multi-Variant Sharp Preprocessing & Local Tesseract.js OCR
+  → Candidate Scoring for Amount, 12-Digit RRN/UTR, Status, Payee & Timestamp
+  → Fail-Closed Deterministic Matcher & Duplicate Protection
   → Atomic Concurrency-Safe Finalizer
   → Immediate Coupon Issuance & TicketModal Download (PDF, PNG, JPEG, ZIP)
 ```
@@ -59,53 +60,43 @@ Participant Details
 - **Responsive Presentation**: Prominent QR code on desktop devices; dynamic payment launch button on mobile devices.
 
 ### 3. Strict 12-Digit RRN & Screenshot Processing
-- **Strict 12-Digit Numeric RRN**: Validated on both frontend and backend using `/^\d{12}$/`.
+- **Automatic RRN Extraction**: The user is never prompted to type a manual UTR. The backend extracts the 12-digit numeric RRN directly from the receipt.
 - **Magic Bytes & Raster Sanitization**: Validates raster magic bytes (PNG, JPEG, WebP, max 5MB).
 - **Sharp Re-Encoding**: Strips all EXIF/GPS metadata and comments.
 - **Deduplication & Perceptual Hashing**: Computes SHA-256 for byte-level duplicate detection and 64-bit dHash (difference hash) for perceptual layout similarity comparison. Rejects duplicate confirmed RRNs and identical screenshots.
 - **Production Screenshot Storage**: When Supabase is configured, sanitized screenshots are stored in a private bucket (`PAYMENT_PROOF_BUCKET`) and accessed only via short-lived signed URLs. Local filesystem fallback is used in offline development.
 - **Authenticated Encryption (AES-256-GCM)**: Sensitive raw RRN data is encrypted at rest using AES-256-GCM with a random 12-byte IV and authentication tag (`v1:<iv>:<tag>:<ciphertext>`).
 
-### 4. Gemini OCR & Fraud Risk Analysis
-- **Server-Side Only**: Uses `@google/genai` on Express server. `GEMINI_API_KEY` is never exposed to Vite or client bundles.
-- **Structured JSON Schema**: Extracts key visible receipt fields without hallucination:
-  - `looks_like_payment_screen`: boolean
-  - `visible_payment_status`: `success` | `pending` | `failed` | `unknown`
-  - `app_name`: `phonepe` | `google_pay` | `paytm` | `other` | `unknown`
-  - `amount`: string
-  - `currency`: `INR`
-  - `utr_or_rrn`: string
-  - `payee_name`: string | null
-  - `payee_upi_id`: string | null
-  - `obvious_editing_signals`: array of strings
-  - `ai_generated_likelihood`: `low` | `medium` | `high` | `unknown`
-  - `field_confidence`: per-field confidence scores (0.0 to 1.0)
-- **Prompt Injection Defense**: Strips delimiter markers and treats all image text as untrusted OCR data.
+### 4. Local Server-Side OCR (Tesseract.js) & Preprocessing
+- **100% Local & Code-Only**: Zero external AI APIs, LLMs, or cloud OCR services. Runs entirely within the Node.js serverless execution environment.
+- **Multi-Variant Sharp Preprocessing**: Generates in-memory candidates (grayscale, contrast-enhanced, sharpened/upscaled) without writing temporary files to disk.
+- **Candidate Scoring Engine**:
+  - **Payment Reference**: Labels scored by proximity (`UTR`, `RRN`, `UPI Ref`, `Bank Reference`). 12-digit numeric sequences prioritized.
+  - **Amount**: Proximity scoring near "Paid", "Amount", "Sent", "Total" with INR / ₹ symbol parsing.
+  - **Payment Status**: Explicit status priority (`FAILED` > `PENDING` > `SUCCESS`).
+  - **Transaction Timestamp**: Indian receipt formats parsed in `Asia/Kolkata` time zone and checked against the 5-minute booking window.
+  - **Payee & App Detection**: Checks recipient UPI ID against `PAYEE_UPI_ID` and identifies app signatures (PhonePe, Google Pay, Paytm).
 
-### 5. Fail-Closed Deterministic Matcher & Explicit Reason Codes
+### 5. Fail-Closed Deterministic Matcher & Reason Codes
 Every automated verification must satisfy all mandatory signals before coupon issuance:
-- `looks_like_payment_screen === true`
-- `visible_payment_status === "success"`
-- Extracted RRN exists and matches entered RRN
+- Sufficient readable text from OCR (`OCR_UNREADABLE` if empty/blurry)
+- `paymentStatus === "success"`
+- Extracted 12-digit RRN exists and matches format
 - Extracted amount exists and matches booking `total_amount_paise`
-- Currency is INR
-- No duplicate RRN or duplicate screenshot
-- Low AI-generated likelihood and no tampering indicators
-- Sufficient OCR confidence for amount, RRN, and status
-- Payment timestamp consistent with session when extractable
+- No duplicate RRN or duplicate screenshot across finalized bookings
+- Payee VPA must not be positively identified as a different UPI account
 - Explicit failure reason codes:
-  - `MISSING_RRN`
+  - `MISSING_PAYMENT_REFERENCE`
+  - `INVALID_PAYMENT_REFERENCE`
   - `MISSING_AMOUNT`
-  - `RRN_MISMATCH`
   - `AMOUNT_MISMATCH`
   - `STATUS_NOT_SUCCESS`
-  - `DUPLICATE_RRN`
+  - `DUPLICATE_PAYMENT_REFERENCE`
   - `DUPLICATE_SCREENSHOT`
-  - `TAMPERING_RISK`
-  - `LOW_CONFIDENCE`
-  - `PAYMENT_SESSION_EXPIRED`
   - `WRONG_PAYEE`
-  - `INVALID_PAYMENT_SCREEN`
+  - `TRANSACTION_TIME_MISMATCH`
+  - `OCR_UNREADABLE`
+  - `OCR_PROCESSING_ERROR` (allows customer retry on stored proof)
 
 ### 6. Atomic Instant Finalizer & Secure Access Tokens
 - **Instant Automatic Finalization**: High-confidence verification immediately calls `finalizeVerifiedSubmission(...)`.
@@ -125,7 +116,7 @@ Every automated verification must satisfy all mandatory signals before coupon is
 
 ### 8. Admin Portal (`/admin`)
 - **Genuine Issued Coupons**: Shows genuine issued coupons with applicant details, booking reference, amount, and download passes.
-- **Verification & Audit Logs**: Shows all proof submissions, Gemini OCR metadata, risk signals, RRN hashes, reason codes, and short-lived signed screenshot previews.
+- **Verification & Audit Logs**: Shows all proof submissions, OCR engine metadata (Tesseract.js), extracted amounts, masked RRNs, transaction timestamps, detected apps, reason codes, and short-lived signed screenshot previews.
 
 ---
 
@@ -135,7 +126,9 @@ Every automated verification must satisfy all mandatory signals before coupon is
 ├── migrations/
 │   ├── 001_init_schema.sql                 # Base PostgreSQL schema
 │   ├── 002_direct_upi_schema.sql           # Direct UPI tables & RRN hash index
-│   └── 003_automated_upi_verification.sql   # payment_expires_at, unified constraints
+│   ├── 003_automated_upi_verification.sql   # payment_expires_at, unified constraints
+│   ├── 004_fix_admin_users.sql             # Admin user schema hardening
+│   └── 005_local_ocr_verification.sql      # ocr_extraction, ocr_engine, extracted_transaction_timestamp
 ├── server/
 │   ├── admin/
 │   │   ├── auth.ts                         # Admin bcrypt auth & sessions
@@ -147,7 +140,7 @@ Every automated verification must satisfy all mandatory signals before coupon is
 │   ├── upi/
 │   │   ├── upiUri.ts                       # NPCI UPI URI generator (PhonePe, GPay, Paytm, Other UPI)
 │   │   ├── imageProcessor.ts               # Sharp sanitization, magic bytes, SHA256, dHash, Supabase Storage
-│   │   ├── geminiAnalyzer.ts               # Google Gemini OCR text extraction & risk analysis
+│   │   ├── localOcrAnalyzer.ts             # In-memory Sharp multi-variant & local Tesseract.js OCR engine
 │   │   ├── deterministicMatcher.ts         # Fail-closed comparison engine & reason codes
 │   │   └── automatedFinalizer.ts           # Concurrency-safe atomic coupon finalizer
 │   ├── utils/
@@ -157,7 +150,7 @@ Every automated verification must satisfy all mandatory signals before coupon is
 │       └── ticketRenderer.ts               # Multi-format PDF, PNG, JPEG & ZIP generator
 ├── tests/
 │   ├── booking-and-pricing.test.ts         # Server pricing, 5-min expiry, token security
-│   ├── payments-and-webhooks.test.ts       # UPI intents, OCR matcher, duplicate checks, legacy 404s
+│   ├── payments-and-webhooks.test.ts       # UPI intents, local OCR matcher, duplicate checks
 │   ├── coupon-allocation-and-pdf.test.ts   # Ticket rendering & download authorization
 │   └── admin.test.ts                       # Admin dashboard, audit logs, verified coupons
 ├── src/
@@ -165,7 +158,7 @@ Every automated verification must satisfy all mandatory signals before coupon is
 │   │   ├── admin/
 │   │   │   ├── AdminLogin.tsx              # Admin login
 │   │   │   └── AdminDashboard.tsx          # Coupons registry & verification audit logs
-│   │   ├── BookingModal.tsx                # 4-phase booking flow, 5-min timer, 4 apps, 12-digit RRN
+│   │   ├── BookingModal.tsx                # Payment flow, 5-min timer, 4 apps, automatic OCR verification
 │   │   ├── TicketModal.tsx                 # Ticket preview & multi-format download
 │   │   └── ...                             # Public event components
 │   └── utils/
@@ -206,9 +199,8 @@ PAYMENT_SCREENSHOT_MAX_BYTES=5242880
 PAYMENT_PROOF_BUCKET=payment-proofs
 FIELD_ENCRYPTION_KEY=c9b68a3f81e9b2512a8848db92ea91bc310dc2e811c7fae98f0601931889c02b
 
-# Google Gemini API (Server-Side Only)
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+# Local Server OCR Engine (No external AI API keys needed)
+OCR_ENGINE=tesseract.js
 
 # Event Configuration
 EVENT_NAME=Yuva Shakti Youth Satulur Lucky Draw

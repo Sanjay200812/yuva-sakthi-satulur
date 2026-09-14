@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import sharp from 'sharp';
 import { app } from '../server.ts';
+import { setMockOcrResult } from '../server/upi/localOcrAnalyzer.ts';
 
 describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () => {
   let adminToken = '';
@@ -116,6 +117,26 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
     const validImgBase64 = (await sharp({
       create: { width: 250, height: 250, channels: 3, background: { r: 240, g: 240, b: 240 } }
     }).png().toBuffer()).toString('base64');
+
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 50 UTR 998877665544',
+      normalizedText: 'Payment Successful 50 UTR 998877665544',
+      paymentStatus: 'success',
+      amount: 50,
+      amountText: '50.00',
+      utrOrRrn: '998877665544',
+      transactionId: 'TXN-ADMIN',
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: null,
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Admin Test Participant',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
+    });
 
     const pRes = await request(app)
       .post(`/api/bookings/${booking.publicId}/payment-proof`)

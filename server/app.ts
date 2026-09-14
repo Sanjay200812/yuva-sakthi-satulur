@@ -8,7 +8,7 @@ import { config, getPublicConfig, canAcceptPayments } from './config/eventConfig
 import { db, isDatabaseConnected } from './db/client.ts';
 import { generateUpiPaymentSession } from './upi/upiUri.ts';
 import { processPaymentScreenshot, hammingDistance, checkStorageHealth, downloadPaymentScreenshot } from './upi/imageProcessor.ts';
-import { analyzePaymentScreenshotWithGemini, getGeminiHealthStatus } from './upi/geminiAnalyzer.ts';
+import { analyzePaymentScreenshot } from './upi/localOcrAnalyzer.ts';
 import { performDeterministicComparison, normalizeUtr } from './upi/deterministicMatcher.ts';
 import { finalizeVerifiedSubmission } from './upi/automatedFinalizer.ts';
 import { encryptSensitiveField } from './utils/crypto.ts';
@@ -87,7 +87,6 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
       checkStorageHealth(),
     ]);
 
-    const geminiStatus = getGeminiHealthStatus();
     const isHealthy = dbStatus.connected && storageStatus.ready;
 
     return res.status(200).json({
@@ -105,13 +104,9 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
         ready: storageStatus.ready,
         ...(storageStatus.error ? { warning: storageStatus.error } : {}),
       },
-      ai: {
-        configured: geminiStatus.configured,
-        model: geminiStatus.model,
-        fallbackModel: geminiStatus.fallbackModel,
-        serviceStatus: geminiStatus.serviceStatus,
-        lastErrorCategory: geminiStatus.lastErrorCategory,
-        lastRequestSuccess: geminiStatus.lastRequestSuccess,
+      ocr: {
+        engine: 'tesseract.js',
+        status: 'ready',
       },
       ...(dbStatus.error ? { warning: 'Database connection check reported an issue' } : {}),
     });
@@ -120,7 +115,6 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
       name: err?.name,
       message: err?.message,
     });
-    const geminiStatus = getGeminiHealthStatus();
     return res.status(200).json({
       status: 'degraded',
       service: 'yuva-shakti-portal',
@@ -133,11 +127,9 @@ app.get(['/api/health', '/health'], async (_req: Request, res: Response) => {
         bucket: config.PAYMENT_PROOF_BUCKET,
         ready: false,
       },
-      ai: {
-        configured: geminiStatus.configured,
-        model: geminiStatus.model,
-        fallbackModel: geminiStatus.fallbackModel,
-        serviceStatus: geminiStatus.serviceStatus,
+      ocr: {
+        engine: 'tesseract.js',
+        status: 'ready',
       },
     });
   }
@@ -457,23 +449,25 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     // 7. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
     const processed = await processPaymentScreenshot(imageBuffer, booking.id);
 
-    // 8. Run Gemini-Assisted OCR & Risk Analysis (Untrusted Input)
-    const analysis = await analyzePaymentScreenshotWithGemini(
+    // 8. Run Local Server-Side OCR & Candidate Extraction
+    const analysis = await analyzePaymentScreenshot(
       processed.sanitizedBuffer,
-      processed.mimeType,
       {
         expectedMerchantName: config.PAYEE_DISPLAY_NAME,
         expectedAmount: (booking.total_amount_paise / 100).toFixed(2),
+        expectedAmountPaise: booking.total_amount_paise,
         sessionTimestampIso: booking.created_at || new Date().toISOString(),
+        bookingCreatedAt: booking.created_at,
+        paymentExpiresAt: booking.payment_expires_at,
       }
     );
 
     const submissionId = crypto.randomUUID();
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
 
-    // 8b. Decouple Infrastructure Failure: Handle Gemini Unavailable / Errors
-    if (!analysis.success) {
-      const fallbackRef = `PENDING_AI_${submissionId}`;
+    // 8b. Handle Local OCR Processing Error / Crash: Keep non-final retryable state
+    if (!analysis.analysisCompleted || analysis.warnings?.includes('OCR_PROCESSING_ERROR')) {
+      const fallbackRef = `PENDING_OCR_${submissionId}`;
       const utrHash = crypto.createHash('sha256').update(fallbackRef).digest('hex');
       const encryptedUtr = encryptSensitiveField(fallbackRef);
 
@@ -482,8 +476,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
           expected_payee_name, expected_amount_paise, payer_utr_hash, encrypted_utr,
           screenshot_storage_path, screenshot_sha256, screenshot_phash, mime_type,
-          byte_size, width, height, status, gemini_extraction, deterministic_comparison,
-          risk_score, reason_codes, ai_model_version
+          byte_size, width, height, status, ocr_extraction, deterministic_comparison,
+          risk_score, reason_codes, ocr_engine
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
         [
           submissionId,
@@ -502,12 +496,12 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           processed.byteSize,
           processed.width,
           processed.height,
-          'ai_retry_pending',
-          JSON.stringify({ is_fallback: true, unavailable: true, reason: 'AI_UNAVAILABLE', errorCode: analysis.errorCode }),
+          'ocr_processing_error',
+          JSON.stringify(analysis),
           null,
           0,
-          ['AI_UNAVAILABLE'],
-          analysis.model,
+          ['OCR_PROCESSING_ERROR'],
+          'tesseract.js',
         ]
       );
 
@@ -519,10 +513,10 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         [
           runId,
           submissionId,
-          'gemini_ocr',
+          'local_ocr',
           'pending_retry',
           0,
-          ['AI_UNAVAILABLE'],
+          ['OCR_PROCESSING_ERROR'],
           JSON.stringify({ analysis }),
           new Date().toISOString(),
         ]
@@ -539,10 +533,10 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: 'ai_retry_pending',
-          reviewStatus: 'ai_retry_pending',
-          retryable: analysis.retryable,
-          message: 'Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.',
+          status: 'ocr_processing_error',
+          reviewStatus: 'ocr_processing_error',
+          retryable: true,
+          message: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
           details: {
             utrMatched: null,
             amountMatched: null,
@@ -553,10 +547,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    const extraction = analysis.extraction;
-
     // 9. Extract and normalize transaction reference exclusively from screenshot OCR
-    const extractedRrn = extraction.utr_or_rrn ? normalizeUtr(extraction.utr_or_rrn) : '';
+    const extractedRrn = analysis.utrOrRrn ? normalizeUtr(analysis.utrOrRrn) : '';
     let utrHash: string;
     let encryptedUtr: string;
     let isDuplicateUtr = false;
@@ -565,7 +557,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       utrHash = crypto.createHash('sha256').update(extractedRrn).digest('hex');
       const dupUtrRes = await db.query(
         'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-        [utrHash, booking.id, 'admin_rejected', 'ai_check_failed']
+        [utrHash, booking.id, 'admin_rejected', 'payment_rejected']
       );
       isDuplicateUtr = dupUtrRes.rows.length > 0;
       encryptedUtr = encryptSensitiveField(extractedRrn);
@@ -578,7 +570,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     // 10. Check Duplicate Screenshot Hash
     const dupScreenRes = await db.query(
       'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-      [processed.sha256, booking.id, 'admin_rejected', 'ai_check_failed']
+      [processed.sha256, booking.id, 'admin_rejected', 'payment_rejected']
     );
     let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
 
@@ -586,12 +578,11 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     if (!isDuplicateScreenshot && processed.phash) {
       const pastSubs = await db.query(
         'SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3',
-        [booking.id, 'admin_rejected', 'ai_check_failed']
+        [booking.id, 'admin_rejected', 'payment_rejected']
       );
       for (const past of pastSubs.rows) {
         if (past.screenshot_phash) {
           const dist = hammingDistance(processed.phash, past.screenshot_phash);
-          // If images are virtually identical and amount matches, flag duplicate screenshot
           if (dist <= 2 && past.expected_amount_paise === booking.total_amount_paise) {
             isDuplicateScreenshot = true;
             break;
@@ -607,7 +598,9 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
       enteredUtr: extractedRrn,
       selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
-      extraction,
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      analysis,
       isDuplicateUtr,
       isDuplicateScreenshot,
       isExpired: false,
@@ -619,9 +612,9 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         id, booking_id, payment_reference, selected_upi_app, expected_payee_upi_id,
         expected_payee_name, expected_amount_paise, payer_utr_hash, encrypted_utr,
         screenshot_storage_path, screenshot_sha256, screenshot_phash, mime_type,
-        byte_size, width, height, status, gemini_extraction, deterministic_comparison,
-        risk_score, reason_codes, ai_model_version
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
+        byte_size, width, height, status, ocr_extraction, deterministic_comparison,
+        risk_score, reason_codes, ocr_engine, extracted_transaction_timestamp
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
       [
         submissionId,
         booking.id,
@@ -640,11 +633,12 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         processed.width,
         processed.height,
         match.nextStatus,
-        JSON.stringify(extraction),
+        JSON.stringify(analysis),
         JSON.stringify(match),
         match.riskScore,
         match.reasonCodes,
-        analysis.model,
+        'tesseract.js',
+        analysis.transactionTimestamp || null,
       ]
     );
 
@@ -657,11 +651,11 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       [
         runId,
         submissionId,
-        'gemini_and_deterministic',
+        'local_ocr_and_deterministic',
         match.passed ? 'passed' : 'flagged',
-        extraction.field_confidence?.amount || 0.8,
+        analysis.extractedFields?.fieldConfidence?.amount || 0.8,
         match.reasonCodes,
-        JSON.stringify({ match, extractionSummary: { utr: extraction.utr_or_rrn, amount: extraction.amount } }),
+        JSON.stringify({ match, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
         new Date().toISOString(),
       ]
     );
@@ -671,7 +665,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       const finalResult = await finalizeVerifiedSubmission({
         submissionId,
         bookingId: booking.id,
-        decisionVersion: 'v2-automated-gemini-deterministic',
+        decisionVersion: 'v3-local-ocr-deterministic',
       });
 
       return res.json({
@@ -680,8 +674,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           submissionId,
           publicId: booking.public_id,
           status: 'payment_confirmed',
-          reviewStatus: 'ai_check_passed',
-          message: 'Payment proof accepted',
+          reviewStatus: 'ocr_verified',
+          message: 'Payment proof verified successfully. Coupons issued.',
           coupons: finalResult.coupons,
           couponsIssuedCount: finalResult.couponsIssuedCount,
           downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
@@ -689,23 +683,23 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         },
       });
     } else {
-      // Step Fail-Closed: mark booking ai_check_failed
+      // Step Fail-Closed: mark booking payment_rejected
       await db.query(
         'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
-        ['ai_check_failed', new Date().toISOString(), booking.id]
+        ['payment_rejected', new Date().toISOString(), booking.id]
       );
 
       return res.status(400).json({
         success: false,
         error: {
-          code: 'AI_CHECK_FAILED',
+          code: match.reasonCodes[0] || 'PROOF_VERIFICATION_FAILED',
           message: match.userMessage,
           reasonCodes: match.reasonCodes,
         },
         data: {
           submissionId,
           publicId: booking.public_id,
-          status: 'ai_check_failed',
+          status: match.nextStatus,
           message: match.userMessage,
           details: match.details,
         },
@@ -818,22 +812,23 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       });
     }
 
-    // Run Gemini OCR with bounded retries
-    const analysis = await analyzePaymentScreenshotWithGemini(
+    // Run Local OCR
+    const analysis = await analyzePaymentScreenshot(
       downloaded.buffer,
-      downloaded.mimeType,
       {
         expectedMerchantName: config.PAYEE_DISPLAY_NAME,
         expectedAmount: (booking.total_amount_paise / 100).toFixed(2),
+        expectedAmountPaise: booking.total_amount_paise,
         sessionTimestampIso: booking.created_at || new Date().toISOString(),
+        bookingCreatedAt: booking.created_at,
+        paymentExpiresAt: booking.payment_expires_at,
       }
     );
 
-    if (!analysis.success) {
-      // AI still unavailable: remain in retry pending state
+    if (!analysis.analysisCompleted || analysis.warnings?.includes('OCR_PROCESSING_ERROR')) {
       await db.query(
         'UPDATE payment_submissions SET status = $1, updated_at = $2 WHERE id = $3',
-        ['ai_retry_pending', new Date().toISOString(), submission.id]
+        ['ocr_processing_error', new Date().toISOString(), submission.id]
       );
 
       return res.json({
@@ -841,10 +836,10 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         data: {
           submissionId: submission.id,
           publicId: booking.public_id,
-          status: 'ai_retry_pending',
-          reviewStatus: 'ai_retry_pending',
-          retryable: analysis.retryable,
-          message: 'Verification service is temporarily busy. Please retry shortly.',
+          status: 'ocr_processing_error',
+          reviewStatus: 'ocr_processing_error',
+          retryable: true,
+          message: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
           details: {
             utrMatched: null,
             amountMatched: null,
@@ -855,8 +850,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       });
     }
 
-    const extraction = analysis.extraction;
-    const extractedRrn = extraction.utr_or_rrn ? normalizeUtr(extraction.utr_or_rrn) : '';
+    const extractedRrn = analysis.utrOrRrn ? normalizeUtr(analysis.utrOrRrn) : '';
     let isDuplicateUtr = false;
     let utrHash = submission.payer_utr_hash;
     let encryptedUtr = submission.encrypted_utr;
@@ -865,7 +859,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       utrHash = crypto.createHash('sha256').update(extractedRrn).digest('hex');
       const dupUtrRes = await db.query(
         'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-        [utrHash, booking.id, 'admin_rejected', 'ai_check_failed']
+        [utrHash, booking.id, 'admin_rejected', 'payment_rejected']
       );
       isDuplicateUtr = dupUtrRes.rows.length > 0;
       encryptedUtr = encryptSensitiveField(extractedRrn);
@@ -878,7 +872,9 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
       enteredUtr: extractedRrn,
       selectedApp: submission.selected_upi_app || 'other_upi',
-      extraction,
+      bookingCreatedAt: booking.created_at,
+      paymentExpiresAt: booking.payment_expires_at,
+      analysis,
       isDuplicateUtr,
       isDuplicateScreenshot: false,
       isExpired: false,
@@ -890,22 +886,24 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         payer_utr_hash = $1,
         encrypted_utr = $2,
         status = $3,
-        gemini_extraction = $4,
+        ocr_extraction = $4,
         deterministic_comparison = $5,
         risk_score = $6,
         reason_codes = $7,
-        ai_model_version = $8,
-        updated_at = $9
-      WHERE id = $10`,
+        ocr_engine = $8,
+        extracted_transaction_timestamp = $9,
+        updated_at = $10
+      WHERE id = $11`,
       [
         utrHash,
         encryptedUtr,
         match.nextStatus,
-        JSON.stringify(extraction),
+        JSON.stringify(analysis),
         JSON.stringify(match),
         match.riskScore,
         match.reasonCodes,
-        analysis.model,
+        'tesseract.js',
+        analysis.transactionTimestamp || null,
         new Date().toISOString(),
         submission.id,
       ]
@@ -920,11 +918,11 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       [
         runId,
         submission.id,
-        'retry_gemini_and_deterministic',
+        'retry_local_ocr_and_deterministic',
         match.passed ? 'passed' : 'flagged',
-        extraction.field_confidence?.amount || 0.8,
+        analysis.extractedFields?.fieldConfidence?.amount || 0.8,
         match.reasonCodes,
-        JSON.stringify({ match, extractionSummary: { utr: extraction.utr_or_rrn, amount: extraction.amount } }),
+        JSON.stringify({ match, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
         new Date().toISOString(),
       ]
     );
@@ -934,7 +932,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       const finalResult = await finalizeVerifiedSubmission({
         submissionId: submission.id,
         bookingId: booking.id,
-        decisionVersion: 'v2-automated-gemini-deterministic-retry',
+        decisionVersion: 'v3-local-ocr-deterministic-retry',
       });
 
       return res.json({
@@ -943,7 +941,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
           submissionId: submission.id,
           publicId: booking.public_id,
           status: 'payment_confirmed',
-          reviewStatus: 'ai_check_passed',
+          reviewStatus: 'ocr_verified',
           message: 'Payment proof accepted. Coupons issued.',
           coupons: finalResult.coupons,
           couponsIssuedCount: finalResult.couponsIssuedCount,
@@ -954,20 +952,20 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
     } else {
       await db.query(
         'UPDATE bookings SET status = $1, updated_at = $2 WHERE id = $3',
-        ['ai_check_failed', new Date().toISOString(), booking.id]
+        ['payment_rejected', new Date().toISOString(), booking.id]
       );
 
       return res.status(400).json({
         success: false,
         error: {
-          code: 'AI_CHECK_FAILED',
+          code: match.reasonCodes[0] || 'PROOF_VERIFICATION_FAILED',
           message: match.userMessage,
           reasonCodes: match.reasonCodes,
         },
         data: {
           submissionId: submission.id,
           publicId: booking.public_id,
-          status: 'ai_check_failed',
+          status: match.nextStatus,
           message: match.userMessage,
           details: match.details,
         },
@@ -1018,6 +1016,8 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
       booking.status !== 'payment_confirmed' &&
       booking.status !== 'proof_verified' &&
       booking.status !== 'proof_submitted' &&
+      booking.status !== 'ocr_checking' &&
+      booking.status !== 'ocr_processing_error' &&
       booking.status !== 'ai_retry_pending'
     ) {
       if (booking.status !== 'expired') {
@@ -1049,10 +1049,11 @@ app.get('/api/bookings/:publicId/status', async (req: Request, res: Response) =>
         status: booking.status,
         submissionStatus: latestSub?.status || null,
         reasonCodes: latestSub?.reason_codes || [],
-        isRetryPending: latestSub?.status === 'ai_retry_pending',
+        isRetryPending: latestSub?.status === 'ocr_processing_error' || latestSub?.status === 'ai_retry_pending',
         name: booking.participant_name,
         quantity: booking.quantity,
         totalAmount: booking.total_amount_paise / 100,
+        paidAt: booking.paid_at ? formatKolkataTime(booking.paid_at) : null,
         isVerified: booking.status === 'payment_confirmed' || booking.status === 'proof_verified',
         isExpired: booking.status === 'expired',
         paymentExpiresAt: booking.payment_expires_at,

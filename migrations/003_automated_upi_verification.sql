@@ -35,7 +35,11 @@ BEGIN
   ALTER TABLE payment_submissions DROP CONSTRAINT IF EXISTS payment_submissions_status_check;
   ALTER TABLE payment_submissions ADD CONSTRAINT payment_submissions_status_check CHECK (status IN (
     'proof_submitted',
+    'ocr_checking',
+    'ocr_check_failed',
+    'ocr_processing_error',
     'ai_checking',
+    'ai_retry_pending',
     'ai_check_passed',
     'ai_check_failed',
     'awaiting_admin_review',

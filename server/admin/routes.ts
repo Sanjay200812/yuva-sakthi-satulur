@@ -18,7 +18,6 @@ import {
   rejectPaymentSubmission,
   requestProofResubmission,
 } from '../upi/adminReconciliation.ts';
-import { getGeminiHealthStatus } from '../upi/geminiAnalyzer.ts';
 
 const router = express.Router();
 
@@ -121,7 +120,7 @@ router.get('/dashboard', requireAdminAuth, async (req: Request, res: Response) =
           (SELECT COALESCE(SUM(total_amount_paise), 0) / 100 FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "totalRevenueInr",
           (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= CURRENT_DATE)::int as "bookingsToday",
           (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= CURRENT_DATE)::int as "couponsToday",
-          (SELECT COUNT(*) FROM payment_submissions WHERE status IN ('verification_failed', 'ai_check_failed', 'admin_rejected', 'awaiting_admin_review', 'proof_submitted', 'ai_checking'))::int as "failedOrPendingAttempts"
+          (SELECT COUNT(*) FROM payment_submissions WHERE status IN ('verification_failed', 'ocr_check_failed', 'ocr_processing_error', 'ai_check_failed', 'admin_rejected', 'awaiting_admin_review', 'proof_submitted', 'ocr_checking', 'ai_checking'))::int as "failedOrPendingAttempts"
       `);
       data = metricsRes.rows[0];
     }
@@ -186,7 +185,7 @@ router.get('/coupons', requireAdminAuth, async (req: Request, res: Response) => 
           formattedPaidAt: formatKolkataTime(item.verified_at || item.paid_at),
           maskedPhone: maskPhoneNumber(item.phone),
           amountInr: (item.amount_paise || 5000) / 100,
-          verificationMethod: 'Automated Proof Verification (Gemini OCR + Deterministic Rules)',
+          verificationMethod: 'Automated Proof Verification (Local OCR + Deterministic Rules)',
         })),
         pagination: {
           page,
@@ -379,7 +378,7 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
 
     res.json({
       success: true,
-      aiHealth: getGeminiHealthStatus(),
+      ocrEngine: 'tesseract.js',
       data: items.map((s: any) => ({
         id: s.id,
         bookingId: s.booking_id,
@@ -395,7 +394,10 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
         status: s.status,
         riskScore: s.risk_score || 0,
         reasonCodes: s.reason_codes || [],
-        geminiExtraction: parseJson(s.gemini_extraction),
+        ocrExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
+        geminiExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
+        ocrEngine: s.ocr_engine || 'tesseract.js',
+        extractedTransactionTimestamp: s.extracted_transaction_timestamp,
         deterministicComparison: parseJson(s.deterministic_comparison),
         hasScreenshot: !!s.screenshot_storage_path,
         adminReviewerId: s.admin_reviewer_id,

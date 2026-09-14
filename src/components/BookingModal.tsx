@@ -56,20 +56,20 @@ const UPI_APPS: { id: UpiAppChoice; label: string; appName: string; color: strin
 ];
 
 const REASON_MESSAGES: Record<string, string> = {
-  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.",
-  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.",
+  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
+  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
   DUPLICATE_PAYMENT_REFERENCE: 'This payment receipt has already been used.',
   DUPLICATE_RRN: 'This payment receipt has already been used.',
   DUPLICATE_UTR: 'This payment receipt has already been used.',
   INVALID_PAYMENT_REFERENCE: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
   INVALID_RRN: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
   MISSING_AMOUNT: 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.',
-  AMOUNT_MISMATCH: 'Payment amount does not match.',
+  AMOUNT_MISMATCH: 'Payment amount does not match authoritative booking total.',
   STATUS_NOT_SUCCESS: 'Payment is not shown as successful.',
   DUPLICATE_SCREENSHOT: 'This payment screenshot has already been submitted for another booking.',
-  TAMPERING_RISK: 'The payment receipt could not be verified due to image quality or authenticity concerns.',
-  LOW_OCR_CONFIDENCE: 'The receipt text is blurry or illegible. Please upload a clearer screenshot.',
-  LOW_CONFIDENCE: 'The receipt text is blurry or illegible. Please upload a clearer screenshot.',
+  TRANSACTION_TIME_MISMATCH: 'Transaction timestamp on the receipt does not match this booking session.',
+  OCR_UNREADABLE: "We couldn't clearly read this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.",
+  OCR_PROCESSING_ERROR: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
   PAYMENT_SESSION_EXPIRED: 'Your 5-minute payment session has expired. Start a new booking.',
   WRONG_PAYEE: 'The payment recipient shown does not match Yuva Shakti Youth Satulur.',
   INVALID_PAYMENT_SCREEN: 'The uploaded image does not appear to be a valid UPI payment confirmation screen.',
@@ -272,8 +272,8 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const handleManualRetry = async () => {
     if (!bookingData) return;
     setIsProcessing(true);
-    setLiveStatus('ai_retry_pending');
-    setStatusMessage('Verifying your payment... Checking automated AI verification.');
+    setLiveStatus('analyzing');
+    setStatusMessage('Reading payment receipt...');
 
     try {
       const res = await retryPaymentVerification({
@@ -286,16 +286,18 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         return;
       }
 
-      if (res.status === 'ai_retry_pending') {
-        setLiveStatus('ai_unavailable');
-        setStatusMessage('Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.');
-      } else if (res.status === 'ai_check_failed') {
+      if (res.status === 'ocr_processing_error') {
+        setLiveStatus('ocr_processing_error');
+        setStatusMessage(res.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
+      } else {
         setLiveStatus('verification_failed');
-        setStatusMessage(res.message || 'Payment proof verification failed.');
+        const reason = (res as any).reasonCode || (res as any).reasons?.[0];
+        const friendly = reason && REASON_MESSAGES[reason] ? REASON_MESSAGES[reason] : (res.message || 'Payment proof verification failed.');
+        setStatusMessage(friendly);
       }
     } catch (err: any) {
-      setLiveStatus('ai_unavailable');
-      setStatusMessage(err.message || 'Verification service is temporarily busy. Please retry verification shortly.');
+      setLiveStatus('ocr_processing_error');
+      setStatusMessage(err.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
     } finally {
       setIsProcessing(false);
     }
@@ -325,7 +327,23 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     setErrorMessage(null);
     setStep('status');
     setLiveStatus('analyzing');
-    setStatusMessage('Analyzing payment screenshot with AI and verifying details...');
+    setStatusMessage('Reading payment receipt...');
+
+    // Dynamic verification progress indicators
+    const progressStages = [
+      'Checking payment amount...',
+      'Checking transaction reference...',
+      'Checking payment status...',
+      'Checking duplicate transaction...',
+      'Finalizing coupon...',
+    ];
+    let stageIdx = 0;
+    const progressTimer = setInterval(() => {
+      if (stageIdx < progressStages.length) {
+        setStatusMessage(progressStages[stageIdx]);
+        stageIdx++;
+      }
+    }, 700);
 
     try {
       const res = await submitPaymentProof({
@@ -337,53 +355,24 @@ export const BookingModal: React.FC<BookingModalProps> = ({
         isRecovery: isExpired || false,
       });
 
+      clearInterval(progressTimer);
+
       if ((res.status === 'payment_confirmed' || res.status === 'proof_verified') && res.coupons?.length) {
         handleBookingConfirmed(res);
         return;
       }
 
-      // Requirement 2 & 7: Separate AI infrastructure retry from actual fraud failure
-      if (res.status === 'ai_retry_pending') {
-        setLiveStatus('ai_retry_pending');
-        setStatusMessage('Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.');
-
-        // Bounded automatic retry with backoff: 3s, 6s, 12s
-        (async () => {
-          const delays = [3000, 6000, 12000];
-          for (let i = 0; i < delays.length; i++) {
-            await new Promise((r) => setTimeout(r, delays[i]));
-            try {
-              const retryRes = await retryPaymentVerification({
-                publicId: bookingData.booking.publicId,
-                statusToken: bookingData.payment.statusToken,
-              });
-
-              if ((retryRes.status === 'payment_confirmed' || retryRes.status === 'proof_verified') && retryRes.coupons?.length) {
-                handleBookingConfirmed(retryRes);
-                return;
-              }
-
-              if (retryRes.status === 'ai_check_failed') {
-                setLiveStatus('verification_failed');
-                setStatusMessage(retryRes.message || 'Payment proof verification failed.');
-                return;
-              }
-            } catch {
-              // Ignore transient error in polling loop
-            }
-          }
-
-          // If AI remains unavailable after retries, show guidance and Retry Verification button
-          setLiveStatus('ai_unavailable');
-          setStatusMessage('Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.');
-        })();
+      if (res.status === 'ocr_processing_error') {
+        setLiveStatus('ocr_processing_error');
+        setStatusMessage(res.message || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.");
         return;
       }
 
       setLiveStatus(res.status);
-      const friendlyMessage = (res as any).reasonCode
-        ? REASON_MESSAGES[(res as any).reasonCode] || res.message
-        : res.message;
+      const reason = (res as any).reasonCode || (res as any).reasons?.[0];
+      const friendlyMessage = reason && REASON_MESSAGES[reason]
+        ? REASON_MESSAGES[reason]
+        : (res.message || 'Payment proof verification failed.');
       setStatusMessage(friendlyMessage);
 
       // Start polling for automated verification completion if needed
@@ -967,20 +956,20 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                 <div className="w-16 h-16 mx-auto rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center text-emerald-400 animate-bounce">
                   <CheckCircle2 className="w-9 h-9" />
                 </div>
-                <h4 className="text-xl font-black text-white font-display">Payment Proof Accepted!</h4>
+                <h4 className="text-xl font-black text-white font-display">Payment Proof Verified!</h4>
                 <p className="text-sm text-emerald-300 font-bold">
-                  {bookingData?.booking.quantity || 1} {bookingData?.booking.quantity === 1 ? 'coupon' : 'coupons'} generated!
+                  Payment proof verified successfully. {bookingData?.booking.quantity || 1} {bookingData?.booking.quantity === 1 ? 'coupon' : 'coupons'} generated!
                 </p>
                 <p className="text-xs text-slate-400">Opening your tickets...</p>
               </div>
-            ) : liveStatus === 'ai_unavailable' ? (
+            ) : liveStatus === 'ocr_processing_error' ? (
               <div className="space-y-3">
                 <div className="w-16 h-16 mx-auto rounded-full bg-amber-500/20 border-2 border-amber-400 flex items-center justify-center text-amber-400">
                   <AlertCircle className="w-9 h-9" />
                 </div>
-                <h4 className="text-xl font-black text-white font-display">Verification Temporarily Busy</h4>
+                <h4 className="text-xl font-black text-white font-display">Receipt Processing Notice</h4>
                 <p className="text-xs text-amber-300 font-medium max-w-sm mx-auto">
-                  Your proof is safely received, but automatic verification is temporarily unavailable. Please retry verification shortly. Do not pay again.
+                  {statusMessage || "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification."}
                 </p>
                 <div className="pt-2">
                   <button
@@ -997,20 +986,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                   Order Reference: <strong className="text-white">{bookingData?.booking.publicId}</strong>
                 </div>
               </div>
-            ) : liveStatus === 'ai_retry_pending' ? (
-              <div className="space-y-3">
-                <div className="w-16 h-16 mx-auto rounded-full bg-purple-500/20 border-2 border-amber-400 flex items-center justify-center text-amber-400">
-                  <Loader2 className="w-9 h-9 animate-spin" />
-                </div>
-                <h4 className="text-xl font-black text-white font-display">Verifying Your Payment</h4>
-                <p className="text-xs text-amber-300 font-medium max-w-sm mx-auto">
-                  Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.
-                </p>
-                <div className="p-3 rounded-xl bg-slate-950/80 border border-purple-500/20 text-[11px] text-slate-400 font-mono">
-                  Order Reference: <strong className="text-white">{bookingData?.booking.publicId}</strong>
-                </div>
-              </div>
-            ) : liveStatus === 'verification_failed' || liveStatus === 'rejected' ? (
+            ) : liveStatus === 'verification_failed' || liveStatus === 'rejected' || liveStatus === 'ocr_check_failed' ? (
               <div className="space-y-3">
                 <div className="w-16 h-16 mx-auto rounded-full bg-red-500/20 border-2 border-red-400 flex items-center justify-center text-red-400">
                   <AlertCircle className="w-9 h-9" />

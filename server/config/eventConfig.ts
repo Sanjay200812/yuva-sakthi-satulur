@@ -44,7 +44,7 @@ const envSchema = z.object({
     Buffer.from('c2Jfc2VjcmV0X2lqQVlLQWp3NHBmUkFFRVpzejZQZUFfcmlsZGFFbHI=', 'base64').toString('utf-8')
   ),
 
-  // Direct Merchant-UPI & Gemini Verification Configuration
+  // Direct Merchant-UPI & Local OCR Verification Configuration
   PAYMENT_MODE: z.string().default('direct_upi_automated_verification'),
   PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || (process.env.NODE_ENV === 'production' ? '' : '7075920852@ybl')),
   PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur'),
@@ -57,13 +57,7 @@ const envSchema = z.object({
   }, z.literal(5)).default(5),
   PAYMENT_SCREENSHOT_MAX_BYTES: z.coerce.number().int().positive().default(5242880),
   PAYMENT_PROOF_BUCKET: z.literal('payment-proofs').default('payment-proofs'),
-  GEMINI_API_KEY: z.string().default(
-    process.env.GEMINI_API_KEY ||
-    Buffer.from('QVEuQWI4Uk42S2ZHejV4Nmc2NExiQlNTcnI1VWMyQUtjd2RaVElwX1A2ZlRYaS1UelVON3c=', 'base64').toString('utf-8')
-  ),
-  GEMINI_MODEL: z.string().default(process.env.GEMINI_MODEL || 'gemini-3.6-flash'),
-  GEMINI_FALLBACK_MODEL: z.string().default(process.env.GEMINI_FALLBACK_MODEL || 'gemini-flash-latest'),
-  GEMINI_STORE_INTERACTIONS: z.preprocess((val) => val === 'true' || val === true, z.boolean()).default(false),
+  OCR_ENGINE: z.string().default(process.env.OCR_ENGINE || 'tesseract.js'),
   FIELD_ENCRYPTION_KEY: z.string().default(process.env.FIELD_ENCRYPTION_KEY || ''),
 
   // Event Configuration
@@ -167,13 +161,6 @@ export function getSupabaseProjectRef(url: string): string {
   }
 }
 
-// Ensure GEMINI_MODEL and GEMINI_FALLBACK_MODEL use environment
-if (process.env.GEMINI_MODEL) {
-  config.GEMINI_MODEL = process.env.GEMINI_MODEL;
-}
-if (process.env.GEMINI_FALLBACK_MODEL) {
-  config.GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL;
-}
 
 // Production Security Validation (Log actionable warnings without crashing the serverless container)
 if (config.NODE_ENV === 'production') {

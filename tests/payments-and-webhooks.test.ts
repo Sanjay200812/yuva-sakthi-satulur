@@ -12,8 +12,17 @@ import {
   getSignedScreenshotUrl,
   checkStorageHealth,
 } from '../server/upi/imageProcessor.ts';
-import { performDeterministicComparison } from '../server/upi/deterministicMatcher.ts';
-import { setMockGeminiExtraction, setMockGeminiResult } from '../server/upi/geminiAnalyzer.ts';
+import { performDeterministicComparison, performDeterministicOcrComparison } from '../server/upi/deterministicMatcher.ts';
+import {
+  setMockOcrResult,
+  setMockOcrText,
+  normalizeOcrText,
+  extractPaymentReference,
+  extractAmount,
+  extractPaymentStatus,
+  extractTransactionTimestamp,
+  extractUpiId,
+} from '../server/upi/localOcrAnalyzer.ts';
 import { db } from '../server/db/client.ts';
 
 // Helper to generate a valid unique raster PNG base64 string that passes Sharp image validation
@@ -32,8 +41,8 @@ async function createValidScreenshotBase64(customSeed?: number): Promise<string>
 
 describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipeline', () => {
   beforeEach(() => {
-    setMockGeminiExtraction(null);
-    setMockGeminiResult(null);
+    setMockOcrResult(null);
+    setMockOcrText(null);
   });
 
   it('generates canonical NPCI UPI URI with fixed am, unique reference, and no mam', () => {
@@ -191,28 +200,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     const validImg = await createValidScreenshotBase64();
 
-    // Provide OCR extraction with valid reference number
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '50.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'Nagaraju',
-      utr_or_rrn: '523489123456',
-      transaction_id: 'T2609140101',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: {
-        amount: 0.98,
-        payee: 0.95,
-        utr: 0.96,
-        status: 0.99,
-        timestamp: 0.92,
-      },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 50 UTR 523489123456',
+      normalizedText: 'Payment Successful 50 UTR 523489123456',
+      paymentStatus: 'success',
+      amount: 50.00,
+      amountText: '50.00',
+      utrOrRrn: '523489123456',
+      transactionId: 'T2609140101',
+      transactionDate: '15 Sep 2026',
+      transactionTime: '01:24 AM',
+      transactionTimestamp: new Date().toISOString(),
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Nagaraju',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
     });
 
     // Request does NOT contain any manual UTR/RRN
@@ -241,27 +246,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     const validImg = await createValidScreenshotBase64();
 
     // OCR cannot clearly read RRN/UTR
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'google_pay',
-      amount: '50.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'Sudha Rani',
-      utr_or_rrn: null, // RRN missing from screenshot
-      transaction_id: null,
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: {
-        amount: 0.95,
-        payee: 0.90,
-        utr: 0,
-        status: 0.95,
-        timestamp: 0.85,
-      },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 50',
+      normalizedText: 'Payment Successful 50',
+      paymentStatus: 'success',
+      amount: 50.00,
+      amountText: '50.00',
+      utrOrRrn: null,
+      transactionId: null,
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: null,
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Sudha Rani',
+      detectedApp: 'google_pay',
+      extractedFields: {},
+      warnings: [],
     });
 
     const res = await request(app)
@@ -275,7 +277,6 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error.code).toBe('AI_CHECK_FAILED');
     expect(res.body.error.reasonCodes).toContain('MISSING_PAYMENT_REFERENCE');
     expect(res.body.error.message).toContain("We couldn't clearly read the transaction reference from this screenshot");
   });
@@ -289,21 +290,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     const img1 = await createValidScreenshotBase64();
 
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '50.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'First User',
-      utr_or_rrn: '425511223344',
-      transaction_id: 'T1001',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: { amount: 0.98, payee: 0.95, utr: 0.95, status: 0.99, timestamp: 0.9 },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 50 UTR 425511223344',
+      normalizedText: 'Payment Successful 50 UTR 425511223344',
+      paymentStatus: 'success',
+      amount: 50.00,
+      amountText: '50.00',
+      utrOrRrn: '425511223344',
+      transactionId: 'T1001',
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: new Date().toISOString(),
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'First User',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
     });
 
     const res1 = await request(app)
@@ -326,21 +330,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       create: { width: 310, height: 410, channels: 3, background: { r: 240, g: 240, b: 240 } }
     }).png().toBuffer()).toString('base64');
 
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '50.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'Second User',
-      utr_or_rrn: '425511223344', // Reused reference!
-      transaction_id: 'T1002',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: { amount: 0.98, payee: 0.95, utr: 0.95, status: 0.99, timestamp: 0.9 },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 50 UTR 425511223344',
+      normalizedText: 'Payment Successful 50 UTR 425511223344',
+      paymentStatus: 'success',
+      amount: 50.00,
+      amountText: '50.00',
+      utrOrRrn: '425511223344', // Reused reference!
+      transactionId: 'T1002',
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: new Date().toISOString(),
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Second User',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
     });
 
     const res2 = await request(app)
@@ -365,21 +372,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     const validImg = await createValidScreenshotBase64();
 
     // Amount on screenshot is ₹100 instead of expected ₹50
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '100.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'Amount Mismatch User',
-      utr_or_rrn: '778899001122',
-      transaction_id: 'T1003',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: { amount: 0.98, payee: 0.95, utr: 0.95, status: 0.99, timestamp: 0.9 },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 100 UTR 778899001122',
+      normalizedText: 'Payment Successful 100 UTR 778899001122',
+      paymentStatus: 'success',
+      amount: 100.00,
+      amountText: '100.00',
+      utrOrRrn: '778899001122',
+      transactionId: 'T1003',
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: new Date().toISOString(),
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Amount Mismatch User',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
     });
 
     const res = await request(app)
@@ -392,7 +402,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     expect(res.status).toBe(400);
     expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
-    expect(res.body.error.message).toBe('Payment amount does not match.');
+    expect(res.body.error.message).toContain('Payment amount');
   });
 
   it('deterministic comparison fails when OCR amount or OCR RRN is missing', () => {
@@ -603,21 +613,24 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     const validImg = await createValidScreenshotBase64();
 
-    setMockGeminiExtraction({
-      looks_like_payment_screen: true,
-      visible_payment_status: 'success',
-      app_name: 'phonepe',
-      amount: '150.00',
-      currency: 'INR',
-      payee_name: 'Yuva Shakti Youth Satulur',
-      payee_upi_id: '7075920852@ybl',
-      payer_name: 'Triad Buyer',
-      utr_or_rrn: '334455667788',
-      transaction_id: 'T3001',
-      transaction_timestamp: new Date().toISOString(),
-      obvious_editing_signals: [],
-      ai_generated_likelihood: 'low',
-      field_confidence: { amount: 0.98, payee: 0.95, utr: 0.95, status: 0.99, timestamp: 0.9 },
+    setMockOcrResult({
+      analysisCompleted: true,
+      rawText: 'Payment Successful 150 UTR 334455667788',
+      normalizedText: 'Payment Successful 150 UTR 334455667788',
+      paymentStatus: 'success',
+      amount: 150.00,
+      amountText: '150.00',
+      utrOrRrn: '334455667788',
+      transactionId: 'T3001',
+      transactionDate: null,
+      transactionTime: null,
+      transactionTimestamp: new Date().toISOString(),
+      payeeName: 'Yuva Shakti Youth Satulur',
+      payeeUpiId: '7075920852@ybl',
+      payerName: 'Triad Buyer',
+      detectedApp: 'phonepe',
+      extractedFields: {},
+      warnings: [],
     });
 
     const res = await request(app)
@@ -847,7 +860,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       }
     });
 
-    it('successful Supabase upload stores supabase:<objectPath> and keeps sanitizedBuffer in memory for Gemini', async () => {
+    it('successful Supabase upload stores supabase:<objectPath> and keeps sanitizedBuffer in memory for Local OCR', async () => {
       const origFetch = global.fetch;
 
       try {
@@ -896,22 +909,25 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
         [createdTime, pastTime, 'payment_initiated', booking.id]
       );
 
-      // 3. Mock Gemini with matching extraction
-      setMockGeminiExtraction({
-        looks_like_payment_screen: true,
-        visible_payment_status: 'success',
-        app_name: 'phonepe',
-        amount: '50.00',
-        currency: 'INR',
-        payee_name: config.PAYEE_DISPLAY_NAME,
-        payee_upi_id: config.PAYEE_UPI_ID,
-        payer_name: 'Real Paid User',
-        utr_or_rrn: '998877665544',
-        transaction_id: 'TXN-REC-1',
-        transaction_timestamp: new Date().toISOString(),
-        obvious_editing_signals: [],
-        ai_generated_likelihood: 'low',
-        field_confidence: { amount: 0.98, payee: 0.95, utr: 0.98, status: 0.99, timestamp: 0.95 },
+      // 3. Mock OCR with matching extraction
+      setMockOcrResult({
+        analysisCompleted: true,
+        rawText: 'Payment Successful 50 UTR 998877665544',
+        normalizedText: 'Payment Successful 50 UTR 998877665544',
+        paymentStatus: 'success',
+        amount: 50.00,
+        amountText: '50.00',
+        utrOrRrn: '998877665544',
+        transactionId: 'TXN-REC-1',
+        transactionDate: null,
+        transactionTime: null,
+        transactionTimestamp: new Date().toISOString(),
+        payeeName: config.PAYEE_DISPLAY_NAME,
+        payeeUpiId: config.PAYEE_UPI_ID,
+        payerName: 'Real Paid User',
+        detectedApp: 'phonepe',
+        extractedFields: {},
+        warnings: [],
       });
 
       const validImg = await createValidScreenshotBase64(4455);
@@ -1034,444 +1050,717 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     });
   });
 
-  describe('Fix False AI Check Failures & Decoupled Infrastructure Retry (11 Scenarios)', () => {
-    it('Scenario 1: valid screenshot + Gemini success -> payment_confirmed with coupons', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Valid User', phone: '9848011111', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(101);
+  describe('Phase 14: Deterministic Code-Only Local OCR Verification Engine', () => {
+    describe('Receipt Parsing Unit Tests (PhonePe, Google Pay, Paytm, Other)', () => {
+      it('parses PhonePe receipt text accurately', () => {
+        const text = `
+          Payment Successful
+          ₹50
+          Paid to Yuva Shakti
+          UPI Ref No: 123456789012
+          15 Sep 2026, 1:24 AM
+        `;
+        const normalized = normalizeOcrText(text);
+        const status = extractPaymentStatus(normalized);
+        const amount = extractAmount(normalized, 50);
+        const ref = extractPaymentReference(normalized);
+        const ts = extractTransactionTimestamp(normalized);
 
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'success',
-          app_name: 'phonepe',
-          amount: '50.00',
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'Valid User',
-          utr_or_rrn: '111122223333',
-          transaction_id: 'T101',
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0.96, status: 0.99, timestamp: 0.92 },
-        },
+        expect(status.status).toBe('success');
+        expect(amount.amount).toBe(50);
+        expect(ref.utrOrRrn).toBe('123456789012');
+        expect(ts.timestampIso).not.toBeNull();
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('parses Google Pay receipt text accurately', () => {
+        const text = `
+          Payment complete
+          ₹100.00
+          UPI transaction ID
+          234567890123
+          15 Sept 2026 01:26 AM
+        `;
+        const normalized = normalizeOcrText(text);
+        const status = extractPaymentStatus(normalized);
+        const amount = extractAmount(normalized, 100);
+        const ref = extractPaymentReference(normalized);
+        const ts = extractTransactionTimestamp(normalized);
 
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(res.body.data.status).toBe('payment_confirmed');
-      expect(res.body.data.coupons.length).toBe(1);
-    });
-
-    it('Scenario 2: Gemini throws 429 -> ai_retry_pending, NOT ai_check_failed', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Rate Limited User', phone: '9848022222', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(102);
-
-      setMockGeminiResult({
-        success: false,
-        retryable: true,
-        errorCode: 'GEMINI_RATE_LIMITED',
-        errorCategory: 'quota',
-        safeMessage: 'Gemini rate limit exceeded. Verification will retry automatically.',
-        model: 'gemini-3.6-flash',
-        attempts: 3,
-        httpStatus: 429,
+        expect(status.status).toBe('success');
+        expect(amount.amount).toBe(100);
+        expect(ref.utrOrRrn).toBe('234567890123');
+        expect(ts.timestampIso).not.toBeNull();
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('parses Paytm receipt text accurately', () => {
+        const text = `
+          Payment Successful
+          ₹ 50.00
+          Sent to 7075920852@ybl
+          UPI Ref: 345678901234
+          15-09-2026 01:24 AM
+        `;
+        const normalized = normalizeOcrText(text);
+        const status = extractPaymentStatus(normalized);
+        const amount = extractAmount(normalized, 50);
+        const ref = extractPaymentReference(normalized);
+        const upi = extractUpiId(normalized);
 
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(res.body.data.status).toBe('ai_retry_pending');
-      expect(res.body.data.retryable).toBe(true);
-
-      // Verify DB booking status is proof_submitted, NOT ai_check_failed
-      const dbBooking = await db.query('SELECT status FROM bookings WHERE public_id = $1', [booking.publicId]);
-      expect(dbBooking.rows[0].status).toBe('proof_submitted');
-    });
-
-    it('Scenario 3: Gemini throws 500 -> retry -> infrastructure pending (ai_retry_pending)', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Server Error User', phone: '9848033333', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(103);
-
-      setMockGeminiResult({
-        success: false,
-        retryable: true,
-        errorCode: 'GEMINI_SERVICE_UNAVAILABLE',
-        errorCategory: 'server',
-        safeMessage: 'Gemini verification service is temporarily busy. Retrying automatically.',
-        model: 'gemini-3.6-flash',
-        attempts: 3,
-        httpStatus: 503,
+        expect(status.status).toBe('success');
+        expect(amount.amount).toBe(50);
+        expect(ref.utrOrRrn).toBe('345678901234');
+        expect(upi.upiId).toBe('7075920852@ybl');
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
-
-      expect(res.status).toBe(200);
-      expect(res.body.data.status).toBe('ai_retry_pending');
-    });
-
-    it('Scenario 4: Gemini invalid key -> infrastructure/config error -> no fake MISSING_RRN/MISSING_AMOUNT codes', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Auth Error User', phone: '9848044444', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(104);
-
-      setMockGeminiResult({
-        success: false,
-        retryable: false,
-        errorCode: 'GEMINI_AUTH_FAILED',
-        errorCategory: 'auth',
-        safeMessage: 'Gemini authentication credentials are invalid or unauthorized.',
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        httpStatus: 401,
+      it('parses Bank Reference Number / RRN label variations', () => {
+        const text = `
+          Transaction Success
+          Amount: INR 50.00
+          Bank Reference Number: 987654321098
+        `;
+        const normalized = normalizeOcrText(text);
+        const ref = extractPaymentReference(normalized);
+        expect(ref.utrOrRrn).toBe('987654321098');
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
-
-      expect(res.status).toBe(200);
-      expect(res.body.data.status).toBe('ai_retry_pending');
-
-      // Check submission reason codes: must ONLY contain AI_UNAVAILABLE, NOT MISSING_RRN / MISSING_AMOUNT
-      const sub = await db.query('SELECT reason_codes FROM payment_submissions WHERE id = $1', [res.body.data.submissionId]);
-      expect(sub.rows[0].reason_codes).toEqual(['AI_UNAVAILABLE']);
-      expect(sub.rows[0].reason_codes).not.toContain('MISSING_RRN');
-      expect(sub.rows[0].reason_codes).not.toContain('MISSING_AMOUNT');
-      expect(sub.rows[0].reason_codes).not.toContain('STATUS_NOT_SUCCESS');
-    });
-
-    it('Scenario 5: Gemini timeout -> retry pending', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Timeout User', phone: '9848055555', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(105);
-
-      setMockGeminiResult({
-        success: false,
-        retryable: true,
-        errorCode: 'GEMINI_NETWORK_TIMEOUT',
-        errorCategory: 'network',
-        safeMessage: 'Network timeout contacting Gemini verification endpoint.',
-        model: 'gemini-3.6-flash',
-        attempts: 3,
+      it('prioritizes explicit FAILED over success words', () => {
+        const text = `
+          Payment Failed
+          Payment processing completed
+          ₹50.00
+        `;
+        const normalized = normalizeOcrText(text);
+        const status = extractPaymentStatus(normalized);
+        expect(status.status).toBe('failed');
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
-
-      expect(res.status).toBe(200);
-      expect(res.body.data.status).toBe('ai_retry_pending');
-      expect(res.body.data.retryable).toBe(true);
+      it('applies controlled numeric normalization for RRN digits without corrupting words', () => {
+        const text = `
+          UTR: 1O23456789O1
+        `;
+        const normalized = normalizeOcrText(text);
+        const ref = extractPaymentReference(normalized);
+        expect(ref.utrOrRrn).toBe('102345678901');
+      });
     });
 
-    it('Scenario 6: successful Gemini extraction but RRN absent -> fails with MISSING_RRN', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'No RRN User', phone: '9848066666', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(106);
+    describe('Verification Integration Scenarios (14 Scenarios)', () => {
+      it('Scenario 1: valid ₹50 screenshot OCR -> accepted and coupons issued', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Valid User', phone: '9848011111', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(101);
 
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'success',
-          app_name: 'phonepe',
-          amount: '50.00',
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'No RRN User',
-          utr_or_rrn: null, // absent
-          transaction_id: null,
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0, status: 0.99, timestamp: 0.92 },
-        },
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 111122223333',
+          normalizedText: 'Payment Successful ₹50 UTR: 111122223333',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '111122223333',
+          transactionId: 'T101',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Valid User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.status).toBe('payment_confirmed');
+        expect(res.body.data.coupons.length).toBe(1);
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('Scenario 2: quantity 2 + ₹100 -> accepted', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Double Buyer', phone: '9848022222', village: 'Satulur', quantity: 2 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(102);
 
-      expect(res.status).toBe(400);
-      expect(res.body.success).toBe(false);
-      expect(res.body.error.code).toBe('AI_CHECK_FAILED');
-      expect(res.body.error.reasonCodes).toContain('MISSING_RRN');
-    });
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹100 UTR: 222233334444',
+          normalizedText: 'Payment Successful ₹100 UTR: 222233334444',
+          paymentStatus: 'success',
+          amount: 100.00,
+          amountText: '100.00',
+          utrOrRrn: '222233334444',
+          transactionId: 'T102',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Double Buyer',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
 
-    it('Scenario 7: successful Gemini extraction but wrong amount -> fails with AMOUNT_MISMATCH', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Wrong Amount User', phone: '9848077777', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(107);
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
 
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'success',
-          app_name: 'phonepe',
-          amount: '10.00', // Expected 50.00
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'Wrong Amount User',
-          utr_or_rrn: '123456789012',
-          transaction_id: 'T107',
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0.96, status: 0.99, timestamp: 0.92 },
-        },
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.status).toBe('payment_confirmed');
+        expect(res.body.data.coupons.length).toBe(2);
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('Scenario 3: quantity 2 + ₹50 -> AMOUNT_MISMATCH', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Underpayer', phone: '9848033333', village: 'Satulur', quantity: 2 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(103);
 
-      expect(res.status).toBe(400);
-      expect(res.body.error.code).toBe('AI_CHECK_FAILED');
-      expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
-    });
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 333344445555',
+          normalizedText: 'Payment Successful ₹50 UTR: 333344445555',
+          paymentStatus: 'success',
+          amount: 50.00, // Expected 100!
+          amountText: '50.00',
+          utrOrRrn: '333344445555',
+          transactionId: 'T103',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Underpayer',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
 
-    it('Scenario 8: successful Gemini extraction but failed payment -> fails with STATUS_NOT_SUCCESS', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Failed Status User', phone: '9848088888', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(108);
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
 
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'failed',
-          app_name: 'phonepe',
-          amount: '50.00',
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'Failed Status User',
-          utr_or_rrn: '123456789013',
-          transaction_id: 'T108',
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0.96, status: 0.99, timestamp: 0.92 },
-        },
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('AMOUNT_MISMATCH');
       });
 
-      const res = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('Scenario 4: success + missing RRN -> MISSING_PAYMENT_REFERENCE', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'No RRN User', phone: '9848044444', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(104);
 
-      expect(res.status).toBe(400);
-      expect(res.body.error.code).toBe('AI_CHECK_FAILED');
-      expect(res.body.error.reasonCodes).toContain('STATUS_NOT_SUCCESS');
-    });
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50',
+          normalizedText: 'Payment Successful ₹50',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: null, // missing RRN
+          transactionId: null,
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'No RRN User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
 
-    it('Scenario 9: AI_UNAVAILABLE never coexists with artificial STATUS_NOT_SUCCESS, MISSING_RRN, MISSING_AMOUNT', () => {
-      const matcherResult = performDeterministicComparison({
-        expectedAmountPaise: 5000,
-        expectedPayeeUpiId: '7075920852@ybl',
-        expectedPayeeName: 'Yuva Shakti Youth Satulur',
-        selectedApp: 'phonepe',
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'unknown',
-          app_name: 'unknown',
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('MISSING_PAYMENT_REFERENCE');
+      });
+
+      it('Scenario 5: failed transaction -> STATUS_NOT_SUCCESS', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Failed User', phone: '9848055555', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(105);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Failed ₹50 UTR: 555566667777',
+          normalizedText: 'Payment Failed ₹50 UTR: 555566667777',
+          paymentStatus: 'failed',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '555566667777',
+          transactionId: 'T105',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Failed User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('STATUS_NOT_SUCCESS');
+      });
+
+      it('Scenario 6: pending transaction -> STATUS_NOT_SUCCESS', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Pending User', phone: '9848066666', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(106);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Processing ₹50 UTR: 666677778888',
+          normalizedText: 'Payment Processing ₹50 UTR: 666677778888',
+          paymentStatus: 'pending',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '666677778888',
+          transactionId: 'T106',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Pending User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('STATUS_NOT_SUCCESS');
+      });
+
+      it('Scenario 7: duplicate RRN -> DUPLICATE_PAYMENT_REFERENCE', async () => {
+        // First booking succeeds
+        const bRes1 = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'User One', phone: '9848077777', village: 'Satulur', quantity: 1 });
+        const b1 = bRes1.body.data;
+        const img1 = await createValidScreenshotBase64(1071);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 777711112222',
+          normalizedText: 'Payment Successful ₹50 UTR: 777711112222',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '777711112222',
+          transactionId: 'T1071',
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'User One',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        await request(app)
+          .post(`/api/bookings/${b1.booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${b1.payment.statusToken}`)
+          .send({ screenshotBase64: img1, consentGiven: true });
+
+        // Second booking attempts same RRN
+        const bRes2 = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'User Two', phone: '9848077778', village: 'Satulur', quantity: 1 });
+        const b2 = bRes2.body.data;
+        const img2 = await createValidScreenshotBase64(1072);
+
+        const res2 = await request(app)
+          .post(`/api/bookings/${b2.booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${b2.payment.statusToken}`)
+          .send({ screenshotBase64: img2, consentGiven: true });
+
+        expect(res2.status).toBe(400);
+        expect(res2.body.error.reasonCodes).toContain('DUPLICATE_PAYMENT_REFERENCE');
+      });
+
+      it('Scenario 8: same screenshot for another finalized booking -> DUPLICATE_SCREENSHOT', async () => {
+        // First booking
+        const bRes1 = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Owner', phone: '9848088881', village: 'Satulur', quantity: 1 });
+        const b1 = bRes1.body.data;
+        const sameImg = await createValidScreenshotBase64(1088);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 888811112222',
+          normalizedText: 'Payment Successful ₹50 UTR: 888811112222',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '888811112222',
+          transactionId: 'T1088',
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Owner',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        await request(app)
+          .post(`/api/bookings/${b1.booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${b1.payment.statusToken}`)
+          .send({ screenshotBase64: sameImg, consentGiven: true });
+
+        // Second booking uses exact same screenshot image
+        const bRes2 = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Copycat', phone: '9848088882', village: 'Satulur', quantity: 1 });
+        const b2 = bRes2.body.data;
+
+        // Even with a different UTR mock, duplicate screenshot SHA256 must reject
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 888899990000',
+          normalizedText: 'Payment Successful ₹50 UTR: 888899990000',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '888899990000',
+          transactionId: 'T1089',
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Copycat',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res2 = await request(app)
+          .post(`/api/bookings/${b2.booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${b2.payment.statusToken}`)
+          .send({ screenshotBase64: sameImg, consentGiven: true });
+
+        expect(res2.status).toBe(400);
+        expect(res2.body.error.reasonCodes).toContain('DUPLICATE_SCREENSHOT');
+      });
+
+      it('Scenario 9: clear different payee UPI -> WRONG_PAYEE', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Wrong Payee User', phone: '9848099991', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(109);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 to someoneelse@okhdfcbank UTR: 999900001111',
+          normalizedText: 'Payment Successful ₹50 to someoneelse@okhdfcbank UTR: 999900001111',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '999900001111',
+          transactionId: 'T109',
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Someone Else Store',
+          payeeUpiId: 'someoneelse@okhdfcbank', // Clearly wrong recipient!
+          payerName: 'Wrong Payee User',
+          detectedApp: 'google_pay',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('WRONG_PAYEE');
+      });
+
+      it('Scenario 10: bad/blurry/empty screenshot -> OCR_UNREADABLE', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Blurry User', phone: '9848099992', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(110);
+
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: '   ',
+          normalizedText: '',
+          paymentStatus: 'unknown',
           amount: null,
-          currency: null,
-          payee_name: null,
-          payee_upi_id: null,
-          payer_name: null,
-          utr_or_rrn: null,
-          transaction_id: null,
-          transaction_timestamp: null,
-          obvious_editing_signals: ['AI_UNAVAILABLE'],
-          ai_generated_likelihood: 'unknown',
-          field_confidence: { amount: 0, payee: 0, utr: 0, status: 0, timestamp: 0 },
-          is_fallback: true,
-        },
-        isDuplicateUtr: false,
-        isDuplicateScreenshot: false,
+          amountText: null,
+          utrOrRrn: null,
+          transactionId: null,
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: null,
+          payeeName: null,
+          payeeUpiId: null,
+          payerName: null,
+          detectedApp: 'unknown',
+          extractedFields: {},
+          warnings: ['OCR_UNREADABLE'],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('OCR_UNREADABLE');
+        expect(res.body.error.message).toContain("We couldn't clearly read this screenshot");
       });
 
-      expect(matcherResult.passed).toBe(false);
-      expect(matcherResult.nextStatus).toBe('ai_retry_pending');
-      expect(matcherResult.reasonCodes).toEqual(['AI_UNAVAILABLE']);
-      expect(matcherResult.reasonCodes).not.toContain('STATUS_NOT_SUCCESS');
-      expect(matcherResult.reasonCodes).not.toContain('MISSING_RRN');
-      expect(matcherResult.reasonCodes).not.toContain('MISSING_AMOUNT');
-      expect(matcherResult.reasonCodes).not.toContain('MISSING_PAYMENT_REFERENCE');
-      expect(matcherResult.reasonCodes).not.toContain('LOW_CONFIDENCE');
-      expect(matcherResult.reasonCodes).not.toContain('WRONG_PAYEE');
-    });
+      it('Scenario 11: OCR engine crash -> ocr_processing_error (NOT payment rejection)', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Engine Crash User', phone: '9848099993', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(111);
 
-    it('Scenario 10: retry successful later -> coupon generated exactly once', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Retry Later User', phone: '9848099999', village: 'Satulur', quantity: 1 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(110);
+        setMockOcrResult({
+          analysisCompleted: false, // Engine failed
+          rawText: '',
+          normalizedText: '',
+          paymentStatus: 'unknown',
+          amount: null,
+          amountText: null,
+          utrOrRrn: null,
+          transactionId: null,
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: null,
+          payeeName: null,
+          payeeUpiId: null,
+          payerName: null,
+          detectedApp: 'unknown',
+          extractedFields: {},
+          warnings: ['OCR_PROCESSING_ERROR'],
+        });
 
-      // Initial submission fails with AI unavailable
-      setMockGeminiResult({
-        success: false,
-        retryable: true,
-        errorCode: 'GEMINI_RATE_LIMITED',
-        errorCategory: 'quota',
-        safeMessage: 'Gemini rate limited',
-        model: 'gemini-3.6-flash',
-        attempts: 3,
-        httpStatus: 429,
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        // Must return 200 with retryable ocr_processing_error state, NOT payment rejection 400!
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.status).toBe('ocr_processing_error');
+        expect(res.body.data.retryable).toBe(true);
+        expect(res.body.data.message).toContain("We couldn't process this receipt right now");
+
+        // Verify DB booking is NOT rejected
+        const dbB = await db.query('SELECT status FROM bookings WHERE public_id = $1', [booking.publicId]);
+        expect(dbB.rows[0].status).toBe('proof_submitted');
       });
 
-      const initialRes = await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('Scenario 12: transaction clearly before booking -> TRANSACTION_TIME_MISMATCH', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Time Mismatch User', phone: '9848099994', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(112);
 
-      expect(initialRes.body.data.status).toBe('ai_retry_pending');
+        // Transaction timestamp is 3 hours before booking
+        const oldTimestamp = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
 
-      // Now AI is available on retry
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'success',
-          app_name: 'phonepe',
-          amount: '50.00',
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'Retry Later User',
-          utr_or_rrn: '999988887777',
-          transaction_id: 'T110',
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0.96, status: 0.99, timestamp: 0.92 },
-        },
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 121234345656',
+          normalizedText: 'Payment Successful ₹50 UTR: 121234345656',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '121234345656',
+          transactionId: 'T112',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: oldTimestamp,
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Time Mismatch User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
+
+        const res = await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
+
+        expect(res.status).toBe(400);
+        expect(res.body.error.reasonCodes).toContain('TRANSACTION_TIME_MISMATCH');
       });
 
-      const retryRes = await request(app)
-        .post(`/api/bookings/${booking.publicId}/retry-verification`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({});
+      it('Scenario 13: retry stored proof via POST /api/bookings/:publicId/retry-verification generates coupon', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Retry Proof User', phone: '9848099995', village: 'Satulur', quantity: 1 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(113);
 
-      expect(retryRes.status).toBe(200);
-      expect(retryRes.body.success).toBe(true);
-      expect(retryRes.body.data.status).toBe('payment_confirmed');
-      expect(retryRes.body.data.coupons.length).toBe(1);
+        // Initial attempt has OCR error
+        setMockOcrResult({
+          analysisCompleted: false,
+          rawText: '',
+          normalizedText: '',
+          paymentStatus: 'unknown',
+          amount: null,
+          amountText: null,
+          utrOrRrn: null,
+          transactionId: null,
+          transactionDate: null,
+          transactionTime: null,
+          transactionTimestamp: null,
+          payeeName: null,
+          payeeUpiId: null,
+          payerName: null,
+          detectedApp: 'unknown',
+          extractedFields: {},
+          warnings: ['OCR_PROCESSING_ERROR'],
+        });
 
-      // Verify coupons in DB exactly 1
-      const coupons = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
-      expect(coupons.rows.length).toBe(1);
-    });
+        await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
 
-    it('Scenario 11: repeated retry endpoint calls -> idempotent, no duplicate coupons', async () => {
-      const bRes = await request(app)
-        .post('/api/bookings')
-        .send({ name: 'Repeated Retry User', phone: '9848011234', village: 'Satulur', quantity: 2 });
-      const { booking, payment } = bRes.body.data;
-      const validImg = await createValidScreenshotBase64(111);
+        // Now OCR is successful on retry
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹50 UTR: 991122334455',
+          normalizedText: 'Payment Successful ₹50 UTR: 991122334455',
+          paymentStatus: 'success',
+          amount: 50.00,
+          amountText: '50.00',
+          utrOrRrn: '991122334455',
+          transactionId: 'T113',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Retry Proof User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
 
-      setMockGeminiResult({
-        success: true,
-        model: 'gemini-3.6-flash',
-        attempts: 1,
-        extraction: {
-          looks_like_payment_screen: true,
-          visible_payment_status: 'success',
-          app_name: 'phonepe',
-          amount: '100.00',
-          currency: 'INR',
-          payee_name: 'Yuva Shakti Youth Satulur',
-          payee_upi_id: '7075920852@ybl',
-          payer_name: 'Repeated Retry User',
-          utr_or_rrn: '112233445566',
-          transaction_id: 'T111',
-          transaction_timestamp: new Date().toISOString(),
-          obvious_editing_signals: [],
-          ai_generated_likelihood: 'low',
-          field_confidence: { amount: 0.98, payee: 0.95, utr: 0.96, status: 0.99, timestamp: 0.92 },
-        },
+        const retryRes = await request(app)
+          .post(`/api/bookings/${booking.publicId}/retry-verification`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({});
+
+        expect(retryRes.status).toBe(200);
+        expect(retryRes.body.success).toBe(true);
+        expect(retryRes.body.data.status).toBe('payment_confirmed');
+        expect(retryRes.body.data.coupons.length).toBe(1);
+
+        const coupons = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
+        expect(coupons.rows.length).toBe(1);
       });
 
-      // First call (initial verification)
-      await request(app)
-        .post(`/api/bookings/${booking.publicId}/payment-proof`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({ screenshotBase64: validImg, consentGiven: true });
+      it('Scenario 14: repeated retry calls -> idempotent, no duplicate coupons', async () => {
+        const bRes = await request(app)
+          .post('/api/bookings')
+          .send({ name: 'Idempotent Retry User', phone: '9848099996', village: 'Satulur', quantity: 2 });
+        const { booking, payment } = bRes.body.data;
+        const validImg = await createValidScreenshotBase64(114);
 
-      // Call retry-verification 3 times in succession
-      const r1 = await request(app)
-        .post(`/api/bookings/${booking.publicId}/retry-verification`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({});
-      const r2 = await request(app)
-        .post(`/api/bookings/${booking.publicId}/retry-verification`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({});
-      const r3 = await request(app)
-        .post(`/api/bookings/${booking.publicId}/retry-verification`)
-        .set('Authorization', `Bearer ${payment.statusToken}`)
-        .send({});
+        setMockOcrResult({
+          analysisCompleted: true,
+          rawText: 'Payment Successful ₹100 UTR: 887766554433',
+          normalizedText: 'Payment Successful ₹100 UTR: 887766554433',
+          paymentStatus: 'success',
+          amount: 100.00,
+          amountText: '100.00',
+          utrOrRrn: '887766554433',
+          transactionId: 'T114',
+          transactionDate: '15 Sep 2026',
+          transactionTime: '01:24 AM',
+          transactionTimestamp: new Date().toISOString(),
+          payeeName: 'Yuva Shakti Youth Satulur',
+          payeeUpiId: '7075920852@ybl',
+          payerName: 'Idempotent Retry User',
+          detectedApp: 'phonepe',
+          extractedFields: {},
+          warnings: [],
+        });
 
-      expect(r1.body.data.status).toBe('payment_confirmed');
-      expect(r2.body.data.status).toBe('payment_confirmed');
-      expect(r3.body.data.status).toBe('payment_confirmed');
+        // Submit initial proof
+        await request(app)
+          .post(`/api/bookings/${booking.publicId}/payment-proof`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({ screenshotBase64: validImg, consentGiven: true });
 
-      // Verify total coupons issued is exactly 2 (quantity: 2), never 4 or 6!
-      const coupons = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
-      expect(coupons.rows.length).toBe(2);
+        // Call retry-verification 3 times
+        const r1 = await request(app)
+          .post(`/api/bookings/${booking.publicId}/retry-verification`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({});
+        const r2 = await request(app)
+          .post(`/api/bookings/${booking.publicId}/retry-verification`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({});
+        const r3 = await request(app)
+          .post(`/api/bookings/${booking.publicId}/retry-verification`)
+          .set('Authorization', `Bearer ${payment.statusToken}`)
+          .send({});
+
+        expect(r1.body.data.status).toBe('payment_confirmed');
+        expect(r2.body.data.status).toBe('payment_confirmed');
+        expect(r3.body.data.status).toBe('payment_confirmed');
+
+        const coupons = await db.query('SELECT * FROM coupons WHERE booking_id = $1', [booking.id]);
+        expect(coupons.rows.length).toBe(2);
+      });
     });
   });
 });

@@ -2,5 +2,5 @@
   "name": "Yuva Shakti Youth Satulur - Lucky Draw",
   "description": "Official ₹50 Lucky Draw Coupon portal for Yuva Shakti Youth Satulur with 1st Prize 20 KG Laddu.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

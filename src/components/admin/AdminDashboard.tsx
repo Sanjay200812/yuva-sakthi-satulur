@@ -460,25 +460,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
               <ShieldCheck className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               <div className="text-xs text-slate-300 space-y-1 w-full">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <p className="font-bold text-white">Automated Verification &amp; Fraud Risk Audit Log</p>
+                  <p className="font-bold text-white">Automated Verification &amp; Audit Log</p>
                   <div className="flex items-center gap-2">
-                    <span className="text-slate-400 text-[11px]">AI Service:</span>
-                    <span
-                      className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold uppercase border ${
-                        aiHealth?.serviceStatus === 'AVAILABLE'
-                          ? 'bg-emerald-950/80 text-emerald-400 border-emerald-500/40'
-                          : 'bg-amber-950/80 text-amber-300 border-amber-500/40'
-                      }`}
-                    >
-                      {aiHealth?.serviceStatus === 'AVAILABLE' ? 'AVAILABLE' : 'TEMPORARILY UNAVAILABLE'}
+                    <span className="text-slate-400 text-[11px]">Verification Engine:</span>
+                    <span className="px-2 py-0.5 rounded font-mono text-[10px] font-bold uppercase border bg-emerald-950/80 text-emerald-400 border-emerald-500/40">
+                      CODE OCR (Tesseract.js)
                     </span>
-                    {aiHealth?.model && (
-                      <span className="text-[10px] text-slate-500 font-mono">({aiHealth.model})</span>
-                    )}
                   </div>
                 </div>
                 <p>
-                  Every payment proof passes OCR detail extraction and deterministic verification. High-confidence verifications automatically issue coupons into the official registry without delay. View full OCR extraction details, risk signals, RRN hashes, and audit history below.
+                  Every payment proof passes local OCR detail extraction and deterministic verification. Validated payments automatically issue coupons into the official registry without delay. View full OCR extraction details, reference numbers, and audit history below.
                 </p>
               </div>
             </div>
@@ -490,8 +481,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                   { key: 'all', label: 'All Submissions' },
                   { key: 'payment_confirmed', label: 'Payment Confirmed' },
                   { key: 'proof_verified', label: 'Proof Verified' },
-                  { key: 'ai_retry_pending', label: 'Retry Pending' },
-                  { key: 'ai_check_failed', label: 'Verification Failed' },
+                  { key: 'ocr_processing_error', label: 'OCR Error (Retryable)' },
+                  { key: 'ocr_check_failed', label: 'Verification Failed' },
                 ].map((f) => (
                   <button
                     key={f.key}
@@ -527,8 +518,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                       <th className="p-3 sm:p-4">Applicant</th>
                       <th className="p-3 sm:p-4">Expected ₹ / App</th>
                       <th className="p-3 sm:p-4">Payer RRN / Screenshot</th>
-                      <th className="p-3 sm:p-4">OCR Signals &amp; Risk</th>
-                      <th className="p-3 sm:p-4">Verification Status</th>
+                      <th className="p-3 sm:p-4">Extracted OCR Data</th>
+                      <th className="p-3 sm:p-4">Verification</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-purple-500/10">
@@ -552,14 +543,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                     ) : (
                       reviews.map((r) => {
                         const isConfirmed = r.status === 'payment_confirmed' || r.status === 'proof_verified' || r.status === 'admin_confirmed';
-                        const isFailed = r.status === 'ai_check_failed' || r.status === 'rejected' || r.status === 'admin_rejected';
+                        const isFailed = r.status === 'ocr_check_failed' || r.status === 'ai_check_failed' || r.status === 'rejected' || r.status === 'admin_rejected';
+                        const isError = r.status === 'ocr_processing_error';
+                        const ext = r.ocrExtraction || r.geminiExtraction;
 
                         return (
                           <tr key={r.id} className="hover:bg-slate-900/60 transition">
                             <td className="p-3 sm:p-4">
                               <div className="font-mono text-purple-300 font-bold">{r.bookingPublicId}</div>
                               <div className="text-[11px] text-slate-400 mt-0.5">{r.submittedAt}</div>
-                              <div className="text-[10px] text-slate-500 font-mono mt-0.5">Ref: {r.paymentReference}</div>
+                              <div className="text-[10px] text-slate-500 font-mono mt-0.5">Ref: {r.paymentReference || 'None'}</div>
                             </td>
 
                             <td className="p-3 sm:p-4">
@@ -594,38 +587,44 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                             </td>
 
                             <td className="p-3 sm:p-4 max-w-xs">
-                              {r.status === 'ai_retry_pending' || r.reasonCodes?.includes('AI_UNAVAILABLE') || r.geminiExtraction?.is_fallback || r.geminiExtraction?.unavailable ? (
+                              {ext ? (
                                 <div className="space-y-1 text-[11px]">
                                   <div className="flex items-center gap-1.5">
-                                    <span className="text-slate-400">OCR Amount:</span>
-                                    <span className="font-mono text-slate-400 italic">Not analyzed</span>
-                                  </div>
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-slate-400">OCR RRN:</span>
-                                    <span className="font-mono text-slate-400 italic">Not analyzed</span>
-                                  </div>
-                                  <div className="flex flex-wrap gap-1 mt-1">
-                                    <span className="px-1.5 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-500/40 text-[9px] font-mono">
-                                      AI_UNAVAILABLE
+                                    <span className="text-slate-400">Extracted Amount:</span>
+                                    <span className="font-mono text-emerald-400 font-bold">
+                                      {ext.amount != null ? `₹${Number(ext.amount).toFixed(2)}` : 'N/A'}
                                     </span>
                                   </div>
-                                </div>
-                              ) : r.geminiExtraction ? (
-                                <div className="space-y-1 text-[11px]">
                                   <div className="flex items-center gap-1.5">
-                                    <span className="text-slate-400">OCR Amount:</span>
-                                    <span className="font-mono text-white font-bold">{r.geminiExtraction.amount || 'N/A'}</span>
-                                  </div>
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-slate-400">OCR RRN:</span>
-                                    <span className="font-mono text-white">{r.geminiExtraction.utr_or_rrn || 'N/A'}</span>
-                                  </div>
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-slate-400">Risk Signals:</span>
-                                    <span className="font-mono text-slate-300">
-                                      {r.geminiExtraction.ai_generated_likelihood || 'low'} AI risk
+                                    <span className="text-slate-400">Extracted RRN:</span>
+                                    <span className="font-mono text-amber-300">
+                                      {ext.utrOrRrn || ext.utr_or_rrn
+                                        ? `********${String(ext.utrOrRrn || ext.utr_or_rrn).slice(-4)}`
+                                        : 'N/A'}
                                     </span>
                                   </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-slate-400">Payment Status:</span>
+                                    <span className="font-mono text-white font-semibold uppercase">
+                                      {ext.paymentStatus || ext.visible_payment_status || 'UNKNOWN'}
+                                    </span>
+                                  </div>
+                                  {(ext.transactionTime || ext.transactionTimestamp || r.extractedTransactionTimestamp) && (
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="text-slate-400">Txn Time:</span>
+                                      <span className="font-mono text-slate-300 text-[10px]">
+                                        {ext.transactionTime || ext.transactionTimestamp || r.extractedTransactionTimestamp}
+                                      </span>
+                                    </div>
+                                  )}
+                                  {(ext.detectedApp || ext.detected_app) && (
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="text-slate-400">OCR App:</span>
+                                      <span className="font-mono text-slate-300 uppercase text-[10px]">
+                                        {ext.detectedApp || ext.detected_app}
+                                      </span>
+                                    </div>
+                                  )}
                                   {r.reasonCodes && r.reasonCodes.length > 0 && (
                                     <div className="flex flex-wrap gap-1 mt-1">
                                       {r.reasonCodes.map((code: string) => (
@@ -646,14 +645,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                                 className={`px-2.5 py-1 rounded-lg text-[10px] uppercase font-bold border inline-block ${
                                   isConfirmed
                                     ? 'bg-emerald-950/80 text-emerald-400 border-emerald-500/40'
-                                    : r.status === 'ai_retry_pending'
+                                    : isError
                                     ? 'bg-amber-950/90 text-amber-300 border-amber-500/50'
                                     : isFailed
                                     ? 'bg-rose-950/80 text-rose-400 border-rose-500/40'
                                     : 'bg-purple-950 text-purple-300 border-purple-500/30'
                                 }`}
                               >
-                                {r.status === 'ai_retry_pending' ? 'AI SERVICE UNAVAILABLE / RETRY PENDING' : r.status.replace(/_/g, ' ')}
+                                {isConfirmed ? 'VERIFIED' : isError ? 'OCR ERROR' : isFailed ? 'FAILED' : r.status.replace(/_/g, ' ')}
                               </span>
                               {r.reviewedAt && (
                                 <div className="text-[10px] text-slate-500 mt-1">

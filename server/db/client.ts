@@ -280,40 +280,59 @@ class MemoryDB implements TransactionalDB {
       const id = params[params.length - 1];
       const s = this.paymentSubmissions.get(id);
       if (s) {
-        if (trimmed.includes("status = 'payment_confirmed'")) {
-          s.status = 'payment_confirmed';
-        } else if (trimmed.includes("status = 'admin_confirmed'")) {
-          s.status = 'admin_confirmed';
-        } else if (trimmed.includes("status = 'admin_rejected'")) {
-          s.status = 'admin_rejected';
-        } else if (trimmed.includes("status = 'superseded'")) {
-          s.status = 'superseded';
-        } else if (trimmed.includes("status = 'proof_verified'")) {
-          s.status = 'payment_confirmed';
-        } else if (trimmed.includes('status = $1')) {
-          s.status = params[0];
-        }
+        const setMatch = trimmed.match(/SET\s+(.*?)\s+WHERE/is);
+        if (setMatch && setMatch[1]) {
+          const assignments = setMatch[1].split(',').map((item) => item.trim());
+          for (const assign of assignments) {
+            const parts = assign.split('=').map((p) => p.trim());
+            if (parts.length === 2) {
+              const col = parts[0];
+              const valPart = parts[1];
+              const paramIdxMatch = valPart.match(/\$(\d+)/);
+              if (paramIdxMatch) {
+                const idx = parseInt(paramIdxMatch[1], 10) - 1;
+                (s as any)[col] = params[idx];
+              } else if (valPart.startsWith("'") && valPart.endsWith("'")) {
+                (s as any)[col] = valPart.slice(1, -1);
+              }
+            }
+          }
+        } else {
+          if (trimmed.includes("status = 'payment_confirmed'")) {
+            s.status = 'payment_confirmed';
+          } else if (trimmed.includes("status = 'admin_confirmed'")) {
+            s.status = 'admin_confirmed';
+          } else if (trimmed.includes("status = 'admin_rejected'")) {
+            s.status = 'admin_rejected';
+          } else if (trimmed.includes("status = 'superseded'")) {
+            s.status = 'superseded';
+          } else if (trimmed.includes("status = 'proof_verified'")) {
+            s.status = 'payment_confirmed';
+          } else if (trimmed.includes('status = $1')) {
+            s.status = params[0];
+          }
 
-        if (trimmed.includes('admin_reviewer_id = $1')) {
-          s.admin_reviewer_id = params[0];
-        } else if (trimmed.includes('admin_reviewer_id = $2')) {
-          s.admin_reviewer_id = params[1];
-        }
+          if (trimmed.includes('admin_reviewer_id = $1')) {
+            s.admin_reviewer_id = params[0];
+          } else if (trimmed.includes('admin_reviewer_id = $2')) {
+            s.admin_reviewer_id = params[1];
+          }
 
-        if (trimmed.includes('admin_review_note = $2')) {
-          s.admin_review_note = params[1];
-        } else if (trimmed.includes('admin_review_note = $3')) {
-          s.admin_review_note = params[2];
-        }
+          if (trimmed.includes('admin_review_note = $2')) {
+            s.admin_review_note = params[1];
+          } else if (trimmed.includes('admin_review_note = $3')) {
+            s.admin_review_note = params[2];
+          }
 
-        if (trimmed.includes('bank_record_match = $3')) {
-          s.bank_record_match = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
-        }
+          if (trimmed.includes('bank_record_match = $3')) {
+            s.bank_record_match = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
+          }
 
-        if (trimmed.includes('reviewed_at = $4')) {
-          s.reviewed_at = params[3];
-        } else if (trimmed.includes('reviewed_at = $3')) {
-          s.reviewed_at = params[2];
+          if (trimmed.includes('reviewed_at = $4')) {
+            s.reviewed_at = params[3];
+          } else if (trimmed.includes('reviewed_at = $3')) {
+            s.reviewed_at = params[2];
+          }
         }
 
         s.updated_at = new Date().toISOString();
@@ -594,7 +613,7 @@ class MemoryDB implements TransactionalDB {
             amount_paise: b?.total_amount_paise || (c.total_quantity * 5000),
             provider_payment_id: sub?.payer_utr_hash ? `UTR-${sub.payer_utr_hash.slice(0, 8)}` : 'BANK_CONFIRMED',
             utr_display: sub ? `UTR: ${sub.payer_utr_hash.slice(0, 6)}...` : 'Bank Confirmed',
-            verification_method: 'Automated Proof Verification (Gemini OCR + Deterministic Rules)',
+            verification_method: 'Automated Proof Verification (Local OCR + Deterministic Rules)',
             confirming_admin: sub?.admin_reviewer_id || null,
             confirmed_at: sub?.reviewed_at || b?.paid_at || null,
           };

@@ -1,26 +1,28 @@
-import { config } from '../config/eventConfig.ts';
-import { GeminiExtractionResult } from './geminiAnalyzer.ts';
+import { LocalOcrAnalysisResult } from './localOcrAnalyzer.ts';
 
-export interface MatchInput {
+export interface OcrMatchInput {
   expectedAmountPaise: number;
   expectedPayeeUpiId: string;
   expectedPayeeName: string;
   enteredUtr?: string;
   selectedApp: string;
-  extraction: GeminiExtractionResult;
+  bookingCreatedAt?: string;
+  paymentExpiresAt?: string;
+  analysis?: LocalOcrAnalysisResult;
+  extraction?: any;
   isDuplicateUtr: boolean;
   isDuplicateScreenshot: boolean;
   isExpired?: boolean;
 }
 
-export interface MatchResult {
+export interface OcrMatchResult {
   passed: boolean;
   riskScore: number;
   reasonCodes: string[];
-  nextStatus: 'payment_confirmed' | 'ai_check_failed' | 'ai_retry_pending';
-  reviewStatus: 'ai_check_passed' | 'ai_check_failed' | 'ai_retry_pending';
+  nextStatus: 'payment_confirmed' | 'payment_rejected' | 'ocr_processing_error';
+  reviewStatus: 'ocr_verified' | 'ocr_check_failed' | 'ocr_processing_error';
   userMessage: string;
-  isInfrastructureError?: boolean;
+  isOcrProcessingError?: boolean;
   details: {
     utrMatched: boolean | null;
     amountMatched: boolean | null;
@@ -41,19 +43,43 @@ export function isValidRrn(rrn: string): boolean {
   return /^\d{12}$/.test(normalizeUtr(rrn));
 }
 
-export function performDeterministicComparison(input: MatchInput): MatchResult {
-  const ext = input.extraction;
+/**
+ * Deterministic OCR Verification Engine:
+ * Strictly validates OCR extraction results against server-authoritative booking parameters.
+ * Completely code-only: NO AI or LLM in the loop.
+ */
+export function performDeterministicOcrComparison(input: OcrMatchInput): OcrMatchResult {
+  const rawAnalysis = input.analysis || (input as any).extraction;
+  const analysis: LocalOcrAnalysisResult = rawAnalysis ? {
+    analysisCompleted: rawAnalysis.analysisCompleted ?? true,
+    rawText: rawAnalysis.rawText || '',
+    normalizedText: rawAnalysis.normalizedText || '',
+    paymentStatus: rawAnalysis.paymentStatus || rawAnalysis.visible_payment_status || 'unknown',
+    amount: rawAnalysis.amount !== undefined ? (rawAnalysis.amount === null ? null : Number(rawAnalysis.amount)) : null,
+    amountText: rawAnalysis.amountText || (rawAnalysis.amount != null ? String(rawAnalysis.amount) : null),
+    utrOrRrn: rawAnalysis.utrOrRrn || rawAnalysis.utr_or_rrn || null,
+    transactionId: rawAnalysis.transactionId || rawAnalysis.transaction_id || null,
+    transactionDate: rawAnalysis.transactionDate || null,
+    transactionTime: rawAnalysis.transactionTime || null,
+    transactionTimestamp: rawAnalysis.transactionTimestamp || rawAnalysis.transaction_timestamp || null,
+    payeeName: rawAnalysis.payeeName || rawAnalysis.payee_name || null,
+    payeeUpiId: rawAnalysis.payeeUpiId || rawAnalysis.payee_upi_id || null,
+    payerName: rawAnalysis.payerName || rawAnalysis.payer_name || null,
+    detectedApp: rawAnalysis.detectedApp || rawAnalysis.app_name || 'unknown',
+    extractedFields: rawAnalysis.extractedFields || {},
+    warnings: rawAnalysis.warnings || [],
+  } : null as any;
 
-  // 1. Decouple Infrastructure Failure: If AI never analyzed the image, DO NOT generate screenshot failure codes
-  if (!ext || ext.is_fallback || ext.obvious_editing_signals?.includes('AI_UNAVAILABLE')) {
+  // 1. OCR Engine Processing Error / Crash: Keep non-final retryable state
+  if (!analysis || !analysis.analysisCompleted || analysis.warnings?.includes('OCR_PROCESSING_ERROR')) {
     return {
       passed: false,
       riskScore: 0,
-      reasonCodes: ['AI_UNAVAILABLE'],
-      nextStatus: 'ai_retry_pending',
-      reviewStatus: 'ai_retry_pending',
-      userMessage: 'Payment proof received. Verification service is temporarily busy. We are retrying automatically. Do not make another payment.',
-      isInfrastructureError: true,
+      reasonCodes: ['OCR_PROCESSING_ERROR'],
+      nextStatus: 'ocr_processing_error',
+      reviewStatus: 'ocr_processing_error',
+      userMessage: "We couldn't process this receipt right now. Your payment proof is saved. Please retry verification.",
+      isOcrProcessingError: true,
       details: {
         utrMatched: null,
         amountMatched: null,
@@ -72,17 +98,32 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     payeeMatched: null as boolean | null,
   };
 
-  // 2. Session Expiry Check
+  // 2. Receipt Quality Check: If text is effectively empty or unreadable
+  const hasExtractedSignals = Boolean(analysis.utrOrRrn || (analysis.amount !== null && !isNaN(analysis.amount)) || (analysis.paymentStatus && analysis.paymentStatus !== 'unknown'));
+  const isUnreadable =
+    analysis.warnings?.includes('OCR_UNREADABLE') ||
+    (!hasExtractedSignals && (!analysis.normalizedText || analysis.normalizedText.trim().length < 5));
+
+  if (isUnreadable) {
+    reasonCodes.push('OCR_UNREADABLE');
+    riskScore += 90;
+  }
+
+  // 2.5 Tampering or Authenticity Check (if signaled)
+  if (analysis.warnings?.includes('TAMPERING_RISK') || (rawAnalysis as any)?.obvious_editing_signals?.length > 0 || (rawAnalysis as any)?.ai_generated_likelihood === 'high') {
+    reasonCodes.push('TAMPERING_RISK');
+    riskScore += 90;
+  }
+
+  // 3. Session Expiry Check
   if (input.isExpired) {
     reasonCodes.push('PAYMENT_SESSION_EXPIRED');
     riskScore += 100;
   }
 
-  // 3. Duplicate checks (Database Uniqueness of extracted reference)
+  // 4. Duplicate checks (Database Uniqueness of extracted reference & image hash)
   if (input.isDuplicateUtr) {
     reasonCodes.push('DUPLICATE_PAYMENT_REFERENCE');
-    reasonCodes.push('DUPLICATE_RRN');
-    reasonCodes.push('DUPLICATE_UTR');
     riskScore += 100;
   }
 
@@ -91,40 +132,37 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     riskScore += 90;
   }
 
-  // 4. Payment Screen Validity
-  if (ext.looks_like_payment_screen === false) {
-    reasonCodes.push('INVALID_PAYMENT_SCREEN');
-    riskScore += 100;
-  }
-
   // 5. Visible Payment Status
-  if (ext.visible_payment_status === 'failed') {
+  if (analysis.paymentStatus === 'failed') {
     reasonCodes.push('STATUS_NOT_SUCCESS');
     riskScore += 100;
     details.statusMatched = false;
-  } else if (ext.visible_payment_status === 'pending') {
+  } else if (analysis.paymentStatus === 'pending') {
     reasonCodes.push('STATUS_NOT_SUCCESS');
     riskScore += 80;
     details.statusMatched = false;
-  } else if (ext.visible_payment_status === 'success') {
+  } else if (analysis.paymentStatus === 'success') {
     details.statusMatched = true;
-  } else if (ext.visible_payment_status === 'unknown') {
-    reasonCodes.push('STATUS_NOT_SUCCESS');
-    riskScore += 80;
+  } else if (analysis.paymentStatus === 'unknown') {
+    if (!isUnreadable) {
+      reasonCodes.push('STATUS_NOT_SUCCESS');
+      riskScore += 80;
+    }
     details.statusMatched = false;
   }
 
-  // 6. OCR-Extracted RRN Validation (Directly from Screenshot - Never trust client input)
-  if (!ext.utr_or_rrn) {
-    reasonCodes.push('MISSING_PAYMENT_REFERENCE');
-    reasonCodes.push('MISSING_RRN');
-    riskScore += 80;
+  // 6. Extracted RRN Validation (Directly from Screenshot OCR)
+  if (!analysis.utrOrRrn) {
+    if (!isUnreadable) {
+      reasonCodes.push('MISSING_PAYMENT_REFERENCE');
+      reasonCodes.push('MISSING_RRN');
+      riskScore += 80;
+    }
     details.utrMatched = false;
   } else {
-    const normalizedExtRrn = normalizeUtr(ext.utr_or_rrn);
+    const normalizedExtRrn = normalizeUtr(analysis.utrOrRrn);
     if (!normalizedExtRrn || normalizedExtRrn.length < 6 || !/^[A-Z0-9]+$/i.test(normalizedExtRrn)) {
       reasonCodes.push('INVALID_PAYMENT_REFERENCE');
-      reasonCodes.push('INVALID_RRN');
       riskScore += 80;
       details.utrMatched = false;
     } else {
@@ -132,148 +170,127 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 7. Amount Comparison (Extracted vs Expected) - Do NOT allow missing amount to silently pass
-  if (!ext.amount) {
-    reasonCodes.push('MISSING_AMOUNT');
-    riskScore += 80;
+  // 7. Amount Comparison (Extracted vs Expected Server Total)
+  if (analysis.amount === null || isNaN(analysis.amount)) {
+    if (!isUnreadable) {
+      reasonCodes.push('MISSING_AMOUNT');
+      riskScore += 80;
+    }
     details.amountMatched = false;
   } else {
-    const extractedNum = parseFloat(ext.amount.replace(/[^0-9.]/g, ''));
     const expectedNum = input.expectedAmountPaise / 100;
-    if (!isNaN(extractedNum) && Math.abs(extractedNum - expectedNum) < 0.05) {
+    if (Math.abs(analysis.amount - expectedNum) < 0.05) {
       details.amountMatched = true;
-    } else if (!isNaN(extractedNum)) {
+    } else {
       details.amountMatched = false;
       reasonCodes.push('AMOUNT_MISMATCH');
       riskScore += 90;
     }
   }
 
-  // 8. Currency check if visible
-  if (ext.currency && !['INR', 'RS', 'RS.', '₹'].includes(ext.currency.toUpperCase())) {
-    reasonCodes.push('AMOUNT_MISMATCH');
-    riskScore += 50;
-  }
-
-  // 9. Payee Comparison (if visible in OCR)
-  if (ext.payee_upi_id || ext.payee_name) {
-    const extPayee = `${ext.payee_upi_id || ''} ${ext.payee_name || ''}`.toLowerCase();
+  // 8. Payee Comparison (if visible in OCR)
+  if (analysis.payeeUpiId || analysis.payeeName) {
+    const extPayee = `${analysis.payeeUpiId || ''} ${analysis.payeeName || ''}`.toLowerCase();
     const configPayeeId = input.expectedPayeeUpiId.toLowerCase();
 
     const matchesId = configPayeeId && extPayee.includes(configPayeeId);
     const matchesName = extPayee.includes('yuva') || extPayee.includes('shakti') || extPayee.includes('satulur');
 
-    if (matchesId || matchesName) {
+    // Also check masked VPA match: 70****52@ybl vs 7075920852@ybl
+    let matchesMasked = false;
+    if (analysis.payeeUpiId && analysis.payeeUpiId.includes('*')) {
+      const [maskUser, maskBank] = analysis.payeeUpiId.split('@');
+      const [confUser, confBank] = configPayeeId.split('@');
+      if (maskBank === confBank && maskUser.length >= 4) {
+        const prefix = maskUser.slice(0, 2);
+        const suffix = maskUser.slice(-2);
+        if (confUser.startsWith(prefix) && confUser.endsWith(suffix)) {
+          matchesMasked = true;
+        }
+      }
+    }
+
+    if (matchesId || matchesName || matchesMasked) {
       details.payeeMatched = true;
     } else {
-      details.payeeMatched = false;
-      reasonCodes.push('WRONG_PAYEE');
-      riskScore += 70;
+      // If a full, non-matching UPI ID is clearly visible, fail for wrong payee
+      if (analysis.payeeUpiId && !analysis.payeeUpiId.includes('*') && !matchesId) {
+        details.payeeMatched = false;
+        reasonCodes.push('WRONG_PAYEE');
+        riskScore += 70;
+      } else {
+        details.payeeMatched = true;
+      }
     }
   }
 
-  // 10. Tampering & AI-Generated Likelihood
-  if (ext.ai_generated_likelihood === 'high' || ext.ai_generated_likelihood === 'medium') {
-    reasonCodes.push('TAMPERING_RISK');
-    riskScore += 70;
-  }
-
-  const obviousSignals = ext.obvious_editing_signals?.filter((s) => s !== 'AI_UNAVAILABLE') || [];
-  if (obviousSignals.length > 0) {
-    reasonCodes.push('TAMPERING_RISK');
-    riskScore += 60;
-  }
-
-  // 11. Field Confidence Thresholds
-  if (ext.field_confidence) {
-    if (ext.field_confidence.amount < 0.60 && ext.amount) {
-      reasonCodes.push('LOW_OCR_CONFIDENCE');
-      reasonCodes.push('LOW_CONFIDENCE');
-      riskScore += 40;
-    }
-    if (ext.field_confidence.utr < 0.60 && ext.utr_or_rrn) {
-      reasonCodes.push('LOW_OCR_CONFIDENCE');
-      reasonCodes.push('LOW_CONFIDENCE');
-      riskScore += 40;
+  // 9. Transaction Timing Verification (Supporting signal)
+  if (analysis.transactionTimestamp && input.bookingCreatedAt) {
+    const receiptTime = new Date(analysis.transactionTimestamp).getTime();
+    const bookingTime = new Date(input.bookingCreatedAt).getTime();
+    // Allow up to 3 minutes display/clock tolerance before booking creation
+    if (!isNaN(receiptTime) && !isNaN(bookingTime)) {
+      if (receiptTime < bookingTime - 3 * 60 * 1000) {
+        reasonCodes.push('TRANSACTION_TIME_MISMATCH');
+        riskScore += 60;
+      }
     }
   }
 
-  // Evaluation: Fail closed on any fatal failure
+  // Fail closed on any critical failure
   const hasFatalFailure =
+    reasonCodes.includes('OCR_UNREADABLE') ||
     reasonCodes.includes('MISSING_PAYMENT_REFERENCE') ||
     reasonCodes.includes('DUPLICATE_PAYMENT_REFERENCE') ||
     reasonCodes.includes('INVALID_PAYMENT_REFERENCE') ||
-    reasonCodes.includes('INVALID_RRN') ||
-    reasonCodes.includes('INVALID_UTR') ||
-    reasonCodes.includes('DUPLICATE_RRN') ||
-    reasonCodes.includes('DUPLICATE_UTR') ||
-    reasonCodes.includes('DUPLICATE_SCREENSHOT') ||
     reasonCodes.includes('STATUS_NOT_SUCCESS') ||
     reasonCodes.includes('AMOUNT_MISMATCH') ||
     reasonCodes.includes('MISSING_AMOUNT') ||
-    reasonCodes.includes('MISSING_RRN') ||
+    reasonCodes.includes('DUPLICATE_SCREENSHOT') ||
     reasonCodes.includes('WRONG_PAYEE') ||
-    reasonCodes.includes('TAMPERING_RISK') ||
-    reasonCodes.includes('LOW_OCR_CONFIDENCE') ||
-    reasonCodes.includes('LOW_CONFIDENCE') ||
-    reasonCodes.includes('INVALID_PAYMENT_SCREEN') ||
+    reasonCodes.includes('TRANSACTION_TIME_MISMATCH') ||
     reasonCodes.includes('PAYMENT_SESSION_EXPIRED') ||
     riskScore >= 50;
 
   if (hasFatalFailure) {
     let failMessage = 'Verification failed. Please review the highlighted issue and resubmit.';
-    if (reasonCodes.includes('PAYMENT_SESSION_EXPIRED')) {
+
+    if (reasonCodes.includes('OCR_UNREADABLE')) {
+      failMessage =
+        "We couldn't clearly read this screenshot. Please upload the detailed payment receipt showing amount, success status and transaction reference.";
+    } else if (reasonCodes.includes('PAYMENT_SESSION_EXPIRED')) {
       failMessage = 'Payment session expired. Start a new booking.';
-    } else if (
-      reasonCodes.includes('DUPLICATE_PAYMENT_REFERENCE') ||
-      reasonCodes.includes('DUPLICATE_RRN') ||
-      reasonCodes.includes('DUPLICATE_UTR')
-    ) {
-      failMessage = 'This payment receipt has already been used.';
+    } else if (reasonCodes.includes('DUPLICATE_PAYMENT_REFERENCE')) {
+      failMessage = 'This payment receipt has already been used for another booking.';
     } else if (reasonCodes.includes('DUPLICATE_SCREENSHOT')) {
       failMessage = 'This payment screenshot has already been submitted for another booking.';
-    } else if (
-      reasonCodes.includes('MISSING_PAYMENT_REFERENCE') ||
-      reasonCodes.includes('MISSING_RRN')
-    ) {
+    } else if (reasonCodes.includes('MISSING_PAYMENT_REFERENCE')) {
       failMessage =
-        "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.";
-    } else if (
-      reasonCodes.includes('INVALID_PAYMENT_REFERENCE') ||
-      reasonCodes.includes('INVALID_RRN')
-    ) {
+        "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the UTR or reference number.";
+    } else if (reasonCodes.includes('INVALID_PAYMENT_REFERENCE')) {
       failMessage =
-        "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.";
+        "We couldn't find a valid 12-digit transaction reference on this screenshot. Please upload the detailed receipt.";
     } else if (reasonCodes.includes('AMOUNT_MISMATCH')) {
-      failMessage = 'Payment amount does not match.';
+      failMessage = 'Payment amount on receipt does not match the booking total.';
     } else if (reasonCodes.includes('MISSING_AMOUNT')) {
       failMessage =
         'Could not detect the payment amount on the screenshot. Please upload a complete receipt.';
     } else if (reasonCodes.includes('STATUS_NOT_SUCCESS')) {
-      failMessage = 'Payment is not shown as successful.';
-    } else if (reasonCodes.includes('TAMPERING_RISK')) {
-      failMessage =
-        'Image validation failed due to visual tampering or editing indicators.';
-    } else if (
-      reasonCodes.includes('LOW_OCR_CONFIDENCE') ||
-      reasonCodes.includes('LOW_CONFIDENCE')
-    ) {
-      failMessage =
-        'The receipt text is blurry or illegible. Please upload a clearer screenshot.';
+      failMessage = 'Payment is not shown as successful on this receipt.';
     } else if (reasonCodes.includes('WRONG_PAYEE')) {
       failMessage =
-        'The recipient UPI ID or name does not match the official Yuva Shakti account.';
-    } else if (reasonCodes.includes('INVALID_PAYMENT_SCREEN')) {
+        'The recipient UPI ID does not match the official Yuva Shakti account.';
+    } else if (reasonCodes.includes('TRANSACTION_TIME_MISMATCH')) {
       failMessage =
-        'The uploaded file does not appear to be a valid UPI payment receipt.';
+        'The transaction date/time on this receipt does not match your booking window.';
     }
 
-  return {
+    return {
       passed: false,
       riskScore,
       reasonCodes,
-      nextStatus: 'ai_check_failed',
-      reviewStatus: 'ai_check_failed',
+      nextStatus: 'payment_rejected',
+      reviewStatus: 'ocr_check_failed',
       userMessage: failMessage,
       details,
     };
@@ -282,10 +299,15 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
   return {
     passed: true,
     riskScore: 0,
-    reasonCodes: [],
+    reasonCodes: ['OCR_VERIFIED'],
     nextStatus: 'payment_confirmed',
-    reviewStatus: 'ai_check_passed',
-    userMessage: 'Payment proof accepted. Coupons generated.',
+    reviewStatus: 'ocr_verified',
+    userMessage: 'Payment proof verified successfully. Coupons generated.',
     details,
   };
 }
+
+// Backwards-compatible alias for existing imports
+export const performDeterministicComparison = performDeterministicOcrComparison;
+export type MatchInput = OcrMatchInput;
+export type MatchResult = OcrMatchResult;
