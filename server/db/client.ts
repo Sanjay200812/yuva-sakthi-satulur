@@ -193,15 +193,13 @@ class MemoryDB implements TransactionalDB {
 
       if (!record.id) record.id = crypto.randomUUID();
 
-      // Check unique payer_utr_hash
-      if (record.payer_utr_hash) {
+      // Check unique payer_utr_hash (matching partial unique index WHERE status IN ('payment_confirmed', 'proof_verified'))
+      if (record.payer_utr_hash && (record.status === 'payment_confirmed' || record.status === 'proof_verified')) {
         const duplicate = Array.from(this.paymentSubmissions.values()).find(
           (s) =>
             s.payer_utr_hash === record.payer_utr_hash &&
             s.booking_id !== record.booking_id &&
-            s.status !== 'admin_rejected' &&
-            s.status !== 'verification_failed' &&
-            s.status !== 'ai_check_failed'
+            (s.status === 'payment_confirmed' || s.status === 'proof_verified')
         );
         if (duplicate) {
           const err = new Error('duplicate key value violates unique constraint "payment_submissions_payer_utr_hash_key"');

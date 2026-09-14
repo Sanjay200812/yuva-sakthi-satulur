@@ -45,7 +45,6 @@ export interface BookingCreationResponse {
 
 export interface PaymentProofParams {
   publicId: string;
-  utr: string;
   screenshotBase64: string;
   selectedApp: string;
   consentGiven: boolean;
@@ -88,7 +87,7 @@ export async function createBooking(params: BookingCreationParams): Promise<Book
 }
 
 /**
- * Submits mandatory payment proof (UTR, payment screenshot, and user consent) for verification.
+ * Submits mandatory payment proof (payment screenshot and user consent) for automated verification.
  */
 export async function submitPaymentProof(params: PaymentProofParams): Promise<PaymentProofResponse> {
   const headers: Record<string, string> = {
@@ -102,7 +101,6 @@ export async function submitPaymentProof(params: PaymentProofParams): Promise<Pa
     method: 'POST',
     headers,
     body: JSON.stringify({
-      utr: params.utr,
       screenshotBase64: params.screenshotBase64,
       selectedApp: params.selectedApp,
       consentGiven: params.consentGiven,

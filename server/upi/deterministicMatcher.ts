@@ -5,7 +5,7 @@ export interface MatchInput {
   expectedAmountPaise: number;
   expectedPayeeUpiId: string;
   expectedPayeeName: string;
-  enteredUtr: string;
+  enteredUtr?: string;
   selectedApp: string;
   extraction: GeminiExtractionResult;
   isDuplicateUtr: boolean;
@@ -50,24 +50,16 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     payeeMatched: null as boolean | null,
   };
 
-  const normalizedEnteredUtr = normalizeUtr(input.enteredUtr);
-
   // 0. Session Expiry Check
   if (input.isExpired) {
     reasonCodes.push('PAYMENT_SESSION_EXPIRED');
     riskScore += 100;
   }
 
-  // 1. Mandatory Strict 12-digit Numeric Entered RRN Validation
-  if (!normalizedEnteredUtr || !/^\d{12}$/.test(normalizedEnteredUtr)) {
-    reasonCodes.push('INVALID_RRN');
-    riskScore += 100;
-  }
-
-  // 2. Duplicate checks (Database Uniqueness)
+  // 1. Duplicate checks (Database Uniqueness of extracted reference)
   if (input.isDuplicateUtr) {
+    reasonCodes.push('DUPLICATE_PAYMENT_REFERENCE');
     reasonCodes.push('DUPLICATE_RRN');
-    // Also include DUPLICATE_UTR for backward compatibility with existing tests
     reasonCodes.push('DUPLICATE_UTR');
     riskScore += 100;
   }
@@ -79,13 +71,13 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
 
   const ext = input.extraction;
 
-  // 3. Payment Screen Validity
+  // 2. Payment Screen Validity
   if (ext.looks_like_payment_screen === false) {
     reasonCodes.push('INVALID_PAYMENT_SCREEN');
     riskScore += 100;
   }
 
-  // 4. AI Service Availability check
+  // 3. AI Service Availability check
   if (ext.obvious_editing_signals?.includes('AI_UNAVAILABLE')) {
     if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
       reasonCodes.push('AI_UNAVAILABLE');
@@ -93,7 +85,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 5. Visible Payment Status
+  // 4. Visible Payment Status
   if (ext.visible_payment_status === 'failed') {
     reasonCodes.push('STATUS_NOT_SUCCESS');
     riskScore += 100;
@@ -112,32 +104,29 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 6. RRN Comparison (Extracted vs Entered) - Do NOT allow missing RRN to silently pass
+  // 5. OCR-Extracted RRN Validation (Directly from Screenshot - Never trust client input)
   if (!ext.utr_or_rrn) {
-    if (!ext.is_fallback) {
-      reasonCodes.push('MISSING_RRN');
+    reasonCodes.push('MISSING_PAYMENT_REFERENCE');
+    reasonCodes.push('MISSING_RRN');
+    riskScore += 80;
+    details.utrMatched = false;
+  } else {
+    const normalizedExtRrn = normalizeUtr(ext.utr_or_rrn);
+    if (!normalizedExtRrn || normalizedExtRrn.length < 6 || !/^[A-Z0-9]+$/i.test(normalizedExtRrn)) {
+      reasonCodes.push('INVALID_PAYMENT_REFERENCE');
+      reasonCodes.push('INVALID_RRN');
       riskScore += 80;
       details.utrMatched = false;
-    }
-  } else {
-    const normalizedExtUtr = normalizeUtr(ext.utr_or_rrn);
-    if (normalizedExtUtr === normalizedEnteredUtr || normalizedExtUtr.includes(normalizedEnteredUtr) || normalizedEnteredUtr.includes(normalizedExtUtr)) {
-      details.utrMatched = true;
     } else {
-      details.utrMatched = false;
-      reasonCodes.push('RRN_MISMATCH');
-      reasonCodes.push('UTR_MISMATCH'); // alias for test compatibility
-      riskScore += 90;
+      details.utrMatched = true;
     }
   }
 
-  // 7. Amount Comparison (Extracted vs Expected) - Do NOT allow missing amount to silently pass
+  // 6. Amount Comparison (Extracted vs Expected) - Do NOT allow missing amount to silently pass
   if (!ext.amount) {
-    if (!ext.is_fallback) {
-      reasonCodes.push('MISSING_AMOUNT');
-      riskScore += 80;
-      details.amountMatched = false;
-    }
+    reasonCodes.push('MISSING_AMOUNT');
+    riskScore += 80;
+    details.amountMatched = false;
   } else {
     const extractedNum = parseFloat(ext.amount.replace(/[^0-9.]/g, ''));
     const expectedNum = input.expectedAmountPaise / 100;
@@ -150,13 +139,13 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 8. Currency check if visible
+  // 7. Currency check if visible
   if (ext.currency && !['INR', 'RS', 'RS.', '₹'].includes(ext.currency.toUpperCase())) {
     reasonCodes.push('AMOUNT_MISMATCH');
     riskScore += 50;
   }
 
-  // 9. Payee Comparison (if visible in OCR)
+  // 8. Payee Comparison (if visible in OCR)
   if (ext.payee_upi_id || ext.payee_name) {
     const extPayee = `${ext.payee_upi_id || ''} ${ext.payee_name || ''}`.toLowerCase();
     const configPayeeId = input.expectedPayeeUpiId.toLowerCase();
@@ -173,7 +162,7 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     }
   }
 
-  // 10. Tampering & AI-Generated Likelihood
+  // 9. Tampering & AI-Generated Likelihood
   if (ext.ai_generated_likelihood === 'high' || ext.ai_generated_likelihood === 'medium') {
     reasonCodes.push('TAMPERING_RISK');
     riskScore += 70;
@@ -185,20 +174,25 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     riskScore += 60;
   }
 
-  // 11. Field Confidence Thresholds
+  // 10. Field Confidence Thresholds
   if (ext.field_confidence) {
     if (ext.field_confidence.amount < 0.60 && ext.amount) {
+      reasonCodes.push('LOW_OCR_CONFIDENCE');
       reasonCodes.push('LOW_CONFIDENCE');
       riskScore += 40;
     }
     if (ext.field_confidence.utr < 0.60 && ext.utr_or_rrn) {
+      reasonCodes.push('LOW_OCR_CONFIDENCE');
       reasonCodes.push('LOW_CONFIDENCE');
       riskScore += 40;
     }
   }
 
-  // Evaluation: Fail closed on any violation
+  // Evaluation: Fail closed on any fatal failure
   const hasFatalFailure =
+    reasonCodes.includes('MISSING_PAYMENT_REFERENCE') ||
+    reasonCodes.includes('DUPLICATE_PAYMENT_REFERENCE') ||
+    reasonCodes.includes('INVALID_PAYMENT_REFERENCE') ||
     reasonCodes.includes('INVALID_RRN') ||
     reasonCodes.includes('INVALID_UTR') ||
     reasonCodes.includes('DUPLICATE_RRN') ||
@@ -207,11 +201,10 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     reasonCodes.includes('STATUS_NOT_SUCCESS') ||
     reasonCodes.includes('AMOUNT_MISMATCH') ||
     reasonCodes.includes('MISSING_AMOUNT') ||
-    reasonCodes.includes('RRN_MISMATCH') ||
-    reasonCodes.includes('UTR_MISMATCH') ||
     reasonCodes.includes('MISSING_RRN') ||
     reasonCodes.includes('WRONG_PAYEE') ||
     reasonCodes.includes('TAMPERING_RISK') ||
+    reasonCodes.includes('LOW_OCR_CONFIDENCE') ||
     reasonCodes.includes('LOW_CONFIDENCE') ||
     reasonCodes.includes('INVALID_PAYMENT_SCREEN') ||
     reasonCodes.includes('PAYMENT_SESSION_EXPIRED') ||
@@ -222,30 +215,48 @@ export function performDeterministicComparison(input: MatchInput): MatchResult {
     let failMessage = 'Verification failed. Please review the highlighted issue and resubmit.';
     if (reasonCodes.includes('PAYMENT_SESSION_EXPIRED')) {
       failMessage = 'Payment session expired. Start a new booking.';
-    } else if (reasonCodes.includes('DUPLICATE_RRN') || reasonCodes.includes('DUPLICATE_UTR')) {
-      failMessage = 'This 12-digit UPI RRN has already been used for another booking.';
+    } else if (
+      reasonCodes.includes('DUPLICATE_PAYMENT_REFERENCE') ||
+      reasonCodes.includes('DUPLICATE_RRN') ||
+      reasonCodes.includes('DUPLICATE_UTR')
+    ) {
+      failMessage = 'This payment receipt has already been used.';
     } else if (reasonCodes.includes('DUPLICATE_SCREENSHOT')) {
       failMessage = 'This payment screenshot has already been submitted for another booking.';
-    } else if (reasonCodes.includes('RRN_MISMATCH') || reasonCodes.includes('UTR_MISMATCH')) {
-      failMessage = 'The 12-digit RRN on your screenshot does not match the entered reference number.';
-    } else if (reasonCodes.includes('MISSING_RRN')) {
-      failMessage = 'Could not clearly detect the 12-digit UPI RRN on the screenshot. Please upload a clear receipt.';
+    } else if (
+      reasonCodes.includes('MISSING_PAYMENT_REFERENCE') ||
+      reasonCodes.includes('MISSING_RRN')
+    ) {
+      failMessage =
+        "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.";
+    } else if (
+      reasonCodes.includes('INVALID_PAYMENT_REFERENCE') ||
+      reasonCodes.includes('INVALID_RRN')
+    ) {
+      failMessage =
+        "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.";
     } else if (reasonCodes.includes('AMOUNT_MISMATCH')) {
-      failMessage = 'The paid amount on the screenshot does not match the required booking total.';
+      failMessage = 'Payment amount does not match.';
     } else if (reasonCodes.includes('MISSING_AMOUNT')) {
-      failMessage = 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.';
+      failMessage =
+        'Could not detect the payment amount on the screenshot. Please upload a complete receipt.';
     } else if (reasonCodes.includes('STATUS_NOT_SUCCESS')) {
-      failMessage = 'The uploaded screenshot shows a failed or pending transaction. Only successful payments are accepted.';
+      failMessage = 'Payment is not shown as successful.';
     } else if (reasonCodes.includes('TAMPERING_RISK')) {
-      failMessage = 'Image validation failed due to visual tampering or editing indicators.';
-    } else if (reasonCodes.includes('LOW_CONFIDENCE')) {
-      failMessage = 'The receipt text is blurry or illegible. Please upload a clearer screenshot.';
+      failMessage =
+        'Image validation failed due to visual tampering or editing indicators.';
+    } else if (
+      reasonCodes.includes('LOW_OCR_CONFIDENCE') ||
+      reasonCodes.includes('LOW_CONFIDENCE')
+    ) {
+      failMessage =
+        'The receipt text is blurry or illegible. Please upload a clearer screenshot.';
     } else if (reasonCodes.includes('WRONG_PAYEE')) {
-      failMessage = 'The recipient UPI ID or name does not match the official Yuva Shakti account.';
+      failMessage =
+        'The recipient UPI ID or name does not match the official Yuva Shakti account.';
     } else if (reasonCodes.includes('INVALID_PAYMENT_SCREEN')) {
-      failMessage = 'The uploaded file does not appear to be a valid UPI payment receipt.';
-    } else if (reasonCodes.includes('INVALID_RRN')) {
-      failMessage = 'Please enter a valid 12-digit numeric UPI RRN.';
+      failMessage =
+        'The uploaded file does not appear to be a valid UPI payment receipt.';
     }
 
     return {

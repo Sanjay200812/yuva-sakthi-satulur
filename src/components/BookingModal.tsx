@@ -55,15 +55,20 @@ const UPI_APPS: { id: UpiAppChoice; label: string; appName: string; color: strin
 ];
 
 const REASON_MESSAGES: Record<string, string> = {
-  MISSING_RRN: 'Could not detect the 12-digit UPI reference (RRN) on the screenshot. Please upload a clearer image.',
-  MISSING_AMOUNT: 'Could not clearly read the paid amount on the screenshot. Please upload an uncropped receipt.',
-  RRN_MISMATCH: 'The RRN on the screenshot does not match the 12-digit RRN you entered.',
-  AMOUNT_MISMATCH: 'The amount shown on the screenshot does not match the required booking amount.',
-  STATUS_NOT_SUCCESS: 'The uploaded screenshot does not show a successful payment status.',
-  DUPLICATE_RRN: 'This UPI reference number has already been used for another booking.',
-  DUPLICATE_SCREENSHOT: 'This screenshot has already been submitted for another booking.',
+  MISSING_PAYMENT_REFERENCE: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.",
+  MISSING_RRN: "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt that shows the transaction/RRN details.",
+  DUPLICATE_PAYMENT_REFERENCE: 'This payment receipt has already been used.',
+  DUPLICATE_RRN: 'This payment receipt has already been used.',
+  DUPLICATE_UTR: 'This payment receipt has already been used.',
+  INVALID_PAYMENT_REFERENCE: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
+  INVALID_RRN: "We couldn't clearly read a valid transaction reference. Please upload the detailed payment receipt.",
+  MISSING_AMOUNT: 'Could not detect the payment amount on the screenshot. Please upload a complete receipt.',
+  AMOUNT_MISMATCH: 'Payment amount does not match.',
+  STATUS_NOT_SUCCESS: 'Payment is not shown as successful.',
+  DUPLICATE_SCREENSHOT: 'This payment screenshot has already been submitted for another booking.',
   TAMPERING_RISK: 'The payment receipt could not be verified due to image quality or authenticity concerns.',
-  LOW_CONFIDENCE: 'The receipt text could not be read with sufficient clarity. Please upload a clear original screenshot.',
+  LOW_OCR_CONFIDENCE: 'The receipt text is blurry or illegible. Please upload a clearer screenshot.',
+  LOW_CONFIDENCE: 'The receipt text is blurry or illegible. Please upload a clearer screenshot.',
   PAYMENT_SESSION_EXPIRED: 'Your 5-minute payment session has expired. Start a new booking.',
   WRONG_PAYEE: 'The payment recipient shown does not match Yuva Shakti Youth Satulur.',
   INVALID_PAYMENT_SCREEN: 'The uploaded image does not appear to be a valid UPI payment confirmation screen.',
@@ -93,7 +98,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const [isExpired, setIsExpired] = useState<boolean>(false);
 
   // Proof form state
-  const [utr, setUtr] = useState<string>('');
   const [screenshotBase64, setScreenshotBase64] = useState<string | null>(null);
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(null);
   const [consentGiven, setConsentGiven] = useState<boolean>(true);
@@ -125,7 +129,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       setStep('details');
       setErrorMessage(null);
       setBookingData(null);
-      setUtr('');
       setScreenshotBase64(null);
       setScreenshotPreview(null);
       setIsExpired(false);
@@ -171,7 +174,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     setBookingData(null);
     setStep('details');
     setErrorMessage(null);
-    setUtr('');
     setScreenshotBase64(null);
     setScreenshotPreview(null);
     setIsExpired(false);
@@ -236,10 +238,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     reader.readAsDataURL(file);
   };
 
-  // Strict 12-digit numeric RRN validation
-  const isUtrValid = /^\d{12}$/.test(utr.trim());
-
-  // 3. Submit Payment Proof (UTR + Screenshot)
+  // 3. Submit Payment Proof (Screenshot + Consent, Automated OCR Reference Extraction)
   const handleSubmitProof = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!bookingData) return;
@@ -251,11 +250,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
 
     if (!consentGiven) {
       alert('Please check the consent box to proceed with verification.');
-      return;
-    }
-
-    if (!isUtrValid) {
-      alert('Please enter a valid 12-digit numeric UPI RRN (Reference No.) from your payment receipt.');
       return;
     }
 
@@ -273,7 +267,6 @@ export const BookingModal: React.FC<BookingModalProps> = ({
     try {
       const res = await submitPaymentProof({
         publicId: bookingData.booking.publicId,
-        utr: utr.trim(),
         screenshotBase64,
         selectedApp,
         consentGiven,
@@ -724,7 +717,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
             <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-400/30 text-amber-200 text-[11px] space-y-1 text-center">
               <span className="font-bold block">After Paying in Your UPI App:</span>
               <span>
-                Return to this screen, click <strong>"I have completed payment"</strong> below, and provide your <strong>12-digit UPI RRN</strong> and <strong>screenshot</strong>.
+                Return to this screen, click <strong>"I have completed payment"</strong> below, and upload your <strong>payment confirmation receipt screenshot</strong>.
               </span>
             </div>
 
@@ -750,48 +743,44 @@ export const BookingModal: React.FC<BookingModalProps> = ({
           </div>
         )}
 
-        {/* STEP 3: Mandatory Proof Form (12-Digit RRN + Screenshot) */}
+        {/* STEP 3: Mandatory Proof Form (Screenshot Upload & Automated Verification) */}
         {step === 'proof' && bookingData && (
           <form onSubmit={handleSubmitProof} className="space-y-4">
-            <div className="p-3 rounded-xl bg-slate-900/90 border border-purple-500/30 flex items-center justify-between text-xs">
+            <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-purple-500/30 flex items-center justify-between text-xs">
               <span>Order: <strong className="font-mono text-white">{bookingData.booking.publicId}</strong></span>
-              <span>Total: <strong className="text-amber-300 font-mono">₹{bookingData.payment.amountInr}</strong></span>
-              <span className="text-[10px] text-purple-300 font-mono">{formatCountdown(remainingSeconds)}</span>
-            </div>
-
-            {/* 12-Digit UPI RRN Input */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-semibold text-slate-200">
-                  Enter 12-Digit UPI RRN / Reference No. <span className="text-amber-400">*</span>
-                </label>
-                <span className={`text-[10px] font-mono ${isUtrValid ? 'text-emerald-400' : 'text-slate-400'}`}>
-                  {utr.length}/12 digits
-                </span>
-              </div>
-              <input
-                type="text"
-                inputMode="numeric"
-                pattern="\d*"
-                maxLength={12}
-                required
-                placeholder="e.g. 523489123456"
-                value={utr}
-                disabled={isExpired || isProcessing}
-                onChange={(e) => setUtr(e.target.value.replace(/\D/g, '').slice(0, 12))}
-                className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-purple-500/30 focus:border-amber-400 outline-none text-white text-sm font-mono tracking-wider placeholder:text-slate-500 disabled:opacity-50"
-              />
-              <span className="text-[10px] text-slate-400 mt-1 block">
-                Found on your UPI receipt as "UPI Ref No" or "RRN" (exactly 12 digits).
+              <span>Total: <strong className="text-amber-300 font-mono text-sm">₹{bookingData.payment.amountInr}</strong></span>
+              <span className={`text-xs font-mono font-bold flex items-center gap-1 ${remainingSeconds !== null && remainingSeconds < 60 ? 'text-red-400 animate-pulse' : 'text-purple-300'}`}>
+                <Clock className="w-3.5 h-3.5" />
+                {formatCountdown(remainingSeconds)}
               </span>
             </div>
 
-            {/* Screenshot Upload */}
-            <div>
-              <label className="text-xs font-semibold text-slate-200 block mb-1">
-                Upload Payment Success Screenshot <span className="text-amber-400">*</span>
-              </label>
+            {/* Detailed Receipt Guidance */}
+            <div className="p-3 rounded-xl bg-purple-950/40 border border-purple-500/30 text-[11px] text-purple-200 space-y-1.5">
+              <span className="font-semibold text-amber-300 block">
+                Upload the payment details/receipt screenshot showing:
+              </span>
+              <ul className="grid grid-cols-2 gap-1 text-[10.5px] text-slate-300 pl-1">
+                <li className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Payment Successful
+                </li>
+                <li className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Amount (₹{bookingData.payment.amountInr})
+                </li>
+                <li className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Receiver
+                </li>
+                <li className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span> Transaction / UPI Ref No
+                </li>
+              </ul>
+              <p className="text-[10px] text-amber-300/90 pt-1 border-t border-purple-500/20 italic">
+                Tip: Open the completed payment and tap View Details / Transaction Details before taking the screenshot.
+              </p>
+            </div>
 
+            {/* Prominent Screenshot Upload Area */}
+            <div>
               <input
                 type="file"
                 ref={fileInputRef}
@@ -804,20 +793,25 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               {!screenshotPreview ? (
                 <div
                   onClick={() => !isExpired && !isProcessing && fileInputRef.current?.click()}
-                  className="border-2 border-dashed border-purple-500/40 hover:border-amber-400 rounded-2xl p-5 text-center cursor-pointer bg-slate-950/60 transition group"
+                  className="border-2 border-dashed border-amber-400/50 hover:border-amber-400 rounded-2xl p-6 text-center cursor-pointer bg-slate-950/80 hover:bg-slate-900/80 transition-all group shadow-[0_0_20px_rgba(245,158,11,0.08)]"
                 >
-                  <Upload className="w-8 h-8 text-amber-400 mx-auto mb-2 group-hover:scale-110 transition-transform" />
-                  <span className="text-xs font-semibold text-white block">Click to upload screenshot</span>
-                  <span className="text-[10px] text-slate-400">PNG, JPEG, or WebP up to 5MB</span>
+                  <div className="w-12 h-12 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
+                    <Upload className="w-6 h-6 text-amber-400" />
+                  </div>
+                  <span className="text-sm font-bold text-white block mb-1">
+                    Upload Payment Success Screenshot <span className="text-amber-400">*</span>
+                  </span>
+                  <span className="text-xs text-slate-400 block mb-1">Tap to select receipt image from gallery</span>
+                  <span className="text-[10px] text-slate-500 font-mono">PNG, JPEG, or WebP up to 5MB</span>
                 </div>
               ) : (
-                <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-500/50 bg-black/50 p-2 flex items-center justify-between">
+                <div className="relative rounded-2xl overflow-hidden border-2 border-emerald-500/60 bg-black/60 p-3 flex items-center justify-between shadow-lg">
                   <div className="flex items-center gap-3">
-                    <img src={screenshotPreview} alt="Receipt preview" className="w-14 h-14 object-cover rounded-lg border" />
+                    <img src={screenshotPreview} alt="Receipt preview" className="w-16 h-16 object-cover rounded-xl border border-emerald-500/30" />
                     <div>
                       <span className="text-xs font-bold text-white block">Screenshot Attached</span>
-                      <span className="text-[10px] text-emerald-400 flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> Valid Image
+                      <span className="text-[10px] text-emerald-400 font-medium flex items-center gap-1 mt-0.5">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Ready for automated verification
                       </span>
                     </div>
                   </div>
@@ -828,7 +822,7 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                       setScreenshotBase64(null);
                       setScreenshotPreview(null);
                     }}
-                    className="p-2 text-slate-400 hover:text-red-400 cursor-pointer"
+                    className="p-2.5 text-slate-400 hover:text-red-400 hover:bg-slate-800/80 rounded-xl transition cursor-pointer"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -863,8 +857,8 @@ export const BookingModal: React.FC<BookingModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isProcessing || isExpired || !isUtrValid || !screenshotBase64 || !consentGiven}
-                className="flex-1 py-3 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+                disabled={isProcessing || isExpired || !screenshotBase64 || !consentGiven}
+                className="flex-1 py-3.5 rounded-xl bg-gradient-to-r from-amber-400 via-yellow-500 to-amber-500 hover:from-amber-300 hover:to-yellow-400 text-slate-950 font-display font-black text-xs uppercase tracking-wider shadow-lg transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
               >
                 {isProcessing ? (
                   <>

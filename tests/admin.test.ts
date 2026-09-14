@@ -112,7 +112,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       .set('Authorization', `Bearer ${adminToken}`);
     expect(couponsBefore.body.data.coupons.some((c: any) => c.booking_public_id === booking.publicId)).toBe(false);
 
-    // 2. Submit payment proof with authorization
+    // 2. Submit payment proof with authorization (screenshot + consent only, no client UTR)
     const validImgBase64 = (await sharp({
       create: { width: 250, height: 250, channels: 3, background: { r: 240, g: 240, b: 240 } }
     }).png().toBuffer()).toString('base64');
@@ -121,7 +121,6 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       .post(`/api/bookings/${booking.publicId}/payment-proof`)
       .set('Authorization', `Bearer ${payment.statusToken}`)
       .send({
-        utr: '984809988801',
         screenshotBase64: validImgBase64,
         consentGiven: true,
       });

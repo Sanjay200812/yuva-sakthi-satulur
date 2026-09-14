@@ -211,11 +211,11 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
   }
 });
 
-// 5. Submit Mandatory Payment Proof (12-Digit RRN + Screenshot + Consent)
+// 5. Submit Mandatory Payment Proof (Screenshot + Consent, Automated OCR Reference Extraction)
 app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
-    const { utr, screenshotBase64, selectedApp, consentGiven } = req.body;
+    const { screenshotBase64, selectedApp, consentGiven } = req.body;
 
     // 0. Secure Token Authentication
     const authHeader = req.headers.authorization;
@@ -267,16 +267,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 4. Strict 12-Digit Numeric RRN Validation
-    const normalizedUtr = normalizeUtr(String(utr || ''));
-    if (!normalizedUtr || !/^\d{12}$/.test(normalizedUtr)) {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'INVALID_RRN', message: 'Please enter a valid 12-digit UPI RRN / Transaction reference number.' },
-      });
-    }
-
-    // 5. Validate Screenshot Presence
+    // 4. Validate Screenshot Presence
     if (!screenshotBase64 || typeof screenshotBase64 !== 'string' || !screenshotBase64.trim()) {
       return res.status(400).json({
         success: false,
@@ -284,7 +275,7 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 6. Idempotency: Return immediately if already confirmed
+    // 5. Idempotency: Return immediately if already confirmed
     if (booking.status === 'payment_confirmed' || booking.status === 'proof_verified') {
       const existingCoupons = await db.query(
         'SELECT coupon_number, holder_name, phone, village, ticket_index, total_quantity, issued_at FROM coupons WHERE booking_id = $1 ORDER BY ticket_index ASC',
@@ -302,20 +293,39 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       });
     }
 
-    // 7. Clean & Decode Screenshot Buffer
+    // 6. Clean & Decode Screenshot Buffer
     const cleanBase64 = screenshotBase64.replace(/^data:image\/[a-z]+;base64,/, '');
     const imageBuffer = Buffer.from(cleanBase64, 'base64');
 
-    // 8. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
+    // 7. Process Image: magic bytes, EXIF strip, dimension check, SHA-256, phash, save to private bucket/disk
     const processed = await processPaymentScreenshot(imageBuffer, booking.id);
 
-    // 9. Check Duplicate RRN (Global uniqueness check)
-    const utrHash = crypto.createHash('sha256').update(normalizedUtr).digest('hex');
-    const dupUtrRes = await db.query(
-      'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-      [utrHash, booking.id, 'admin_rejected', 'ai_check_failed']
+    // 8. Run Gemini-Assisted OCR & Risk Analysis (Untrusted Input)
+    const extraction = await analyzePaymentScreenshotWithGemini(
+      processed.sanitizedBuffer,
+      processed.mimeType
     );
-    const isDuplicateUtr = dupUtrRes.rows.length > 0;
+
+    // 9. Extract and normalize transaction reference exclusively from screenshot OCR
+    const extractedRrn = extraction.utr_or_rrn ? normalizeUtr(extraction.utr_or_rrn) : '';
+    const submissionId = crypto.randomUUID();
+    let utrHash: string;
+    let encryptedUtr: string;
+    let isDuplicateUtr = false;
+
+    if (extractedRrn) {
+      utrHash = crypto.createHash('sha256').update(extractedRrn).digest('hex');
+      const dupUtrRes = await db.query(
+        'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
+        [utrHash, booking.id, 'admin_rejected', 'ai_check_failed']
+      );
+      isDuplicateUtr = dupUtrRes.rows.length > 0;
+      encryptedUtr = encryptSensitiveField(extractedRrn);
+    } else {
+      const fallbackRef = `UNEXTRACTED_${submissionId}`;
+      utrHash = crypto.createHash('sha256').update(fallbackRef).digest('hex');
+      encryptedUtr = encryptSensitiveField(fallbackRef);
+    }
 
     // 10. Check Duplicate Screenshot Hash
     const dupScreenRes = await db.query(
@@ -342,29 +352,20 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       }
     }
 
-    // 11. Run Gemini-Assisted OCR & Risk Analysis
-    const extraction = await analyzePaymentScreenshotWithGemini(
-      processed.sanitizedBuffer,
-      processed.mimeType
-    );
-
-    // 12. Run Deterministic Comparison Engine (Fail-Closed)
+    // 11. Run Deterministic Comparison Engine (Fail-Closed)
     const match = performDeterministicComparison({
       expectedAmountPaise: booking.total_amount_paise,
       expectedPayeeUpiId: config.PAYEE_UPI_ID,
       expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: normalizedUtr,
+      enteredUtr: extractedRrn,
       selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
       extraction,
       isDuplicateUtr,
       isDuplicateScreenshot,
+      isExpired,
     });
 
-    const submissionId = crypto.randomUUID();
     const paymentRef = booking.payment_reference || `YSYS-${Date.now().toString(36).toUpperCase()}`;
-
-    // Authenticated AES-256-GCM encryption for sensitive RRN at rest
-    const encryptedUtr = encryptSensitiveField(normalizedUtr);
 
     // 13. Persist payment submission record
     await db.query(
