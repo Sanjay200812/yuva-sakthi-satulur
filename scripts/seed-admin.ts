@@ -3,13 +3,13 @@ import { db, closePool } from '../server/db/client.ts';
 import { hashPassword } from '../server/admin/auth.ts';
 
 async function seed() {
-  const rawEmail = process.env.ADMIN_EMAIL || 'admin@yuvashakti.org';
+  const rawEmail = process.env.ADMIN_EMAIL || 'admin@yuvashakti.com';
   const email = rawEmail.trim().toLowerCase();
   const password = process.env.ADMIN_PASSWORD;
 
   if (!password) {
     console.error('❌ ERROR: ADMIN_PASSWORD environment variable is required to seed/reset admin credentials.');
-    console.error('Example: ADMIN_EMAIL=admin@yuvashakti.org ADMIN_PASSWORD=your_secure_password npm run seed:admin');
+    console.error('Example: ADMIN_EMAIL=admin@yuvashakti.com ADMIN_PASSWORD=your_secure_password npm run seed:admin');
     process.exit(1);
   }
 

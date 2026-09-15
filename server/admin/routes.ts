@@ -11,13 +11,18 @@ import {
   destroyAdminSession,
   getAdminCookieOptions,
 } from './auth.ts';
-import { renderTicketPdf, renderTicketRaster, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
+import { renderTicketPdf, renderTicketRaster, renderTicketDocx, formatKolkataTime, maskPhoneNumber } from '../services/ticketRenderer.ts';
+import { getCouponInventory } from '../services/couponAllocator.ts';
 import { getSignedScreenshotUrl } from '../upi/imageProcessor.ts';
 import {
   confirmPaymentFromBankRecord,
   rejectPaymentSubmission,
   requestProofResubmission,
 } from '../upi/adminReconciliation.ts';
+import {
+  getPaymentSettings,
+  updatePaymentSettings,
+} from '../services/paymentSettingsService.ts';
 
 const router = express.Router();
 
@@ -133,6 +138,17 @@ router.get('/dashboard', requireAdminAuth, async (req: Request, res: Response) =
       couponsToday: 0,
       failedOrPendingAttempts: 0,
       lastPaymentAt: null,
+    };
+
+    const inventory = await getCouponInventory();
+    data = {
+      ...data,
+      couponRange: '1501 – 2250',
+      totalCoupons: inventory.total,
+      issuedCoupons: inventory.issued,
+      remainingCoupons: inventory.remaining,
+      isSoldOut: inventory.isSoldOut,
+      validCouponsCount: inventory.issued,
     };
 
     res.json({ success: true, data });
@@ -270,8 +286,8 @@ router.get('/coupons/:couponNumber/download', requireAdminAuth, async (req: Requ
     const { couponNumber } = req.params;
     const format = ((req.query.format as string) || 'pdf').toLowerCase();
 
-    if (!['pdf', 'png', 'jpeg', 'jpg'].includes(format)) {
-      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg.');
+    if (!['pdf', 'png', 'jpeg', 'jpg', 'docx'].includes(format)) {
+      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg, docx.');
     }
 
     const resCoupon = await db.query('SELECT * FROM coupons WHERE coupon_number = $1', [couponNumber]);
@@ -294,6 +310,13 @@ router.get('/coupons/:couponNumber/download', requireAdminAuth, async (req: Requ
       totalQuantity: coupon.total_quantity,
       paidAt: booking?.verified_at || booking?.paid_at,
     };
+
+    if (format === 'docx') {
+      const docxBuffer = await renderTicketDocx(ticketData);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.docx"`);
+      return res.send(docxBuffer);
+    }
 
     if (format === 'pdf') {
       const pdfBuffer = await renderTicketPdf(ticketData);
@@ -399,8 +422,7 @@ router.get(['/payment-reviews', '/payment-diagnostics'], requireAdminAuth, async
         status: s.status,
         riskScore: s.risk_score || 0,
         reasonCodes: s.verification_reason_codes && s.verification_reason_codes.length > 0 ? s.verification_reason_codes : (s.reason_codes || []),
-        ocrExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
-        geminiExtraction: parseJson(s.ocr_extraction || s.gemini_extraction),
+        ocrExtraction: parseJson(s.ocr_extraction),
         ocrEngine: s.ocr_engine || 'tesseract.js',
         extractedTransactionTimestamp: s.extracted_transaction_timestamp,
         deterministicComparison: parseJson(s.verification_result || s.deterministic_comparison),
@@ -581,18 +603,10 @@ router.get('/bookings/:publicId', requireAdminAuth, async (req: Request, res: Re
   }
 });
 
-// 16. Admin Payment Settings (Section 4 & 52 of Master Implementation Prompt)
+// 16. Admin Payment Settings (Single Source of Truth backed by paymentSettingsService)
 router.get('/payment-settings', requireAdminAuth, async (_req: Request, res: Response) => {
   try {
-    const result = await db.query('SELECT * FROM payment_settings LIMIT 1');
-    const settings = result.rows[0] || {
-      payee_upi_id: config.PAYEE_UPI_ID || '7075920852@ybl',
-      payee_display_name: config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur',
-      coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5000,
-      payments_enabled: true,
-      max_quantity: config.EVENT_MAX_COUPONS_PER_BOOKING || 20,
-      payment_session_minutes: 5,
-    };
+    const settings = await getPaymentSettings();
 
     res.json({
       success: true,
@@ -615,52 +629,45 @@ router.get('/payment-settings', requireAdminAuth, async (_req: Request, res: Res
 
 router.put('/payment-settings', requireAdminAuth, async (req: Request, res: Response) => {
   try {
-    const { payeeUpiId, payeeDisplayName, couponPriceInr, paymentsEnabled, maxQuantity } = req.body;
-
-    // Validate payee UPI ID
-    if (payeeUpiId && !/^[a-zA-Z0-9._\-]{2,256}@[a-zA-Z]{2,64}$/.test(payeeUpiId.trim())) {
-      return res.status(400).json({
-        success: false,
-        error: { code: 'INVALID_UPI_ID', message: 'Invalid UPI VPA format. Example: 7075920852@ybl' },
-      });
-    }
-
-    const cleanUpi = payeeUpiId ? payeeUpiId.trim() : config.PAYEE_UPI_ID;
-    const cleanName = payeeDisplayName ? payeeDisplayName.trim() : config.PAYEE_DISPLAY_NAME;
-    const cleanPrice = couponPriceInr ? Math.round(Number(couponPriceInr) * 100) : 5000;
-    const cleanEnabled = paymentsEnabled !== undefined ? Boolean(paymentsEnabled) : true;
-    const cleanMaxQty = maxQuantity ? Math.min(Math.max(1, parseInt(maxQuantity, 10)), 100) : 20;
+    const { payeeUpiId, payeeDisplayName, couponPriceInr, couponPricePaise, paymentsEnabled, maxQuantity } = req.body;
     const adminUser = (req as any).adminUser;
 
-    await db.query(
-      `UPDATE payment_settings SET
-        payee_upi_id = $1,
-        payee_display_name = $2,
-        coupon_price_paise = $3,
-        payments_enabled = $4,
-        max_quantity = $5,
-        payment_session_minutes = 5,
-        updated_at = $6,
-        updated_by = $7`,
-      [cleanUpi, cleanName, cleanPrice, cleanEnabled, cleanMaxQty, new Date().toISOString(), adminUser?.id || null]
+    const updated = await updatePaymentSettings(
+      {
+        payeeUpiId,
+        payeeDisplayName,
+        couponPriceInr,
+        couponPricePaise,
+        paymentsEnabled,
+        maxQuantity,
+      },
+      adminUser?.id || null
     );
 
     res.json({
       success: true,
       message: 'Payment settings updated successfully.',
       data: {
-        payeeUpiId: cleanUpi,
-        payeeDisplayName: cleanName,
-        couponPricePaise: cleanPrice,
-        couponPriceInr: cleanPrice / 100,
-        paymentsEnabled: cleanEnabled,
-        maxQuantity: cleanMaxQty,
+        payeeUpiId: updated.payee_upi_id,
+        payeeDisplayName: updated.payee_display_name,
+        couponPricePaise: updated.coupon_price_paise,
+        couponPriceInr: updated.coupon_price_paise / 100,
+        paymentsEnabled: updated.payments_enabled,
+        maxQuantity: updated.max_quantity,
         paymentSessionMinutes: 5,
         sessionDurationLabel: '5 Minutes — Security Rule',
+        updatedAt: updated.updated_at,
       },
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, error: { message: 'Failed to update payment settings.' } });
+    const isValidation = error?.message?.startsWith('INVALID_');
+    res.status(isValidation ? 400 : 500).json({
+      success: false,
+      error: {
+        code: isValidation ? error.message.split(':')[0] : 'SETTINGS_UPDATE_FAILED',
+        message: error.message || 'Failed to update payment settings.',
+      },
+    });
   }
 });
 

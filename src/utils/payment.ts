@@ -215,6 +215,7 @@ export function pollPaymentStatus(
             }),
             status: 'confirmed',
             transactionRef: 'AUTOMATED_PROOF_VERIFIED',
+            downloadToken: b.downloadToken || statusToken,
           };
           onStatusChange('payment_confirmed', b.message, confirmedBooking);
           return; // stop polling

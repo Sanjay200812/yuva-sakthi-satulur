@@ -9,7 +9,7 @@ interface InteractiveTicketProps {
 }
 
 export const InteractiveTicket: React.FC<InteractiveTicketProps> = ({
-  customNumber = 'YSYS-2025-1501',
+  customNumber = '1501',
   customName = 'LUCKY PARTICIPANT',
   onSelect,
   interactive = true,

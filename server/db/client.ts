@@ -48,10 +48,10 @@ class MemoryDB implements TransactionalDB {
 
   constructor() {
     const adminId = '00000000-0000-0000-0000-000000000001';
-    const hashedPassword = bcrypt.hashSync('YuvaShakti@Admin2026', 10);
+    const hashedPassword = bcrypt.hashSync('admin@123', 10);
     this.adminUsers.set(adminId, {
       id: adminId,
-      email: 'admin@yuvashakti.org',
+      email: 'admin@yuvashakti.com',
       password_hash: hashedPassword,
       role: 'super_admin',
       is_active: true,
@@ -60,7 +60,7 @@ class MemoryDB implements TransactionalDB {
 
     this.paymentSettings = {
       id: '00000000-0000-0000-0000-000000000002',
-      payee_upi_id: config.PAYEE_UPI_ID || '7075920852@ybl',
+      payee_upi_id: config.PAYEE_UPI_ID || '9574876369@ybl',
       payee_display_name: config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur',
       coupon_price_paise: config.EVENT_COUPON_PRICE_PAISE || 5000,
       payments_enabled: true,
@@ -73,6 +73,11 @@ class MemoryDB implements TransactionalDB {
 
   async getNextCouponSerial(): Promise<number> {
     this.currentSerial += 1;
+    if (this.currentSerial > 2250) {
+      const err = new Error('reached maximum value of sequence "coupon_serial_seq" (2250)');
+      (err as any).code = '22023';
+      throw err;
+    }
     return this.currentSerial;
   }
 
@@ -133,6 +138,12 @@ class MemoryDB implements TransactionalDB {
     // 3.5. Find bookings with status != $1
     if (trimmed.includes('FROM bookings') && trimmed.includes('status != $1')) {
       const list = Array.from(this.bookings.values()).filter((b) => b.status !== params[0]);
+      return { rows: list as any, rowCount: list.length };
+    }
+
+    // 3.6. Find booking by expected_payee_upi_id
+    if (trimmed.includes('FROM bookings') && trimmed.includes('expected_payee_upi_id = $1')) {
+      const list = Array.from(this.bookings.values()).filter((b) => b.expected_payee_upi_id === params[0]);
       return { rows: list as any, rowCount: list.length };
     }
 
@@ -521,6 +532,23 @@ class MemoryDB implements TransactionalDB {
       return { rows: (c ? [c] : []) as any, rowCount: c ? 1 : 0 };
     }
 
+    // 11.5. Count coupons for inventory query
+    if (trimmed.includes('FROM coupons') && trimmed.includes('COUNT(*)')) {
+      let count = 0;
+      for (const c of this.coupons.values()) {
+        const s = Number(c.serial);
+        const st = c.status || 'valid';
+        if (params && params.length >= 3) {
+          if (s >= params[0] && s <= params[1] && st === params[2]) {
+            count++;
+          }
+        } else if (st === 'valid') {
+          count++;
+        }
+      }
+      return { rows: [{ count }] as any, rowCount: 1 };
+    }
+
     // 12. Payment event check (idempotency)
     if (trimmed.includes('FROM payment_events') && trimmed.includes('provider_event_id = $1')) {
       const ev = this.paymentEvents.get(params[0]);
@@ -698,6 +726,18 @@ class MemoryDB implements TransactionalDB {
 
     // 21. Payment Settings
     if (trimmed.includes('FROM payment_settings')) {
+      return { rows: [this.paymentSettings] as any, rowCount: 1 };
+    }
+
+    if (trimmed.startsWith('INSERT INTO payment_settings')) {
+      const matchCols = trimmed.match(/\((.*?)\)\s*VALUES/s);
+      if (matchCols && matchCols[1]) {
+        const cols = matchCols[1].split(',').map((c) => c.trim().toLowerCase());
+        cols.forEach((col, idx) => {
+          this.paymentSettings[col] = params[idx];
+        });
+      }
+      this.paymentSettings.updated_at = new Date().toISOString();
       return { rows: [this.paymentSettings] as any, rowCount: 1 };
     }
 

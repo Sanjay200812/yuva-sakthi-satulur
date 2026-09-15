@@ -38,7 +38,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
   const [metrics, setMetrics] = useState<any>(null);
   const [coupons, setCoupons] = useState<any[]>([]);
   const [reviews, setReviews] = useState<any[]>([]);
-  const [aiHealth, setAiHealth] = useState<any>(null);
   const [reviewFilter, setReviewFilter] = useState<string>('all');
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -98,7 +97,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
         'Save payment settings'
       );
       if (json.success) {
+        if (json.data) {
+          setPaymentSettings(json.data);
+        }
         setSettingsMessage('Payment settings updated successfully.');
+        await fetchPaymentSettings();
         setTimeout(() => setSettingsMessage(null), 3500);
       } else {
         setSettingsError(json.error?.message || 'Failed to update settings.');
@@ -152,9 +155,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
       const json = await safeFetchJson<any>(`/api/admin/payment-reviews?${query.toString()}`, { credentials: 'include' }, 'Payment reviews');
       if (json.success) {
         setReviews(json.data || []);
-        if (json.aiHealth) {
-          setAiHealth(json.aiHealth);
-        }
       }
     } catch (err) {
       console.error('Error fetching verification logs', err);
@@ -248,14 +248,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
 
           <div className="p-4 rounded-2xl bg-[#0D132D] border border-purple-500/20">
             <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-              <span>Valid Issued Coupons</span>
+              <span>Coupon Range: 1501 – 2250</span>
               <Ticket className="w-4 h-4 text-amber-400" />
             </div>
-            <div className="text-2xl sm:text-3xl font-black text-amber-400 font-display">
-              {metrics?.validCouponsCount || 0}
+            <div className="flex items-center justify-between">
+              <div className="text-2xl sm:text-3xl font-black text-amber-400 font-display">
+                {metrics?.validCouponsCount || 0} <span className="text-xs font-normal text-slate-400">/ 750</span>
+              </div>
+              {((metrics?.remainingCoupons ?? (750 - (metrics?.validCouponsCount || 0))) <= 0) && (
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                  COUPONS SOLD OUT
+                </span>
+              )}
             </div>
-            <div className="text-[10px] text-slate-400 mt-1 font-mono">
-              Today: +{metrics?.couponsToday || 0}
+            <div className="text-[11px] text-slate-300 mt-2 grid grid-cols-3 gap-1 font-mono bg-slate-900/60 p-2 rounded-xl border border-white/5">
+              <div><span className="text-slate-500">Total:</span> <strong className="text-white">750</strong></div>
+              <div><span className="text-slate-500">Issued:</span> <strong className="text-amber-400">{metrics?.validCouponsCount || 0}</strong></div>
+              <div><span className="text-slate-500">Left:</span> <strong className="text-emerald-400">{metrics?.remainingCoupons ?? Math.max(0, 750 - (metrics?.validCouponsCount || 0))}</strong></div>
             </div>
           </div>
 
@@ -617,10 +626,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                       </tr>
                     ) : (
                       reviews.map((r) => {
-                        const isConfirmed = r.status === 'payment_confirmed' || r.status === 'proof_verified' || r.status === 'admin_confirmed';
-                        const isFailed = r.status === 'ocr_check_failed' || r.status === 'ai_check_failed' || r.status === 'rejected' || r.status === 'admin_rejected';
-                        const isError = r.status === 'ocr_processing_error';
-                        const ext = r.ocrExtraction || r.geminiExtraction;
+                        const isConfirmed = r.status === 'payment_confirmed' || r.status === 'proof_verified';
+                        const isFailed = r.status === 'ocr_check_failed' || r.status === 'proof_verification_failed' || r.status === 'rejected';
+                        const isError = r.status === 'ocr_processing_error' || r.status === 'processing_error';
+                        const ext = r.ocrExtraction;
 
                         return (
                           <tr key={r.id} className="hover:bg-slate-900/60 transition">

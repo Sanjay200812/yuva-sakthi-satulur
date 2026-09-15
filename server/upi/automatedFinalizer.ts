@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { db } from '../db/client.ts';
 import { config } from '../config/eventConfig.ts';
+import { allocateCouponsForBooking } from '../services/couponAllocator.ts';
 
 export interface AutomatedFinalizationParams {
   submissionId: string;
@@ -78,7 +79,6 @@ export async function finalizeVerifiedSubmission(
       `UPDATE payment_submissions 
        SET status = 'payment_confirmed', 
            ocr_engine = $1,
-           ai_model_version = $1, 
            updated_at = $2
        WHERE id = $3`,
       [decisionVersion, finalizedAt, submission.id]
@@ -95,61 +95,11 @@ export async function finalizeVerifiedSubmission(
       [finalizedAt, booking.id]
     );
 
-    // 6. Sequential atomic coupon serial allocation
-    const quantity = booking.quantity || 1;
-    const currentYear = new Date().getFullYear();
-    const prefix = config.EVENT_COUPON_PREFIX || 'YSYS';
-
-    // Get the current max serial from database
-    const serialRes = await client.query('SELECT COALESCE(MAX(serial), 0) as max_serial FROM coupons');
-    let nextSerial = Number(serialRes.rows[0]?.max_serial || 0);
-
-    const issuedCoupons: any[] = [];
-
-    for (let i = 1; i <= quantity; i++) {
-      nextSerial++;
-      const paddedSerial = String(nextSerial).padStart(6, '0');
-      const couponNumber = `${prefix}-${currentYear}-${paddedSerial}`;
-      const couponId = crypto.randomUUID();
-
-      const verificationToken = crypto.randomBytes(16).toString('hex');
-      const verificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
-
-      await client.query(
-        `INSERT INTO coupons (
-          id, booking_id, serial, coupon_number, holder_name, phone, village,
-          ticket_index, total_quantity, template_version, verification_token_hash, status, issued_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-        [
-          couponId,
-          booking.id,
-          nextSerial,
-          couponNumber,
-          booking.participant_name,
-          booking.phone,
-          booking.village,
-          i,
-          quantity,
-          config.TEMPLATE_VERSION || 'v1-official',
-          verificationTokenHash,
-          'valid',
-          finalizedAt,
-        ]
-      );
-
-      issuedCoupons.push({
-        id: couponId,
-        coupon_number: couponNumber,
-        serial: nextSerial,
-        holder_name: booking.participant_name,
-        phone: booking.phone,
-        village: booking.village,
-        ticket_index: i,
-        total_quantity: quantity,
-        status: 'valid',
-        issued_at: finalizedAt,
-      });
-    }
+    // 6. Sequential atomic coupon serial allocation strictly in 1501-2250 range
+    const issuedCoupons = await allocateCouponsForBooking(client, booking.id, async () => {
+      const res = await client.query("SELECT nextval('coupon_serial_seq') as nextval");
+      return parseInt(res.rows[0].nextval, 10);
+    });
 
     // 7. System Audit Event
     const auditId = crypto.randomUUID();
@@ -165,7 +115,7 @@ export async function finalizeVerifiedSubmission(
         JSON.stringify({
           submissionId: submission.id,
           publicBookingId: booking.public_id,
-          couponsIssued: quantity,
+          couponsIssued: issuedCoupons.length,
           amountPaise: booking.total_amount_paise,
           utrHash: submission.payer_utr_hash,
           decisionVersion,
@@ -177,7 +127,7 @@ export async function finalizeVerifiedSubmission(
     return {
       booking: { ...booking, status: 'payment_confirmed', paid_at: finalizedAt, verified_at: finalizedAt },
       coupons: issuedCoupons,
-      couponsIssuedCount: quantity,
+      couponsIssuedCount: issuedCoupons.length,
     };
   });
 }

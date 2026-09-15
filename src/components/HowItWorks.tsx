@@ -21,7 +21,7 @@ export const HowItWorks: React.FC<HowItWorksProps> = ({ onOpenBooking }) => {
       number: '02',
       title: 'SAVE YOUR COUPON NUMBER',
       subtitle: 'Keep your coupon details safely.',
-      detail: 'Get your instant digital pass with unique serial numbers (e.g., YSYS-2025-XXXX). Take a screenshot or download the ticket.',
+      detail: 'Get your instant digital pass with unique serial numbers (e.g., 1501, 1502). Take a screenshot or download the ticket.',
       icon: BookmarkCheck,
       accent: 'from-amber-400 to-yellow-500',
       badge: 'Digital Pass Issued',

@@ -517,7 +517,7 @@ export const CouponSection: React.FC<CouponSectionProps> = ({ onBookCoupon, onOp
                         key={idx}
                         className="px-2 py-0.5 rounded bg-purple-950/80 border border-purple-500/30 text-amber-300 font-mono text-[11px] font-semibold"
                       >
-                        YSYS-2025-{1501 + idx}
+                        {1501 + idx}
                       </span>
                     ))}
                   </div>

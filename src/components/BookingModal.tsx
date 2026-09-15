@@ -31,6 +31,7 @@ import {
   pollPaymentStatus,
   BookingCreationResponse,
 } from '../utils/payment.ts';
+import { downloadAuthorizedFile } from '../utils/download.ts';
 
 interface BookingModalProps {
   isOpen: boolean;
@@ -115,6 +116,8 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   const [liveStatus, setLiveStatus] = useState<string>('payment_initiated');
   const [statusMessage, setStatusMessage] = useState<string>('Payment initiated.');
   const [confirmedBookingData, setConfirmedBookingData] = useState<CouponBooking | null>(null);
+  const [downloadingFormat, setDownloadingFormat] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -282,6 +285,11 @@ export const BookingModal: React.FC<BookingModalProps> = ({
   };
 
   const handleBookingConfirmed = (confirmed: any) => {
+    const token = bookingData?.payment?.downloadToken
+      || confirmed.downloadToken
+      || (confirmed as any).data?.downloadToken
+      || bookingData?.payment?.statusToken;
+
     try {
       sessionStorage.removeItem('active_upi_session');
       sessionStorage.removeItem('active_upi_step');
@@ -307,11 +315,80 @@ export const BookingModal: React.FC<BookingModalProps> = ({
       }),
       status: 'confirmed',
       transactionRef: maskedRef,
+      downloadToken: token,
     };
+
+    // Store secure temporary download context for this browser session (Requirement 10)
+    try {
+      sessionStorage.setItem(
+        'confirmed_booking_download',
+        JSON.stringify({
+          publicId: confirmedBooking.id,
+          downloadToken: token,
+          couponNumbers: confirmedBooking.ticketNumbers,
+        })
+      );
+    } catch {}
 
     setConfirmedBookingData(confirmedBooking);
     setLiveStatus('payment_confirmed');
     setStatusMessage(`Payment proof verified! ${confirmedBooking.quantity} coupons generated.`);
+  };
+
+  const getEffectiveDownloadToken = (): string | undefined => {
+    if (confirmedBookingData?.downloadToken) return confirmedBookingData.downloadToken;
+    if (bookingData?.payment?.downloadToken) return bookingData.payment.downloadToken;
+    try {
+      const stored = sessionStorage.getItem('confirmed_booking_download');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.publicId === (confirmedBookingData?.id || bookingData?.booking.publicId)) {
+          return parsed.downloadToken;
+        }
+      }
+    } catch {}
+    return bookingData?.payment?.statusToken;
+  };
+
+  const handleCouponDownload = async (couponNum: string, format: 'pdf' | 'png' | 'jpeg') => {
+    const token = getEffectiveDownloadToken();
+    setDownloadingFormat(format);
+    setDownloadError(null);
+    try {
+      const ext = format === 'jpeg' ? 'jpg' : format;
+      const res = await downloadAuthorizedFile(
+        `/api/coupons/${couponNum}/download?format=${format}`,
+        token,
+        `${couponNum}.${ext}`
+      );
+      if (!res.success && res.error) {
+        setDownloadError(res.error);
+      }
+    } finally {
+      setDownloadingFormat(null);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    const publicId = bookingData?.booking.publicId || confirmedBookingData?.id;
+    if (!publicId) return;
+    const token = getEffectiveDownloadToken();
+    setDownloadingFormat('all');
+    setDownloadError(null);
+    try {
+      const isMulti = (confirmedBookingData?.ticketNumbers?.length || 0) > 1;
+      const filename = isMulti ? `YuvaShakti-${publicId}-Coupons.zip` : `YuvaShakti-${publicId}-Tickets.pdf`;
+      const res = await downloadAuthorizedFile(
+        `/api/bookings/${publicId}/download-all`,
+        token,
+        filename
+      );
+      if (!res.success && res.error) {
+        setDownloadError(res.error);
+      }
+    } finally {
+      setDownloadingFormat(null);
+    }
   };
 
   const handleManualRetry = async () => {
@@ -1062,53 +1139,75 @@ export const BookingModal: React.FC<BookingModalProps> = ({
                     <span>VIEW COUPONS</span>
                   </button>
 
+                  {downloadError && (
+                    <div className="p-2.5 rounded-lg bg-red-950/70 border border-red-500/40 text-red-200 text-xs text-center font-medium">
+                      {downloadError}
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-3 gap-2">
-                    <a
-                      href={
-                        confirmedBookingData?.ticketNumbers?.[0]
-                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=pdf`
-                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                    <button
+                      type="button"
+                      disabled={!!downloadingFormat}
+                      onClick={() => {
+                        const firstCoupon = confirmedBookingData?.ticketNumbers?.[0];
+                        if (firstCoupon) handleCouponDownload(firstCoupon, 'pdf');
+                        else handleDownloadAll();
+                      }}
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700 cursor-pointer disabled:opacity-50 transition"
                     >
-                      <span>PDF</span>
-                    </a>
-                    <a
-                      href={
-                        confirmedBookingData?.ticketNumbers?.[0]
-                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=png`
-                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                      {downloadingFormat === 'pdf' ? (
+                        <span className="animate-pulse text-amber-300">DOWNLOADING...</span>
+                      ) : (
+                        <span>PDF</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!!downloadingFormat}
+                      onClick={() => {
+                        const firstCoupon = confirmedBookingData?.ticketNumbers?.[0];
+                        if (firstCoupon) handleCouponDownload(firstCoupon, 'png');
+                        else handleDownloadAll();
+                      }}
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700 cursor-pointer disabled:opacity-50 transition"
                     >
-                      <span>PNG</span>
-                    </a>
-                    <a
-                      href={
-                        confirmedBookingData?.ticketNumbers?.[0]
-                          ? `/api/coupons/${confirmedBookingData.ticketNumbers[0]}/download?format=jpeg`
-                          : `/api/bookings/${bookingData?.booking.publicId}/download-all`
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700"
+                      {downloadingFormat === 'png' ? (
+                        <span className="animate-pulse text-amber-300">DOWNLOADING...</span>
+                      ) : (
+                        <span>PNG</span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!!downloadingFormat}
+                      onClick={() => {
+                        const firstCoupon = confirmedBookingData?.ticketNumbers?.[0];
+                        if (firstCoupon) handleCouponDownload(firstCoupon, 'jpeg');
+                        else handleDownloadAll();
+                      }}
+                      className="py-2.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1 border border-slate-700 cursor-pointer disabled:opacity-50 transition"
                     >
-                      <span>JPEG</span>
-                    </a>
+                      {downloadingFormat === 'jpeg' ? (
+                        <span className="animate-pulse text-amber-300">DOWNLOADING...</span>
+                      ) : (
+                        <span>JPEG</span>
+                      )}
+                    </button>
                   </div>
 
-                  <a
-                    href={`/api/bookings/${bookingData?.booking.publicId}/download-all`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-full py-2.5 rounded-xl bg-purple-950/70 hover:bg-purple-900/80 border border-purple-500/40 text-purple-200 text-[11px] font-bold uppercase tracking-wider block text-center cursor-pointer transition"
+                  <button
+                    type="button"
+                    disabled={!!downloadingFormat}
+                    onClick={handleDownloadAll}
+                    className="w-full py-2.5 rounded-xl bg-purple-950/70 hover:bg-purple-900/80 border border-purple-500/40 text-purple-200 text-[11px] font-bold uppercase tracking-wider block text-center cursor-pointer disabled:opacity-50 transition"
                   >
-                    DOWNLOAD ALL / ZIP
-                  </a>
+                    {downloadingFormat === 'all' ? (
+                      <span className="animate-pulse text-amber-300">DOWNLOADING ALL...</span>
+                    ) : (
+                      <span>DOWNLOAD ALL / ZIP</span>
+                    )}
+                  </button>
                 </div>
               </div>
             ) : liveStatus === 'ocr_processing_error' ? (

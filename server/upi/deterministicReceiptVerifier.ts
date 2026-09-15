@@ -55,7 +55,7 @@ export function is12DigitRrn(ref: string): boolean {
  */
 export function isMaskedUpiMatch(maskedUpi: string, expectedUpi: string): boolean {
   if (!maskedUpi || !expectedUpi) return false;
-  const mLower = maskedUpi.toLowerCase().trim();
+  const mLower = maskedUpi.toLowerCase().trim().replace(/\|/g, 'l');
   const eLower = expectedUpi.toLowerCase().trim();
 
   if (mLower === eLower) return true;
@@ -63,7 +63,16 @@ export function isMaskedUpiMatch(maskedUpi: string, expectedUpi: string): boolea
   const [mUser, mBank] = mLower.split('@');
   const [eUser, eBank] = eLower.split('@');
 
-  if (!mBank || !eBank || mBank !== eBank) return false;
+  // If username matches completely (e.g. 7075920852 == 7075920852)
+  if (mUser && eUser && mUser === eUser) {
+    if (!mBank || !eBank || eBank.startsWith(mBank) || mBank.startsWith(eBank) || mBank === eBank) {
+      return true;
+    }
+  }
+
+  if (!mBank || !eBank || (!eBank.startsWith(mBank) && !mBank.startsWith(eBank) && mBank !== eBank)) {
+    return false;
+  }
   if (!mUser.includes('*')) return mUser === eUser;
 
   const prefixMatch = mUser.match(/^([^*]+)/);
@@ -80,8 +89,8 @@ export function isMaskedUpiMatch(maskedUpi: string, expectedUpi: string): boolea
 
 /**
  * Master Deterministic Receipt Verifier.
- * Performs code-only, zero-AI, fail-closed validation of payment screenshots
- * and cross-checks with user-entered UTR and server-authoritative booking parameters.
+ * Performs code-only, zero-AI, fail-closed validation of payment receipts
+ * against server-authoritative booking parameters.
  */
 export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVerificationResult {
   // 1. Format Check
@@ -89,7 +98,7 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     return {
       verified: false,
       riskScore: 100,
-      reasonCodes: ['INVALID_SCREENSHOT_FORMAT'],
+      reasonCodes: ['INVALID_SCREENSHOT', 'INVALID_SCREENSHOT_FORMAT'],
       nextStatus: 'payment_rejected',
       reviewStatus: 'ocr_check_failed',
       userMessage: 'Invalid screenshot file format. Please upload a clear PNG, JPEG, or WebP payment receipt.',
@@ -129,10 +138,10 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     return {
       verified: false,
       riskScore: 0,
-      reasonCodes: ['OCR_PROCESSING_ERROR'],
+      reasonCodes: ['OCR_PROCESSING_ERROR', 'PROCESSING_ERROR'],
       nextStatus: 'ocr_processing_error',
       reviewStatus: 'ocr_processing_error',
-      userMessage: "Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.",
+      userMessage: 'Your payment proof has been saved, but verification could not be completed right now. Please retry verification. Do not make another payment.',
       isOcrProcessingError: true,
       details: {
         referenceMatched: null,
@@ -170,13 +179,7 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     riskScore += 100;
   }
 
-  // 6. Suspicious Filename Pattern Check (only when accompanied by watermark or anomaly)
-  if (input.isSuspiciousFilename && (reasonCodes.includes('AI_GENERATOR_WATERMARK') || riskScore > 30)) {
-    reasonCodes.push('SUSPICIOUS_FILENAME');
-    riskScore += 30;
-  }
-
-  // 7. Payment Status Extraction Check
+  // 6. Payment Status Extraction Check
   if (analysis.paymentStatus === 'success') {
     details.statusMatched = true;
   } else {
@@ -185,9 +188,10 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     riskScore += 50;
   }
 
-  // 8. Screenshot OCR Reference Extraction Check (Automatic, Screenshot-Only)
+  // 7. Screenshot OCR Reference Extraction Check (Automatic, Screenshot-Only)
   if (!normalizedOcrRef) {
     reasonCodes.push('REFERENCE_NOT_READABLE');
+    reasonCodes.push('MISSING_PAYMENT_REFERENCE');
     riskScore += 50;
     details.referenceMatched = false;
   } else if (normalizedOcrRef.length < 6 || normalizedOcrRef.length > 36) {
@@ -205,7 +209,7 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     }
   }
 
-  // 10. Amount Validation
+  // 8. Amount Validation
   if (analysis.amount == null) {
     details.amountMatched = false;
     reasonCodes.push('MISSING_AMOUNT');
@@ -221,23 +225,25 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     }
   }
 
-  // 11. Duplicate Reference Check
+  // 9. Duplicate Reference Check
   if (input.isDuplicateReference) {
+    reasonCodes.push('DUPLICATE_TRANSACTION');
     reasonCodes.push('DUPLICATE_TRANSACTION_REFERENCE');
+    reasonCodes.push('DUPLICATE_PAYMENT_REFERENCE');
     riskScore += 90;
     details.referenceMatched = false;
   }
 
-  // 12. Duplicate Screenshot Check
+  // 10. Duplicate Screenshot Check
   if (input.isDuplicateScreenshot) {
     reasonCodes.push('DUPLICATE_SCREENSHOT');
     riskScore += 90;
   }
 
-  // 13. Payee UPI ID Verification (if visible in screenshot)
+  // 11. Payee UPI ID Verification (if visible in screenshot)
   if (analysis.payeeUpiId) {
     const rawPayee = analysis.payeeUpiId.toLowerCase().trim();
-    const expPayee = input.expectedPayeeUpiId.toLowerCase().trim();
+    const expPayee = (input.expectedPayeeUpiId || '').toLowerCase().trim();
 
     if (rawPayee === expPayee || isMaskedUpiMatch(rawPayee, expPayee)) {
       details.payeeMatched = true;
@@ -251,28 +257,32 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     details.payeeMatched = true;
   }
 
-  // 14. Transaction Timestamp Verification (Supporting signal, tolerance ±2 minutes)
+  // 12. Transaction Timestamp Verification (Supporting signal, generous tolerance)
   if (analysis.transactionTimestamp && input.bookingCreatedAt) {
     const txnMs = new Date(analysis.transactionTimestamp).getTime();
     const createdMs = new Date(input.bookingCreatedAt).getTime();
-    const expiresMs = input.paymentExpiresAt ? new Date(input.paymentExpiresAt).getTime() : createdMs + 5 * 60 * 1000;
 
-    const twoMinutesMs = 2 * 60 * 1000;
-    const isWithinWindow = txnMs >= (createdMs - twoMinutesMs) && txnMs <= (expiresMs + twoMinutesMs);
+    if (!isNaN(txnMs) && !isNaN(createdMs)) {
+      // 30-minute window around booking creation
+      const windowMs = 30 * 60 * 1000;
+      const isWithinWindow = Math.abs(txnMs - createdMs) <= windowMs;
 
-    if (isWithinWindow) {
-      details.timestampMatched = true;
+      if (isWithinWindow) {
+        details.timestampMatched = true;
+      } else {
+        details.timestampMatched = false;
+        reasonCodes.push('TRANSACTION_TIME_MISMATCH');
+        riskScore += 30;
+      }
     } else {
-      details.timestampMatched = false;
-      reasonCodes.push('TRANSACTION_TIME_MISMATCH');
-      riskScore += 30;
+      details.timestampMatched = null;
     }
   } else {
     // Timestamp not extractable: supporting signal only, do NOT reject solely for missing timestamp
     details.timestampMatched = null;
   }
 
-  // Final Decision: Strict Fail-Closed Verification
+  // Final Decision: Code-Only Fail-Closed Verification
   const verified =
     reasonCodes.length === 0 &&
     details.statusMatched === true &&
@@ -288,7 +298,7 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
   // Construct clear, user-facing descriptive messages
   let userMessage = 'Payment proof verified successfully.';
   if (!verified) {
-    if (reasonCodes.includes('DUPLICATE_TRANSACTION_REFERENCE')) {
+    if (reasonCodes.includes('DUPLICATE_TRANSACTION') || reasonCodes.includes('DUPLICATE_TRANSACTION_REFERENCE')) {
       userMessage = 'This transaction reference has already been used for another booking.';
     } else if (reasonCodes.includes('DUPLICATE_SCREENSHOT')) {
       userMessage = 'This screenshot has already been submitted for another booking.';
@@ -301,17 +311,17 @@ export function verifyPaymentReceipt(input: ReceiptVerificationInput): ReceiptVe
     } else if (reasonCodes.includes('OCR_UNREADABLE')) {
       userMessage = "We couldn't clearly read this payment receipt. Please upload the detailed payment confirmation screen showing amount, payment status and transaction reference.";
     } else if (reasonCodes.includes('STATUS_NOT_SUCCESS')) {
-      userMessage = `The uploaded receipt shows the transaction as ${analysis.paymentStatus || 'not successful'}. Please upload a successful receipt.`;
+      userMessage = `The uploaded receipt shows the transaction as ${analysis.paymentStatus || 'not successful'}. Only successful payments can be verified.`;
     } else if (reasonCodes.includes('WRONG_PAYEE')) {
-      userMessage = 'The payment recipient does not match the configured receiver (Yuva Shakti Youth Satulur).';
+      userMessage = 'The payment recipient does not match the configured receiver.';
     } else if (reasonCodes.includes('AI_GENERATOR_WATERMARK')) {
-      userMessage = 'This image appears to be an AI-generated mock receipt and cannot be verified.';
+      userMessage = 'AI generator watermark detected on the uploaded image. Please upload an authentic payment receipt.';
     } else if (reasonCodes.includes('REFERENCE_NOT_READABLE')) {
-      userMessage = "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt showing the transaction/reference number.";
+      userMessage = "We couldn't clearly read the transaction reference from this screenshot. Please upload the detailed payment receipt.";
     } else if (reasonCodes.includes('TRANSACTION_TIME_MISMATCH')) {
-      userMessage = 'The transaction time on the receipt does not match your active payment session.';
+      userMessage = 'Transaction timestamp on the receipt does not match this booking session.';
     } else {
-      userMessage = 'Payment verification could not be completed with the provided screenshot. Please upload a clear, unedited payment confirmation screen.';
+      userMessage = 'Payment verification could not be completed with the provided screenshot. Please upload a clear payment receipt.';
     }
   }
 

@@ -11,6 +11,7 @@ export interface CouponBooking {
   transactionRef?: string;
   paymentGateway?: string;
   downloadUrl?: string;
+  downloadToken?: string;
 }
 
 export interface IssuedCoupon {

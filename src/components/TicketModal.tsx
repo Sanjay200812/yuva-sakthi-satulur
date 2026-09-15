@@ -1,7 +1,8 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState } from 'react';
 import { motion } from 'motion/react';
-import { X, Download, Share2, CheckCircle2, Ticket, QrCode, Award, ShieldCheck, Flame, Phone, MessageSquare, Calendar, CreditCard, Tag } from 'lucide-react';
+import { X, Download, Share2, CheckCircle2, Ticket, QrCode, Award, ShieldCheck, Flame, Phone, MessageSquare, Calendar, CreditCard, Tag, Loader2 } from 'lucide-react';
 import { CouponBooking } from '../types.ts';
+import { downloadAuthorizedFile } from '../utils/download.ts';
 import confetti from 'canvas-confetti';
 
 interface TicketModalProps {
@@ -11,6 +12,8 @@ interface TicketModalProps {
 
 export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) => {
   const ticketRef = useRef<HTMLDivElement>(null);
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   if (!booking) return null;
 
@@ -29,6 +32,7 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
   }, [booking]);
 
   const handleWhatsAppShare = () => {
+    if (!booking) return;
     const numbersList = booking.ticketNumbers.join(', ');
     const message = encodeURIComponent(
       `🎉 *YUVA SHAKTI YOUTH SATULUR - LUCKY DRAW COUPON CONFIRMATION*\n\n` +
@@ -44,6 +48,61 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
       `Keep this digital receipt safe for the official public lucky draw in Satulur! 🌟`
     );
     window.open(`https://wa.me/?text=${message}`, '_blank');
+  };
+
+  const getDownloadToken = (): string | undefined => {
+    if (!booking) return undefined;
+    if (booking.downloadToken) return booking.downloadToken;
+    try {
+      const stored = sessionStorage.getItem('confirmed_booking_download');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.publicId === booking.id) {
+          return parsed.downloadToken;
+        }
+      }
+    } catch {}
+    return undefined;
+  };
+
+  const handleDownloadSingle = async (couponNum: string, format: 'pdf' | 'png' | 'jpeg') => {
+    const key = `${couponNum}-${format}`;
+    setDownloadingKey(key);
+    setDownloadError(null);
+    try {
+      const token = getDownloadToken();
+      const ext = format === 'jpeg' ? 'jpg' : format;
+      const res = await downloadAuthorizedFile(
+        `/api/coupons/${couponNum}/download?format=${format}`,
+        token,
+        `${couponNum}.${ext}`
+      );
+      if (!res.success && res.error) {
+        setDownloadError(res.error);
+      }
+    } finally {
+      setDownloadingKey(null);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    if (!booking) return;
+    setDownloadingKey('all');
+    setDownloadError(null);
+    try {
+      const token = getDownloadToken();
+      const isMulti = booking.ticketNumbers.length > 1;
+      const filename = isMulti ? `YuvaShakti-${booking.id}-Coupons.zip` : `YuvaShakti-${booking.id}-Tickets.pdf`;
+      const url = isMulti
+        ? `/api/bookings/${booking.id}/download-all`
+        : `/api/coupons/${booking.ticketNumbers[0]}/download?format=pdf`;
+      const res = await downloadAuthorizedFile(url, token, filename);
+      if (!res.success && res.error) {
+        setDownloadError(res.error);
+      }
+    } finally {
+      setDownloadingKey(null);
+    }
   };
 
   const handlePrint = () => {
@@ -166,36 +225,36 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
                       {num}
                     </span>
                     <div className="flex items-center gap-1">
-                      <a
-                        href={`/api/coupons/${num}/download?format=pdf`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2 py-1 rounded bg-amber-400 hover:bg-amber-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                      <button
+                        type="button"
+                        disabled={!!downloadingKey}
+                        onClick={() => handleDownloadSingle(num, 'pdf')}
+                        className="px-2 py-1 rounded bg-amber-400 hover:bg-amber-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
                         title="Download PDF"
                       >
-                        <Download className="w-3 h-3" />
+                        {downloadingKey === `${num}-pdf` ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
                         <span>PDF</span>
-                      </a>
-                      <a
-                        href={`/api/coupons/${num}/download?format=png`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2 py-1 rounded bg-sky-400 hover:bg-sky-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!!downloadingKey}
+                        onClick={() => handleDownloadSingle(num, 'png')}
+                        className="px-2 py-1 rounded bg-sky-400 hover:bg-sky-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
                         title="Download PNG"
                       >
-                        <Download className="w-3 h-3" />
+                        {downloadingKey === `${num}-png` ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
                         <span>PNG</span>
-                      </a>
-                      <a
-                        href={`/api/coupons/${num}/download?format=jpeg`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2 py-1 rounded bg-emerald-400 hover:bg-emerald-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!!downloadingKey}
+                        onClick={() => handleDownloadSingle(num, 'jpeg')}
+                        className="px-2 py-1 rounded bg-emerald-400 hover:bg-emerald-300 text-slate-950 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
                         title="Download JPEG"
                       >
-                        <Download className="w-3 h-3" />
+                        {downloadingKey === `${num}-jpeg` ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
                         <span>JPEG</span>
-                      </a>
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -229,6 +288,12 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
           </div>
         </div>
 
+        {downloadError && (
+          <div className="mt-3 p-2.5 rounded-lg bg-red-950/70 border border-red-500/40 text-red-200 text-xs text-center font-medium">
+            {downloadError}
+          </div>
+        )}
+
         {/* Action Buttons: WhatsApp Share & Download All Official PDFs */}
         <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
@@ -239,19 +304,25 @@ export const TicketModal: React.FC<TicketModalProps> = ({ booking, onClose }) =>
             <span>Share on WhatsApp</span>
           </button>
 
-          <a
-            href={
-              booking.ticketNumbers.length > 1
-                ? `/api/bookings/${booking.id}/download-all`
-                : `/api/coupons/${booking.ticketNumbers[0]}/download`
-            }
-            target="_blank"
-            rel="noopener noreferrer"
-            className="w-full py-3 px-4 rounded-xl font-bold text-xs sm:text-sm text-slate-950 bg-gradient-to-r from-amber-400 to-yellow-500 hover:scale-[1.02] transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg text-center"
+          <button
+            type="button"
+            disabled={!!downloadingKey}
+            onClick={handleDownloadAll}
+            className="w-full py-3 px-4 rounded-xl font-bold text-xs sm:text-sm text-slate-950 bg-gradient-to-r from-amber-400 to-yellow-500 hover:scale-[1.02] transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg text-center disabled:opacity-50"
           >
-            <Download className="w-4 h-4 text-slate-950" />
-            <span>{booking.ticketNumbers.length > 1 ? 'Download All Passes (ZIP)' : 'Download Official PDF'}</span>
-          </a>
+            {downloadingKey === 'all' ? (
+              <Loader2 className="w-4 h-4 animate-spin text-slate-950" />
+            ) : (
+              <Download className="w-4 h-4 text-slate-950" />
+            )}
+            <span>
+              {downloadingKey === 'all'
+                ? 'Downloading...'
+                : booking.ticketNumbers.length > 1
+                ? 'Download All Passes (ZIP)'
+                : 'Download Official PDF'}
+            </span>
+          </button>
         </div>
 
         <div className="mt-4 text-center">

@@ -5,21 +5,22 @@ import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 
 import { config, getPublicConfig, canAcceptPayments } from './config/eventConfig.ts';
+import { getPaymentSettings, getPublicPaymentSettings } from './services/paymentSettingsService.ts';
 import { db, isDatabaseConnected } from './db/client.ts';
 import { generateUpiPaymentSession } from './upi/upiUri.ts';
 import { processPaymentScreenshot, hammingDistance, checkStorageHealth, downloadPaymentScreenshot } from './upi/imageProcessor.ts';
 import { analyzePaymentScreenshot } from './upi/localOcrAnalyzer.ts';
-import { performDeterministicComparison, normalizeUtr } from './upi/deterministicMatcher.ts';
 import { verifyPaymentReceipt, normalizeTransactionReference } from './upi/deterministicReceiptVerifier.ts';
 import { finalizeVerifiedSubmission } from './upi/automatedFinalizer.ts';
 import { encryptSensitiveField } from './utils/crypto.ts';
 import { getAdminSession } from './admin/auth.ts';
 import { confirmPaymentFromBankRecord } from './upi/adminReconciliation.ts';
-import { allocateCouponsForBooking } from './services/couponAllocator.ts';
+import { allocateCouponsForBooking, getCouponInventory } from './services/couponAllocator.ts';
 import {
   renderTicketPdf,
   renderMultiTicketPdf,
   renderTicketRaster,
+  renderTicketDocx,
   createTicketsZipArchive,
   maskPhoneNumber,
   formatKolkataTime,
@@ -141,13 +142,50 @@ app.get(['/api', '/api/'], (_req: Request, res: Response) => {
   res.redirect('/api/health');
 });
 
-app.get('/api/config', (_req: Request, res: Response) => {
-  const pub = getPublicConfig();
-  res.json({
-    success: true,
-    data: pub,
-    ...pub,
-  });
+app.get('/api/config', async (_req: Request, res: Response) => {
+  try {
+    const pub = await getPublicPaymentSettings();
+    const eventPub = getPublicConfig();
+    const inventory = await getCouponInventory();
+    const combined = {
+      ...eventPub,
+      ...pub,
+      couponPricePaise: pub.couponPricePaise,
+      couponPrice: pub.couponPriceInr,
+      payeeUpiId: eventPub.canBook ? pub.payeeUpiId : '',
+      payeeDisplayName: pub.payeeDisplayName,
+      sessionMinutes: 5,
+      totalCoupons: inventory.total,
+      issuedCoupons: inventory.issued,
+      remainingCoupons: inventory.remaining,
+      couponRange: '1501 – 2250',
+      isSoldOut: inventory.isSoldOut,
+    };
+    res.json({
+      success: true,
+      data: combined,
+      ...combined,
+    });
+  } catch (err: any) {
+    const fallback = getPublicConfig();
+    res.json({
+      success: true,
+      data: fallback,
+      ...fallback,
+    });
+  }
+});
+
+app.get('/api/payment-settings/public', async (_req: Request, res: Response) => {
+  try {
+    const pub = await getPublicPaymentSettings();
+    res.json({
+      success: true,
+      data: pub,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: { message: err.message } });
+  }
 });
 
 // 3. Mount Admin Routes
@@ -195,9 +233,42 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
 
     const cleanVillage = (village && typeof village === 'string' ? village.trim() : 'Satulur') || 'Satulur';
 
-    // Authoritative Server-side Price Calculation (₹50 / coupon)
-    const unitPricePaise = config.EVENT_COUPON_PRICE_PAISE; // 5000 paise = ₹50.00
+    // Authoritative Server-side Price & Payee Calculation from DB Payment Settings
+    const paymentSettings = await getPaymentSettings();
+    if (!paymentSettings.payments_enabled || !config.BOOKING_OPEN) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'BOOKING_UNAVAILABLE', message: 'Online payments are currently disabled.' },
+      });
+    }
+
+    // Strict Coupon Inventory Check (Range: 1501-2250, Total: 750)
+    const inventory = await getCouponInventory();
+    if (inventory.remaining <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'COUPON_RANGE_EXHAUSTED',
+          message: 'All available coupons have been issued.',
+        },
+      });
+    }
+
+    if (qty > inventory.remaining) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INSUFFICIENT_COUPON_INVENTORY',
+          message: `Only ${inventory.remaining} coupon${inventory.remaining === 1 ? '' : 's'} are currently available.`,
+          remaining: inventory.remaining,
+        },
+      });
+    }
+
+    const unitPricePaise = paymentSettings.coupon_price_paise || 5000;
     const totalAmountPaise = unitPricePaise * qty;
+    const payeeUpiId = paymentSettings.payee_upi_id;
+    const payeeDisplayName = paymentSettings.payee_display_name;
 
     let publicId = generateCollisionSafePublicId();
     let paymentReference = generateCollisionSafePaymentReference();
@@ -210,15 +281,19 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
     const downloadToken = crypto.randomBytes(24).toString('hex');
     const downloadTokenHash = crypto.createHash('sha256').update(downloadToken).digest('hex');
 
-    // Generate canonical NPCI UPI Session & QR
+    // Generate canonical NPCI UPI Session & QR using snapshot settings
     let upiSession = await generateUpiPaymentSession({
       publicBookingId: publicId,
       transactionReference: paymentReference,
       totalAmountPaise,
       participantName: name.trim(),
+      payeeUpiId,
+      payeeDisplayName,
     });
 
-    // Persist booking in PostgreSQL with collision retry safety
+    const paymentStartedAt = new Date().toISOString();
+
+    // Persist booking in PostgreSQL with collision retry safety and snapshot fields
     let inserted = false;
     let attempts = 0;
     while (!inserted && attempts < 3) {
@@ -228,8 +303,9 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
           `INSERT INTO bookings (
             id, public_id, participant_name, phone, village, quantity,
             unit_price_paise, total_amount_paise, status, provider_name,
-            download_token_hash, status_token_hash, selected_upi_app, payment_reference, payment_expires_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+            download_token_hash, status_token_hash, selected_upi_app, payment_reference, payment_expires_at,
+            expected_payee_upi_id, expected_payee_name, payment_started_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
           [
             bookingId,
             publicId,
@@ -246,6 +322,9 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
             selectedApp || 'other_upi',
             paymentReference,
             upiSession.expiresAt,
+            payeeUpiId,
+            payeeDisplayName,
+            paymentStartedAt,
           ]
         );
         inserted = true;
@@ -259,6 +338,8 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
             transactionReference: paymentReference,
             totalAmountPaise,
             participantName: name.trim(),
+            payeeUpiId,
+            payeeDisplayName,
           });
         } else {
           throw insertError;
@@ -285,15 +366,22 @@ app.post('/api/bookings', async (req: Request, res: Response) => {
           orderId: paymentReference,
           qrDataUrl: upiSession.qrDataUrl,
           canonicalUri: upiSession.canonicalUri,
-          payeeUpiId: upiSession.maskedPayeeUpiId,
+          upiUri: upiSession.canonicalUri,
+          qrPayload: upiSession.canonicalUri,
+          payeeUpiId: upiSession.payeeUpiId,
+          maskedPayeeUpiId: upiSession.maskedPayeeUpiId,
           rawPayeeUpiId: upiSession.payeeUpiId,
           payeeDisplayName: upiSession.payeeDisplayName,
           amountInr: upiSession.amountInr,
           totalAmount: totalAmountPaise / 100,
+          startedAt: upiSession.startedAt,
           expiresAt: upiSession.expiresAt,
           statusToken,
           downloadToken,
           appIntents: upiSession.appIntents,
+          phonePeUri: upiSession.appIntents?.phonepe,
+          googlePayUri: upiSession.appIntents?.google_pay,
+          paytmUri: upiSession.appIntents?.paytm,
         },
       },
     });
@@ -576,56 +664,40 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
     const t4 = Date.now();
     const parsingMs = t4 - t3;
 
-    // 10. Fast Parallel Database Checks across indexed columns
-    const [dupEnteredRes, dupExtractedRes, dupScreenRes, pastSubsRes] = await Promise.all([
+    // 10. Fast Parallel Database Checks across confirmed records only
+    const [dupEnteredRes, dupExtractedRes, dupScreenRes] = await Promise.all([
       enteredRefHash
         ? db.query(
-            `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
-            [enteredRefHash, booking.id, 'admin_rejected', 'payment_rejected']
+            `SELECT id, booking_id FROM payment_submissions WHERE (entered_reference_hash = $1 OR extracted_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status IN ('payment_confirmed', 'proof_verified')`,
+            [enteredRefHash, booking.id]
           )
         : Promise.resolve({ rows: [] }),
       extractedRefHash
         ? db.query(
-            `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status != $3 AND status != $4`,
-            [extractedRefHash, booking.id, 'admin_rejected', 'payment_rejected']
+            `SELECT id, booking_id FROM payment_submissions WHERE (extracted_reference_hash = $1 OR entered_reference_hash = $1 OR payer_utr_hash = $1) AND booking_id != $2 AND status IN ('payment_confirmed', 'proof_verified')`,
+            [extractedRefHash, booking.id]
           )
         : Promise.resolve({ rows: [] }),
       db.query(
-        'SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-        [processed.sha256, booking.id, 'admin_rejected', 'payment_rejected']
+        `SELECT id, booking_id FROM payment_submissions WHERE screenshot_sha256 = $1 AND booking_id != $2 AND status IN ('payment_confirmed', 'proof_verified')`,
+        [processed.sha256, booking.id]
       ),
-      processed.phash
-        ? db.query(
-            'SELECT id, booking_id, screenshot_phash, expected_amount_paise FROM payment_submissions WHERE booking_id != $1 AND screenshot_phash IS NOT NULL AND status != $2 AND status != $3',
-            [booking.id, 'admin_rejected', 'payment_rejected']
-          )
-        : Promise.resolve({ rows: [] }),
     ]);
 
-    let isDuplicateUtr = dupEnteredRes.rows.length > 0 || dupExtractedRes.rows.length > 0;
-    let isDuplicateScreenshot = dupScreenRes.rows.length > 0;
-
-    // Perceptual dHash Duplicate Detection (supporting signal)
-    if (!isDuplicateScreenshot && processed.phash) {
-      for (const past of pastSubsRes.rows) {
-        if (past.screenshot_phash) {
-          const dist = hammingDistance(processed.phash, past.screenshot_phash);
-          if (dist <= 2 && past.expected_amount_paise === booking.total_amount_paise) {
-            isDuplicateScreenshot = true;
-            break;
-          }
-        }
-      }
-    }
+    const isDuplicateUtr = dupEnteredRes.rows.length > 0 || dupExtractedRes.rows.length > 0;
+    const isDuplicateScreenshot = dupScreenRes.rows.length > 0;
 
     const t5 = Date.now();
     const databaseChecksMs = t5 - t4;
 
-    // 11. Run Deterministic Receipt Verifier (Fail-Closed, Code-Only)
+    // 11. Run Deterministic Receipt Verifier (Fail-Closed, Code-Only, Snapshot-Bound)
+    const expectedPayee = booking.expected_payee_upi_id || config.PAYEE_UPI_ID;
+    const expectedPayeeDisplay = booking.expected_payee_name || config.PAYEE_DISPLAY_NAME;
+
     const verification = verifyPaymentReceipt({
       expectedAmountPaise: booking.total_amount_paise,
-      expectedPayeeUpiId: config.PAYEE_UPI_ID,
-      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      expectedPayeeUpiId: expectedPayee,
+      expectedPayeeName: expectedPayeeDisplay,
       enteredReference: normalizedEnteredRef || undefined,
       selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
       bookingCreatedAt: booking.created_at,
@@ -639,23 +711,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
       isValidScreenshotFormat: true,
     });
 
-    // Also run legacy matcher for backwards compatibility
-    const match = performDeterministicComparison({
-      expectedAmountPaise: booking.total_amount_paise,
-      expectedPayeeUpiId: config.PAYEE_UPI_ID,
-      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: normalizedEnteredRef || extractedRrn,
-      selectedApp: selectedApp || booking.selected_upi_app || 'other_upi',
-      bookingCreatedAt: booking.created_at,
-      paymentExpiresAt: booking.payment_expires_at,
-      analysis,
-      isDuplicateUtr,
-      isDuplicateScreenshot,
-      isExpired: false,
-    });
-
-    const isPassed = verification.verified && match.passed;
-    const finalReasonCodes = Array.from(new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const isPassed = verification.verified;
+    const finalReasonCodes = verification.reasonCodes;
     const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
 
     // 12. Persist payment submission record with extended columns
@@ -676,8 +733,8 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         booking.id,
         paymentRef,
         selectedApp || booking.selected_upi_app || 'other_upi',
-        config.PAYEE_UPI_ID,
-        config.PAYEE_DISPLAY_NAME,
+        expectedPayee,
+        expectedPayeeDisplay,
         booking.total_amount_paise,
         payerUtrHash,
         encryptedUtr,
@@ -695,14 +752,14 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         processed.height,
         isPassed ? 'payment_confirmed' : 'payment_rejected',
         JSON.stringify(analysis),
-        JSON.stringify(match),
+        JSON.stringify(verification),
         JSON.stringify(verification),
         finalReasonCodes,
         extractedPaise,
         analysis.paymentStatus,
         analysis.payeeUpiId || null,
         analysis.transactionTimestamp || null,
-        Math.max(verification.riskScore, match.riskScore),
+        verification.riskScore,
         finalReasonCodes,
         'tesseract.js',
         isPassed ? new Date().toISOString() : null,
@@ -719,10 +776,10 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         runId,
         submissionId,
         'local_ocr_and_deterministic',
-        match.passed ? 'passed' : 'flagged',
+        isPassed ? 'passed' : 'flagged',
         analysis.extractedFields?.fieldConfidence?.amount || 0.8,
-        match.reasonCodes,
-        JSON.stringify({ match, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
+        finalReasonCodes,
+        JSON.stringify({ verification, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
         new Date().toISOString(),
       ]
     );
@@ -759,7 +816,6 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
           couponsIssuedCount: finalResult.couponsIssuedCount,
           downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
           details: {
-            ...match.details,
             ...verification.details,
           },
         },
@@ -780,19 +836,18 @@ app.post('/api/bookings/:publicId/payment-proof', async (req: Request, res: Resp
         success: false,
         status: 'proof_verification_failed',
         reasonCode: primaryCode,
-        message: verification.userMessage || match.userMessage,
+        message: verification.userMessage,
         error: {
           code: primaryCode,
-          message: verification.userMessage || match.userMessage,
+          message: verification.userMessage,
           reasonCodes: finalReasonCodes,
         },
         data: {
           submissionId,
           publicId: booking.public_id,
           status: 'payment_rejected',
-          message: verification.userMessage || match.userMessage,
+          message: verification.userMessage,
           details: {
-            ...match.details,
             ...verification.details,
           },
         },
@@ -943,7 +998,7 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       });
     }
 
-    const extractedRrn = analysis.utrOrRrn ? normalizeUtr(analysis.utrOrRrn) : '';
+    const extractedRrn = analysis.utrOrRrn ? normalizeTransactionReference(analysis.utrOrRrn) : (analysis.transactionId ? normalizeTransactionReference(analysis.transactionId) : '');
     let isDuplicateUtr = false;
     let utrHash = submission.payer_utr_hash;
     let encryptedUtr = submission.encrypted_utr;
@@ -951,18 +1006,21 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
     if (extractedRrn) {
       utrHash = crypto.createHash('sha256').update(extractedRrn).digest('hex');
       const dupUtrRes = await db.query(
-        'SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status != $3 AND status != $4',
-        [utrHash, booking.id, 'admin_rejected', 'payment_rejected']
+        `SELECT id, booking_id FROM payment_submissions WHERE payer_utr_hash = $1 AND booking_id != $2 AND status IN ('payment_confirmed', 'proof_verified')`,
+        [utrHash, booking.id]
       );
       isDuplicateUtr = dupUtrRes.rows.length > 0;
       encryptedUtr = encryptSensitiveField(extractedRrn);
     }
 
-    // Run Deterministic Receipt Verifier
+    // Run Deterministic Receipt Verifier (Snapshot-Bound)
+    const expectedPayee = booking.expected_payee_upi_id || config.PAYEE_UPI_ID;
+    const expectedPayeeDisplay = booking.expected_payee_name || config.PAYEE_DISPLAY_NAME;
+
     const verification = verifyPaymentReceipt({
       expectedAmountPaise: booking.total_amount_paise,
-      expectedPayeeUpiId: config.PAYEE_UPI_ID,
-      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
+      expectedPayeeUpiId: expectedPayee,
+      expectedPayeeName: expectedPayeeDisplay,
       enteredReference: extractedRrn,
       selectedApp: submission.selected_upi_app || 'other_upi',
       bookingCreatedAt: booking.created_at,
@@ -975,22 +1033,8 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       isValidScreenshotFormat: true,
     });
 
-    const match = performDeterministicComparison({
-      expectedAmountPaise: booking.total_amount_paise,
-      expectedPayeeUpiId: config.PAYEE_UPI_ID,
-      expectedPayeeName: config.PAYEE_DISPLAY_NAME,
-      enteredUtr: extractedRrn,
-      selectedApp: submission.selected_upi_app || 'other_upi',
-      bookingCreatedAt: booking.created_at,
-      paymentExpiresAt: booking.payment_expires_at,
-      analysis,
-      isDuplicateUtr,
-      isDuplicateScreenshot: false,
-      isExpired: false,
-    });
-
-    const isPassed = verification.verified && match.passed;
-    const finalReasonCodes = Array.from(new Set([...verification.reasonCodes, ...match.reasonCodes]));
+    const isPassed = verification.verified;
+    const finalReasonCodes = verification.reasonCodes;
     const extractedPaise = analysis.amount != null ? Math.round(Number(analysis.amount) * 100) : null;
 
     // Update existing submission with genuine OCR results and extended columns
@@ -1017,10 +1061,10 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         encryptedUtr,
         isPassed ? 'payment_confirmed' : 'payment_rejected',
         JSON.stringify(analysis),
-        JSON.stringify(match),
+        JSON.stringify(verification),
         JSON.stringify(verification),
         finalReasonCodes,
-        Math.max(verification.riskScore, match.riskScore),
+        verification.riskScore,
         finalReasonCodes,
         'tesseract.js',
         extractedPaise,
@@ -1042,15 +1086,15 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
         runId,
         submission.id,
         'retry_local_ocr_and_deterministic',
-        match.passed ? 'passed' : 'flagged',
+        isPassed ? 'passed' : 'flagged',
         analysis.extractedFields?.fieldConfidence?.amount || 0.8,
-        match.reasonCodes,
-        JSON.stringify({ match, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
+        finalReasonCodes,
+        JSON.stringify({ verification, extractionSummary: { utr: analysis.utrOrRrn, amount: analysis.amount } }),
         new Date().toISOString(),
       ]
     );
 
-    if (match.passed) {
+    if (isPassed) {
       // Atomic Finalization: Lock booking, issue sequential coupons, transition to payment_confirmed
       const finalResult = await finalizeVerifiedSubmission({
         submissionId: submission.id,
@@ -1065,11 +1109,11 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
           publicId: booking.public_id,
           status: 'payment_confirmed',
           reviewStatus: 'ocr_verified',
-          message: 'Payment proof accepted. Coupons issued.',
+          message: verification.userMessage || 'Payment proof accepted. Coupons issued.',
           coupons: finalResult.coupons,
           couponsIssuedCount: finalResult.couponsIssuedCount,
           downloadUrl: `/api/bookings/${booking.public_id}/download-all?token=${token}`,
-          details: match.details,
+          details: verification.details,
         },
       });
     } else {
@@ -1081,16 +1125,15 @@ app.post('/api/bookings/:publicId/retry-verification', async (req: Request, res:
       return res.status(400).json({
         success: false,
         error: {
-          code: match.reasonCodes[0] || 'PROOF_VERIFICATION_FAILED',
-          message: match.userMessage,
-          reasonCodes: match.reasonCodes,
+          code: finalReasonCodes[0] || 'PROOF_VERIFICATION_FAILED',
+          message: verification.userMessage,
         },
         data: {
           submissionId: submission.id,
           publicId: booking.public_id,
-          status: match.nextStatus,
-          message: match.userMessage,
-          details: match.details,
+          status: 'payment_rejected',
+          message: verification.userMessage,
+          details: verification.details,
         },
       });
     }
@@ -1233,14 +1276,76 @@ app.get(['/api/coupons/:couponNumber/verify', '/api/coupons/verify', '/api/coupo
   }
 });
 
-// 8. Single Coupon Download (PDF, PNG, JPEG)
+/**
+ * Timing-safe comparison of a plain token against an expected SHA-256 hex hash.
+ */
+export function tokenMatchesHash(token?: string | null, expectedHash?: string | null): boolean {
+  if (!token || !expectedHash) return false;
+  try {
+    const actualHash = crypto.createHash('sha256').update(token.trim()).digest();
+    const expected = Buffer.from(expectedHash.trim(), 'hex');
+    if (actualHash.length !== expected.length) return false;
+    return crypto.timingSafeEqual(actualHash, expected);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Authorizes access to booking coupon downloads.
+ * Allowed if:
+ * 1. An active Admin session exists (via cookie or bearer token).
+ * 2. OR a valid booking download token or status token matching this booking is provided via:
+ *    - Authorization: Bearer <token>
+ *    - x-booking-token: <token>
+ *    - ?token=<token>
+ */
+export function authorizeBookingDownload(
+  req: Request,
+  booking: any
+): { authorized: boolean; reason?: string; isAdmin?: boolean } {
+  // 1. Admin authorization check
+  const adminCookie = req.cookies?.admin_session;
+  const authHeader = req.headers.authorization;
+  const adminTokenCandidate = adminCookie || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null);
+  if (adminTokenCandidate && getAdminSession(adminTokenCandidate)) {
+    return { authorized: true, isAdmin: true };
+  }
+
+  // 2. Customer token extraction
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : ((req.headers['x-booking-token'] as string)?.trim() || (req.query.token as string)?.trim());
+
+  if (!token) {
+    return {
+      authorized: false,
+      reason: 'Unauthorized. Valid booking download token or admin session is required.',
+    };
+  }
+
+  // 3. Compare timing-safely against booking download_token_hash and status_token_hash
+  const matchesDownload = tokenMatchesHash(token, booking?.download_token_hash);
+  const matchesStatus = tokenMatchesHash(token, booking?.status_token_hash);
+
+  if (matchesDownload || matchesStatus) {
+    return { authorized: true, isAdmin: false };
+  }
+
+  return {
+    authorized: false,
+    reason: 'Unauthorized. Valid booking download token or admin session is required.',
+  };
+}
+
+// 8. Single Coupon Download (PDF, PNG, JPEG, DOCX)
 app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Response) => {
   try {
     const { couponNumber } = req.params;
     const format = ((req.query.format as string) || 'pdf').toLowerCase();
 
-    if (!['pdf', 'png', 'jpeg', 'jpg'].includes(format)) {
-      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg.');
+    if (!['pdf', 'png', 'jpeg', 'jpg', 'docx'].includes(format)) {
+      return res.status(400).send('Invalid format requested. Supported formats: pdf, png, jpeg, docx.');
     }
 
     const cleanNumber = couponNumber.trim().toUpperCase();
@@ -1251,28 +1356,17 @@ app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Respons
 
     const coupon = couponRes.rows[0];
     const bookingRes = await db.query('SELECT * FROM bookings WHERE id = $1', [coupon.booking_id]);
+    if (bookingRes.rows.length === 0) {
+      return res.status(404).send('Associated booking not found.');
+    }
     const booking = bookingRes.rows[0];
 
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith('Bearer ')
-      ? authHeader.slice(7)
-      : ((req.query.token as string) || (req.headers['x-booking-token'] as string));
-    const adminToken = req.cookies?.admin_session || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null);
-    const adminSession = adminToken ? getAdminSession(adminToken) : null;
-
-    let isAuthorized = !!adminSession;
-    if (!isAuthorized && token && booking) {
-      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      if (booking.download_token_hash === tokenHash || booking.status_token_hash === tokenHash) {
-        isAuthorized = true;
-      }
+    const auth = authorizeBookingDownload(req, booking);
+    if (!auth.authorized) {
+      return res.status(401).send(auth.reason || 'Unauthorized. Valid booking download token or admin session is required.');
     }
 
-    if (!isAuthorized) {
-      return res.status(401).send('Unauthorized. Valid booking download token or admin session is required.');
-    }
-
-    const isVerified = (booking?.status === 'proof_verified' || booking?.status === 'payment_confirmed') && coupon.status === 'valid';
+    const isVerified = (booking.status === 'proof_verified' || booking.status === 'payment_confirmed') && coupon.status === 'valid';
     if (!isVerified) {
       return res.status(403).send('Ticket cannot be downloaded until payment proof is verified.');
     }
@@ -1282,11 +1376,18 @@ app.get('/api/coupons/:couponNumber/download', async (req: Request, res: Respons
       participantName: coupon.holder_name,
       phone: coupon.phone,
       village: coupon.village,
-      bookingPublicId: booking?.public_id || 'YSYS-DRAW',
+      bookingPublicId: booking.public_id || 'YSYS-DRAW',
       ticketIndex: coupon.ticket_index,
       totalQuantity: coupon.total_quantity,
-      paidAt: booking?.verified_at || booking?.paid_at,
+      paidAt: booking.verified_at || booking.paid_at,
     };
+
+    if (format === 'docx') {
+      const docxBuffer = await renderTicketDocx(ticketData);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', `attachment; filename="${coupon.coupon_number}.docx"`);
+      return res.send(docxBuffer);
+    }
 
     if (format === 'pdf') {
       const pdfBuffer = await renderTicketPdf(ticketData);
@@ -1317,17 +1418,30 @@ app.get('/api/coupons/:couponNumber/raster', async (req: Request, res: Response)
 
     const coupon = cRes.rows[0];
     const bRes = await db.query('SELECT * FROM bookings WHERE id = $1', [coupon.booking_id]);
+    if (bRes.rows.length === 0) {
+      return res.status(404).send('Associated booking not found.');
+    }
     const booking = bRes.rows[0];
+
+    const auth = authorizeBookingDownload(req, booking);
+    if (!auth.authorized) {
+      return res.status(401).send(auth.reason || 'Unauthorized. Valid booking download token or admin session is required.');
+    }
+
+    const isVerified = (booking.status === 'proof_verified' || booking.status === 'payment_confirmed') && coupon.status === 'valid';
+    if (!isVerified) {
+      return res.status(403).send('Ticket cannot be viewed until payment proof is verified.');
+    }
 
     const ticketData = {
       couponNumber: coupon.coupon_number,
       participantName: coupon.holder_name,
       phone: coupon.phone,
       village: coupon.village,
-      bookingPublicId: booking?.public_id || 'YSYS-DRAW',
+      bookingPublicId: booking.public_id || 'YSYS-DRAW',
       ticketIndex: coupon.ticket_index,
       totalQuantity: coupon.total_quantity,
-      paidAt: booking?.verified_at || booking?.paid_at,
+      paidAt: booking.verified_at || booking.paid_at,
     };
 
     const pngBuffer = await renderTicketRaster(ticketData, 'png');
@@ -1344,11 +1458,6 @@ app.get('/api/coupons/:couponNumber/raster', async (req: Request, res: Response)
 app.get('/api/bookings/:publicId/download-all', async (req: Request, res: Response) => {
   try {
     const { publicId } = req.params;
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith('Bearer ')
-      ? authHeader.slice(7)
-      : ((req.headers['x-booking-token'] as string) || (req.query.token as string));
-
     const bookingRes = await db.query('SELECT * FROM bookings WHERE public_id = $1', [publicId]);
     if (bookingRes.rows.length === 0) {
       return res.status(404).send('Booking not found.');
@@ -1356,17 +1465,14 @@ app.get('/api/bookings/:publicId/download-all', async (req: Request, res: Respon
 
     const booking = bookingRes.rows[0];
 
-    // Validate access token
-    if (token && booking.download_token_hash && booking.status_token_hash) {
-      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      const isValid = tokenHash === booking.download_token_hash || tokenHash === booking.status_token_hash;
-      if (!isValid) {
-        return res.status(401).send('Unauthorized to download tickets.');
-      }
+    // Validate access token or admin session
+    const auth = authorizeBookingDownload(req, booking);
+    if (!auth.authorized) {
+      return res.status(401).send(auth.reason || 'Unauthorized to download tickets.');
     }
 
     if (booking.status !== 'payment_confirmed' && booking.status !== 'proof_verified') {
-      return res.status(400).send('Payment is not confirmed for this booking.');
+      return res.status(403).send('Payment is not confirmed for this booking.');
     }
 
     const cRes = await db.query(

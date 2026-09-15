@@ -6,6 +6,9 @@ export interface UpiSessionInput {
   transactionReference: string;
   totalAmountPaise: number;
   participantName: string;
+  payeeUpiId?: string;
+  payeeDisplayName?: string;
+  startedAtMs?: number;
 }
 
 export interface UpiSessionResult {
@@ -17,11 +20,13 @@ export interface UpiSessionResult {
   amountInr: string;
   totalAmountPaise: number;
   transactionReference: string;
+  startedAt: string;
   expiresAt: string;
   appIntents: {
     phonepe: string;
     google_pay: string;
     paytm: string;
+    fampay: string;
     other_upi: string;
     standard: string;
   };
@@ -58,11 +63,11 @@ export function generateCanonicalUpiUri(input: {
 }
 
 export async function generateUpiPaymentSession(input: UpiSessionInput): Promise<UpiSessionResult> {
-  const payeeId = (config.PAYEE_UPI_ID || '').trim();
+  const payeeId = (input.payeeUpiId || config.PAYEE_UPI_ID || '').trim();
   if (!payeeId || !isValidUpiId(payeeId)) {
     throw new Error('CONFIG_ERROR: Valid receiver UPI ID (PAYEE_UPI_ID) is required to generate payment session.');
   }
-  const payeeName = (config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur').trim();
+  const payeeName = (input.payeeDisplayName || config.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur').trim();
   const amountInr = (input.totalAmountPaise / 100).toFixed(2);
   const note = `${config.UPI_TRANSACTION_NOTE_PREFIX} Lucky Draw ${input.publicBookingId}`;
 
@@ -89,7 +94,8 @@ export async function generateUpiPaymentSession(input: UpiSessionInput): Promise
     },
   });
 
-  const expiresAt = new Date(Date.now() + AUTHORITATIVE_PAYMENT_SESSION_MINUTES * 60 * 1000).toISOString();
+  const baseStart = input.startedAtMs || Date.now();
+  const expiresAt = new Date(baseStart + AUTHORITATIVE_PAYMENT_SESSION_MINUTES * 60 * 1000).toISOString();
 
   // App-specific intent URIs
   const queryString = params.toString();
@@ -97,6 +103,7 @@ export async function generateUpiPaymentSession(input: UpiSessionInput): Promise
     phonepe: `phonepe://pay?${queryString}`,
     google_pay: `gpay://upi/pay?${queryString}`,
     paytm: `paytmmp://pay?${queryString}`,
+    fampay: canonicalUri, // Canonical standard UPI intent for FamPay
     other_upi: canonicalUri,
     standard: canonicalUri,
   };
@@ -110,6 +117,7 @@ export async function generateUpiPaymentSession(input: UpiSessionInput): Promise
     amountInr,
     totalAmountPaise: input.totalAmountPaise,
     transactionReference: input.transactionReference,
+    startedAt: new Date(baseStart).toISOString(),
     expiresAt,
     appIntents,
   };

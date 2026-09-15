@@ -26,27 +26,21 @@ const envSchema = z.object({
 
   // Security
   SESSION_SECRET: z.string().min(16).default(process.env.SESSION_SECRET || 'dev-session-secret-yuva-shakti-satulur-min-32-chars-long'),
-  ADMIN_EMAIL: z.string().email().default('admin@yuvashakti.org'),
+  ADMIN_EMAIL: z.string().email().default('admin@yuvashakti.com'),
 
   // Authoritative constants
   AUTHORITATIVE_PAYMENT_SESSION_MINUTES: z.literal(5).default(5),
 
-  // Database & Supabase storage credentials with safe runtime fallback
-  DATABASE_URL: z.string().default(
-    process.env.DATABASE_URL ||
-    Buffer.from('cG9zdGdyZXNxbDovL3Bvc3RncmVzLnNud2pmd2xleGV2ZHBmYmVrcW5jOmhyY0ExOUdPeXhnanMzT29AYXdzLTAtYXAtc291dGhlYXN0LTEucG9vbGVyLnN1cGFiYXNlLmNvbTo2NTQzL3Bvc3RncmVz', 'base64').toString('utf-8')
-  ),
+  // Database & Supabase storage credentials strictly from environment
+  DATABASE_URL: z.string().default(process.env.DATABASE_URL || ''),
   SUPABASE_URL: z.string().default(
     process.env.SUPABASE_URL || 'https://snwjfwlexevdpfbekqnc.supabase.co'
   ),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().default(
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    Buffer.from('c2Jfc2VjcmV0X2lqQVlLQWp3NHBmUkFFRVpzejZQZUFfcmlsZGFFbHI=', 'base64').toString('utf-8')
-  ),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().default(process.env.SUPABASE_SERVICE_ROLE_KEY || ''),
 
   // Direct Merchant-UPI & Local OCR Verification Configuration
   PAYMENT_MODE: z.string().default('direct_upi_automated_verification'),
-  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || (process.env.NODE_ENV === 'production' ? '' : '7075920852@ybl')),
+  PAYEE_UPI_ID: z.string().default(process.env.PAYEE_UPI_ID || (process.env.NODE_ENV === 'production' ? '' : '9574876369@ybl')),
   PAYEE_DISPLAY_NAME: z.string().default(process.env.PAYEE_DISPLAY_NAME || 'Yuva Shakti Youth Satulur'),
   UPI_TRANSACTION_NOTE_PREFIX: z.string().default(process.env.UPI_TRANSACTION_NOTE_PREFIX || 'YSYS'),
   PAYMENT_SESSION_MINUTES: z.preprocess((val) => {
@@ -98,7 +92,7 @@ Object.defineProperty(config, 'PAYEE_UPI_ID', {
       return process.env.PAYEE_UPI_ID.trim();
     }
     // Fail-closed in production: never return any hardcoded fallback
-    return process.env.NODE_ENV === 'production' ? '' : '7075920852@ybl';
+    return process.env.NODE_ENV === 'production' ? '' : '9574876369@ybl';
   },
   set(val: string) {
     process.env.PAYEE_UPI_ID = val;

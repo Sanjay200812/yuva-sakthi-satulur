@@ -181,7 +181,7 @@ export const HeroSection: React.FC<HeroSectionProps> = ({ onOpenBooking, onExplo
             {/* The Ticket Component */}
             <InteractiveTicket
               onSelect={onOpenBooking}
-              customNumber="YSYS-2025-1501"
+              customNumber="1501"
               customName="YOUR LUCKY TICKET"
             />
 

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Search, CheckCircle2, XCircle, Ticket, ShieldCheck, User, Calendar, MapPin, X, Tag, Download, Loader2 } from 'lucide-react';
 import { safeFetchJson } from '../utils/api.ts';
+import { downloadAuthorizedFile } from '../utils/download.ts';
 
 interface CouponVerifierProps {
   bookings?: any[];
@@ -11,6 +12,7 @@ interface CouponVerifierProps {
 export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [searchResult, setSearchResult] = useState<{
     found: boolean;
     data?: any;
@@ -78,7 +80,7 @@ export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose 
           Verify Your <span className="gold-gradient-text">Lucky Coupon</span>
         </h3>
         <p className="text-xs text-slate-400 max-w-md mx-auto">
-          Enter your unique Coupon Number (e.g., <strong className="text-amber-300 font-mono">YSYS-2026-000001</strong>) to verify its authenticity and status.
+          Enter your unique Coupon Number (e.g., <strong className="text-amber-300 font-mono">1501</strong>) to verify its authenticity and status.
         </p>
       </div>
 
@@ -89,7 +91,7 @@ export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose 
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Enter Coupon Number (e.g. YSYS-2026-000001)"
+            placeholder="Enter Coupon Number (e.g. 1501)"
             className="w-full pl-4 pr-10 py-3 rounded-2xl bg-slate-950/80 border border-purple-500/30 focus:border-amber-400 outline-none text-white text-sm placeholder:text-slate-500"
           />
           <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-3.5" />
@@ -143,15 +145,50 @@ export const CouponVerifier: React.FC<CouponVerifierProps> = ({ isOpen, onClose 
                 <span className="text-[10px] text-slate-400">
                   Issued: {searchResult.data.issuedAt}
                 </span>
-                <a
-                  href={`/api/coupons/${searchResult.data.couponNumber}/download`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold flex items-center gap-1 transition shadow-sm"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download PDF Pass</span>
-                </a>
+                {(() => {
+                  let userDownloadToken: string | undefined;
+                  try {
+                    const stored = sessionStorage.getItem('confirmed_booking_download');
+                    if (stored) {
+                      const parsed = JSON.parse(stored);
+                      if (parsed.couponNumbers?.includes(searchResult.data.couponNumber)) {
+                        userDownloadToken = parsed.downloadToken;
+                      }
+                    }
+                  } catch {}
+
+                  if (userDownloadToken) {
+                    return (
+                      <button
+                        type="button"
+                        disabled={downloading}
+                        onClick={async () => {
+                          setDownloading(true);
+                          try {
+                            await downloadAuthorizedFile(
+                              `/api/coupons/${searchResult.data.couponNumber}/download?format=pdf`,
+                              userDownloadToken,
+                              `${searchResult.data.couponNumber}.pdf`
+                            );
+                          } finally {
+                            setDownloading(false);
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold flex items-center gap-1 transition shadow-sm cursor-pointer disabled:opacity-50"
+                      >
+                        {downloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                        <span>Download PDF Pass</span>
+                      </button>
+                    );
+                  }
+
+                  return (
+                    <span className="px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 text-[11px] font-semibold flex items-center gap-1 border border-emerald-500/30">
+                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Verified Draw Pass</span>
+                    </span>
+                  );
+                })()}
               </div>
             </div>
           ) : (

@@ -22,7 +22,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
   it('rejects invalid admin login credentials', async () => {
     const res = await request(app)
       .post('/api/admin/auth/login')
-      .send({ email: 'admin@yuvashakti.org', password: 'WrongPassword123!' });
+      .send({ email: 'admin@yuvashakti.com', password: 'WrongPassword123!' });
 
     expect(res.status).toBe(401);
     expect(res.body.success).toBe(false);
@@ -31,7 +31,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
   it('successfully authenticates valid admin user and provides session token', async () => {
     const res = await request(app)
       .post('/api/admin/auth/login')
-      .send({ email: 'admin@yuvashakti.org', password: 'YuvaShakti@Admin2026' });
+      .send({ email: 'admin@yuvashakti.com', password: 'admin@123' });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -131,7 +131,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       transactionTime: null,
       transactionTimestamp: null,
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Admin Test Participant',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -155,7 +155,8 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
     expect(couponsAfter.body.data.coupons.some((c: any) => c.booking_public_id === booking.publicId)).toBe(true);
 
     const issuedCoupon = couponsAfter.body.data.coupons.find((c: any) => c.booking_public_id === booking.publicId);
-    expect(issuedCoupon.coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
+    expect(Number(issuedCoupon.coupon_number)).toBeGreaterThanOrEqual(1501);
+    expect(Number(issuedCoupon.coupon_number)).toBeLessThanOrEqual(2250);
     expect(issuedCoupon.holder_name).toBe('Admin Test Participant');
 
     // 4. Verification record must exist in payment review audit logs
@@ -186,11 +187,11 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
     it('admin login sets HTTP-only cookie and normalizes mixed-case email', async () => {
       const res = await request(app)
         .post('/api/admin/auth/login')
-        .send({ email: 'ADMIN@YuvaShakti.ORG', password: 'YuvaShakti@Admin2026' });
+        .send({ email: 'ADMIN@YuvaShakti.COM', password: 'admin@123' });
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(res.body.data.user.email).toBe('admin@yuvashakti.org');
+      expect(res.body.data.user.email).toBe('admin@yuvashakti.com');
 
       // Verify Set-Cookie header contains admin_session with HttpOnly
       const cookies = res.headers['set-cookie'];
@@ -204,7 +205,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       // 1. Log in to get cookie
       const loginRes = await request(app)
         .post('/api/admin/auth/login')
-        .send({ email: 'admin@yuvashakti.org', password: 'YuvaShakti@Admin2026' });
+        .send({ email: 'admin@yuvashakti.com', password: 'admin@123' });
 
       const cookies = loginRes.headers['set-cookie'];
       const rawCookie = Array.isArray(cookies) ? cookies[0] : cookies;
@@ -217,7 +218,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
 
       expect(meRes.status).toBe(200);
       expect(meRes.body.success).toBe(true);
-      expect(meRes.body.data.email).toBe('admin@yuvashakti.org');
+      expect(meRes.body.data.email).toBe('admin@yuvashakti.com');
 
       // 3. Fetch dashboard using the cookie
       const dashRes = await request(app)
@@ -273,7 +274,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       expect(res.body.success).toBe(true);
       expect(res.body.data.paymentSessionMinutes).toBe(5);
       expect(res.body.data.sessionDurationLabel).toBe('5 Minutes — Security Rule');
-      expect(res.body.data.payeeUpiId).toBe('7075920852@ybl');
+      expect(res.body.data.payeeUpiId).toBe('9574876369@ybl');
     });
 
     it('Section 4 & 52: updates payment settings and preserves 5-minute locked session duration', async () => {
@@ -291,7 +292,7 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
         .put('/api/admin/payment-settings')
         .set('Authorization', `Bearer ${adminToken}`)
         .send({
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payeeDisplayName: 'Yuva Shakti Youth Satulur',
           couponPriceInr: 50,
           paymentsEnabled: true,
@@ -301,6 +302,94 @@ describe('Phase 11: Admin Panel Authentication & Verified Coupons Registry', () 
       expect(validRes.status).toBe(200);
       expect(validRes.body.success).toBe(true);
       expect(validRes.body.data.paymentSessionMinutes).toBe(5);
+    });
+
+    it('Section 54: updates UPI from AAA@ybl to BBB@ybl, immediately updates public config and new booking QR, while preserving old active booking receiver', async () => {
+      // 1. Initial admin config: set to AAA@ybl
+      const setupRes = await request(app)
+        .put('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          payeeUpiId: 'AAA@ybl',
+          payeeDisplayName: 'Payee AAA',
+          couponPriceInr: 50,
+          paymentsEnabled: true,
+          maxQuantity: 20,
+        });
+      expect(setupRes.status).toBe(200);
+
+      // 2. Create OLD active booking while configured as AAA@ybl
+      const oldBookingRes = await request(app)
+        .post('/api/bookings')
+        .send({
+          name: 'Old Booking Participant',
+          phone: '9848011223',
+          village: 'Satulur Old',
+          quantity: 1,
+        });
+      expect(oldBookingRes.status).toBe(200);
+      const oldData = oldBookingRes.body.data;
+      expect(oldData.payment.payeeUpiId).toBe('AAA@ybl');
+      expect(oldData.payment.qrPayload).toContain('pa=AAA%40ybl');
+      expect(oldData.payment.phonePeUri).toContain('pa=AAA%40ybl');
+
+      // 3. Admin updates payment settings: changes receiver to BBB@ybl
+      const updateRes = await request(app)
+        .put('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          payeeUpiId: 'BBB@ybl',
+          payeeDisplayName: 'Payee BBB',
+          couponPriceInr: 50,
+          paymentsEnabled: true,
+          maxQuantity: 20,
+        });
+      expect(updateRes.status).toBe(200);
+      expect(updateRes.body.data.payeeUpiId).toBe('BBB@ybl');
+
+      // 4. GET /api/config must IMMEDIATELY return BBB@ybl (no redeployment needed)
+      const configRes = await request(app).get('/api/config');
+      expect(configRes.status).toBe(200);
+      expect(configRes.body.data.payeeUpiId).toBe('BBB@ybl');
+      expect(configRes.body.data.payeeDisplayName).toBe('Payee BBB');
+
+      // 5. Create NEW booking: must use BBB@ybl
+      const newBookingRes = await request(app)
+        .post('/api/bookings')
+        .send({
+          name: 'New Booking Participant',
+          phone: '9848099881',
+          village: 'Satulur New',
+          quantity: 1,
+        });
+      expect(newBookingRes.status).toBe(200);
+      const newData = newBookingRes.body.data;
+      expect(newData.payment.payeeUpiId).toBe('BBB@ybl');
+      expect(newData.payment.qrPayload).toContain('pa=BBB%40ybl');
+      expect(newData.payment.phonePeUri).toContain('pa=BBB%40ybl');
+      expect(newData.payment.googlePayUri).toContain('pa=BBB%40ybl');
+      expect(newData.payment.paytmUri).toContain('pa=BBB%40ybl');
+
+      // 6. Check that OLD active booking created prior to change still retains AAA@ybl in database snapshot
+      const { db } = await import('../server/db/client.ts');
+      const oldDbRow = await db.query(
+        'SELECT expected_payee_upi_id, expected_payee_name FROM bookings WHERE public_id = $1',
+        [oldData.booking.publicId]
+      );
+      expect(oldDbRow.rows[0].expected_payee_upi_id).toBe('AAA@ybl');
+      expect(oldDbRow.rows[0].expected_payee_name).toBe('Payee AAA');
+
+      // Clean up / restore default config
+      await request(app)
+        .put('/api/admin/payment-settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          payeeUpiId: '9574876369@ybl',
+          payeeDisplayName: 'Yuva Shakti Youth Satulur',
+          couponPriceInr: 50,
+          paymentsEnabled: true,
+          maxQuantity: 20,
+        });
     });
   });
 });

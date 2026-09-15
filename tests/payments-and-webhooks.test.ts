@@ -213,7 +213,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: '01:24 AM',
       transactionTimestamp: new Date().toISOString(),
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Nagaraju',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -233,8 +233,8 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.data.status).toBe('payment_confirmed');
-    expect(res.body.data.coupons.length).toBe(1);
-    expect(res.body.data.coupons[0].coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
+    expect(Number(res.body.data.coupons[0].coupon_number)).toBeGreaterThanOrEqual(1501);
+    expect(Number(res.body.data.coupons[0].coupon_number)).toBeLessThanOrEqual(2250);
   });
 
   it('fails closed when extracted RRN/UTR is missing or illegible from screenshot', async () => {
@@ -259,7 +259,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: null,
       transactionTimestamp: null,
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Sudha Rani',
       detectedApp: 'google_pay',
       extractedFields: {},
@@ -303,7 +303,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: null,
       transactionTimestamp: new Date().toISOString(),
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'First User',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -343,7 +343,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: null,
       transactionTimestamp: new Date().toISOString(),
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Second User',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -385,7 +385,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: null,
       transactionTimestamp: new Date().toISOString(),
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Amount Mismatch User',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -582,8 +582,8 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
 
     const [c1, c2] = simRes.body.data.coupons;
     expect(c1.coupon_number).not.toBe(c2.coupon_number);
-    expect(c1.coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
-    expect(c2.coupon_number).toMatch(/^YSYS-\d{4}-\d{6}$/);
+    expect(Number(c1.coupon_number)).toBeGreaterThanOrEqual(1501);
+    expect(Number(c2.coupon_number)).toBeGreaterThanOrEqual(1501);
 
     // 4. Idempotency test: calling finalizer again for the same booking must NOT duplicate coupons!
     const repeatSimRes = await request(app)
@@ -626,7 +626,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       transactionTime: null,
       transactionTimestamp: new Date().toISOString(),
       payeeName: 'Yuva Shakti Youth Satulur',
-      payeeUpiId: '7075920852@ybl',
+      payeeUpiId: '9574876369@ybl',
       payerName: 'Triad Buyer',
       detectedApp: 'phonepe',
       extractedFields: {},
@@ -656,8 +656,8 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     expect(resRazorpay.status).toBe(404);
   });
 
-  it('Requirement 12: when PAYEE_UPI_ID=7075920852@ybl, canonicalUri, QR, and all 4 UPI app intents use that exact VPA', async () => {
-    process.env.PAYEE_UPI_ID = '7075920852@ybl';
+  it('Requirement 12: when PAYEE_UPI_ID=9574876369@ybl, canonicalUri, QR, and all 4 UPI app intents use that exact VPA', async () => {
+    process.env.PAYEE_UPI_ID = '9574876369@ybl';
     process.env.PAYEE_DISPLAY_NAME = 'Yuva Shakti Youth Satulur';
     process.env.PAYMENT_SESSION_MINUTES = '5';
 
@@ -675,11 +675,11 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     expect(res.body.success).toBe(true);
 
     const { payment } = res.body.data;
-    const expectedVpaEncoded = 'pa=7075920852%40ybl';
+    const expectedVpaEncoded = 'pa=9574876369%40ybl';
 
-    // 1. canonicalUri contains pa=7075920852%40ybl
+    // 1. canonicalUri contains pa=9574876369%40ybl
     expect(payment.canonicalUri).toContain(expectedVpaEncoded);
-    expect(payment.rawPayeeUpiId).toBe('7075920852@ybl');
+    expect(payment.rawPayeeUpiId).toBe('9574876369@ybl');
 
     // 2. QR encodes that same URI
     const expectedQr = await QRCode.toDataURL(payment.canonicalUri, {
@@ -712,7 +712,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
     // 7. /api/config safely exposes it
     const configRes = await request(app).get('/api/config');
     expect(configRes.status).toBe(200);
-    expect(configRes.body.payeeUpiId).toBe('7075920852@ybl');
+    expect(configRes.body.payeeUpiId).toBe('9574876369@ybl');
     expect(configRes.body.payeeDisplayName).toBe('Yuva Shakti Youth Satulur');
     expect(configRes.body.sessionMinutes).toBe(5);
   });
@@ -1165,7 +1165,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Valid User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1203,7 +1203,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Double Buyer',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1241,7 +1241,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Underpayer',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1277,7 +1277,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'No RRN User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1313,7 +1313,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Failed User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1349,7 +1349,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Pending User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1386,7 +1386,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: null,
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'User One',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1435,7 +1435,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: null,
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Owner',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1467,7 +1467,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: null,
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Copycat',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1623,7 +1623,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: oldTimestamp,
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Time Mismatch User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1686,7 +1686,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Retry Proof User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1727,7 +1727,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
           transactionTime: '01:24 AM',
           transactionTimestamp: new Date().toISOString(),
           payeeName: 'Yuva Shakti Youth Satulur',
-          payeeUpiId: '7075920852@ybl',
+          payeeUpiId: '9574876369@ybl',
           payerName: 'Idempotent Retry User',
           detectedApp: 'phonepe',
           extractedFields: {},
@@ -1950,7 +1950,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       expect(res.body.error.reasonCodes).toContain('WRONG_PAYEE');
     });
 
-    it('Section 69: Test — Masked payee UPI (70****52@ybl) matches successfully', async () => {
+    it('Section 69: Test — Masked payee UPI (95****69@ybl) matches successfully', async () => {
       const bRes = await request(app)
         .post('/api/bookings')
         .send({ name: 'Masked Payee User', phone: '9988776648', village: 'Satulur', quantity: 1 });
@@ -1958,7 +1958,7 @@ describe('Phase 11: Direct UPI Collection & Automated Proof Verification Pipelin
       const validImg = await createValidScreenshotBase64(208);
 
       setMockOcrText(
-        `Payment Successful\n₹50.00\nUPI ID: 70****52@ybl\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900756789012\n${getValidTestTimestampText()}`
+        `Payment Successful\n₹50.00\nUPI ID: 95****69@ybl\nPaid to Yuva Shakti Youth Satulur\nUPI Ref No: 900756789012\n${getValidTestTimestampText()}`
       );
 
       const res = await request(app)

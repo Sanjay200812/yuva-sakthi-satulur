@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { db } from '../db/client.ts';
 import { config } from '../config/eventConfig.ts';
+import { allocateCouponsForBooking } from '../services/couponAllocator.ts';
 
 export interface BankRecordMatchInput {
   bankTxnId?: string;
@@ -124,62 +125,11 @@ export async function confirmPaymentFromBankRecord(
       [confirmedAt, booking.id]
     );
 
-    // 7. Concurrency-safe sequential coupon serial allocation
-    const quantity = booking.quantity || 1;
-    const currentYear = new Date().getFullYear();
-    const prefix = config.EVENT_COUPON_PREFIX || 'YSYS';
-
-    const maxSerialRes = await client.query('SELECT COALESCE(MAX(serial), 0) as max_serial FROM coupons');
-    let currentMaxSerial = Number(maxSerialRes.rows[0]?.max_serial) || 0;
-
-    const issuedCoupons: any[] = [];
-
-    for (let i = 1; i <= quantity; i++) {
-      currentMaxSerial += 1;
-      const nextSerial = currentMaxSerial;
-      const serialPadded = String(nextSerial).padStart(6, '0');
-      const couponNumber = `${prefix}-${currentYear}-${serialPadded}`;
-      const couponId = crypto.randomUUID();
-
-      const verificationToken = crypto.randomBytes(16).toString('hex');
-      const verificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
-
-      await client.query(
-        `INSERT INTO coupons (
-          id, booking_id, serial, coupon_number, holder_name, phone, village,
-          ticket_index, total_quantity, template_version, verification_token_hash,
-          status, issued_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-        [
-          couponId,
-          booking.id,
-          nextSerial,
-          couponNumber,
-          booking.participant_name,
-          booking.phone,
-          booking.village,
-          i,
-          quantity,
-          config.TEMPLATE_VERSION || 'v1-official',
-          verificationTokenHash,
-          'valid',
-          confirmedAt,
-        ]
-      );
-
-      issuedCoupons.push({
-        id: couponId,
-        coupon_number: couponNumber,
-        serial: nextSerial,
-        holder_name: booking.participant_name,
-        phone: booking.phone,
-        village: booking.village,
-        ticket_index: i,
-        total_quantity: quantity,
-        status: 'valid',
-        issued_at: confirmedAt,
-      });
-    }
+    // 7. Concurrency-safe sequential coupon serial allocation strictly in 1501-2250 range
+    const issuedCoupons = await allocateCouponsForBooking(client, booking.id, async () => {
+      const res = await client.query("SELECT nextval('coupon_serial_seq') as nextval");
+      return parseInt(res.rows[0].nextval, 10);
+    });
 
     // 8. Write immutable admin audit log
     await client.query(
@@ -194,7 +144,7 @@ export async function confirmPaymentFromBankRecord(
         booking.id,
         JSON.stringify({
           submissionId: submission.id,
-          couponsIssuedCount: quantity,
+          couponsIssuedCount: issuedCoupons.length,
           couponNumbers: issuedCoupons.map((c) => c.coupon_number),
           bankRecordMatch,
           auditNote,
