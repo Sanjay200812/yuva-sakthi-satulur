@@ -46,8 +46,8 @@ export function checkSuspiciousFilename(filename?: string): boolean {
  * Creates authenticated Supabase client for private storage operations.
  */
 export function getSupabaseStorageClient(): SupabaseClient {
-  const url = (config.SUPABASE_URL || '').trim();
-  const key = (config.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const url = (process.env.SUPABASE_URL || config.SUPABASE_URL || '').trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 
   if (!url || !key) {
     throw new Error('STORAGE_NOT_CONFIGURED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing.');
@@ -181,31 +181,39 @@ async function uploadToSupabaseStorage(
   mimeType: string,
   bookingId: string
 ): Promise<boolean> {
-  const isProduction = config.NODE_ENV === 'production';
+  const isProduction = isProductionEnvironment();
+  const supabaseUrl = (process.env.SUPABASE_URL || config.SUPABASE_URL || '').trim();
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 
-  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || config.PAYMENT_PROOF_BUCKET !== 'payment-proofs') {
-    if (isProduction) {
-      console.error(`Payment proof storage failed:
+  if (!supabaseUrl || !serviceRoleKey || config.PAYMENT_PROOF_BUCKET !== 'payment-proofs') {
+    const diagnostic = `Payment proof storage failed:
 provider=supabase
 bucket=${config.PAYMENT_PROOF_BUCKET || 'missing'}
 status=config_missing
 message=SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY or PAYMENT_PROOF_BUCKET missing in production
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || 'undefined'}, VERCEL=${process.env.VERCEL || 'undefined'}, VERCEL_ENV=${process.env.VERCEL_ENV || 'undefined'}`;
+
+    if (isProduction) {
+      console.error(diagnostic);
       throw new Error('STORAGE_NOT_CONFIGURED: Supabase storage credentials or bucket are not configured in production.');
     }
     return false;
   }
 
-  if (isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY)) {
-    if (isProduction) {
-      console.error(`Payment proof storage failed:
+  if (isAnonKey(serviceRoleKey)) {
+    const diagnostic = `Payment proof storage failed:
 provider=supabase
 bucket=${config.PAYMENT_PROOF_BUCKET}
 status=401
 message=Anon key supplied as SUPABASE_SERVICE_ROLE_KEY
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || 'undefined'}, VERCEL=${process.env.VERCEL || 'undefined'}, VERCEL_ENV=${process.env.VERCEL_ENV || 'undefined'}`;
+
+    if (isProduction) {
+      console.error(diagnostic);
       throw new Error('STORAGE_NOT_CONFIGURED: Anon key cannot be used as SUPABASE_SERVICE_ROLE_KEY.');
     }
     return false;
@@ -213,11 +221,12 @@ bookingId=${bookingId}`);
 
   try {
     const supabase = getSupabaseStorageClient();
+    // Use upsert: true so that customer retries on the same booking with the same screenshot succeed cleanly
     const { data, error } = await supabase.storage
       .from(config.PAYMENT_PROOF_BUCKET)
       .upload(objectPath, buffer, {
         contentType: mimeType,
-        upsert: false,
+        upsert: true,
       });
 
     if (!error && data) {
@@ -233,7 +242,8 @@ bucket=${config.PAYMENT_PROOF_BUCKET}
 status=${statusCode}
 message=${safeErrorMessage}
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || 'undefined'}, VERCEL=${process.env.VERCEL || 'undefined'}, VERCEL_ENV=${process.env.VERCEL_ENV || 'undefined'}`);
 
     if (isProduction) {
       throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${statusCode}: ${safeErrorMessage}`);
@@ -249,7 +259,8 @@ bucket=${config.PAYMENT_PROOF_BUCKET}
 status=network_error
 message=${err?.message || 'Network exception connecting to Supabase'}
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || 'undefined'}, VERCEL=${process.env.VERCEL || 'undefined'}, VERCEL_ENV=${process.env.VERCEL_ENV || 'undefined'}`);
 
     if (isProduction) {
       throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Network error during Supabase upload: ${err?.message || 'Network error'}`);
@@ -268,10 +279,13 @@ export async function checkStorageHealth(): Promise<{
   ready: boolean;
   error?: string;
 }> {
+  const url = (process.env.SUPABASE_URL || config.SUPABASE_URL || '').trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
   const isConfigured = Boolean(
-    config.SUPABASE_URL &&
-    config.SUPABASE_SERVICE_ROLE_KEY &&
-    !isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY) &&
+    url &&
+    key &&
+    !isAnonKey(key) &&
     config.PAYMENT_PROOF_BUCKET === 'payment-proofs'
   );
 
@@ -281,7 +295,9 @@ export async function checkStorageHealth(): Promise<{
       provider: 'supabase',
       bucket: config.PAYMENT_PROOF_BUCKET || 'payment-proofs',
       ready: false,
-      error: isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY)
+      error: !key
+        ? 'SUPABASE_SERVICE_ROLE_KEY is missing'
+        : isAnonKey(key)
         ? 'Anon key supplied as SUPABASE_SERVICE_ROLE_KEY'
         : 'Supabase storage credentials or bucket are not configured',
     };

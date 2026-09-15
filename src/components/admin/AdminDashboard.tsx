@@ -26,6 +26,7 @@ import {
   CreditCard,
 } from 'lucide-react';
 import { safeFetchJson } from '../../utils/api.ts';
+import { formatKolkataTime, formatOcrTxnTime } from '../../utils/formatters.ts';
 
 interface AdminDashboardProps {
   adminUser: any;
@@ -463,7 +464,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                             ₹{c.amountInr}
                           </td>
                           <td className="p-3 sm:p-4 text-slate-400 text-[11px]">
-                            {c.formattedPaidAt}
+                            {formatKolkataTime(c.formattedPaidAt || c.verified_at || c.paid_at || c.issued_at)}
                           </td>
                           <td className="p-3 sm:p-4 text-right">
                             <div className="inline-flex items-center gap-1.5">
@@ -635,7 +636,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                           <tr key={r.id} className="hover:bg-slate-900/60 transition">
                             <td className="p-3 sm:p-4">
                               <div className="font-mono text-purple-300 font-bold">{r.bookingPublicId}</div>
-                              <div className="text-[11px] text-slate-400 mt-0.5">{r.submittedAt}</div>
+                              <div className="text-[11px] text-slate-400 mt-0.5">{formatKolkataTime(r.submittedAt || r.created_at)}</div>
                               <div className="text-[10px] text-slate-500 font-mono mt-0.5">Ref: {r.paymentReference || 'None'}</div>
                             </td>
 
@@ -715,7 +716,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                                     <div className="flex items-center gap-1.5">
                                       <span className="text-slate-400">Txn Time:</span>
                                       <span className="font-mono text-slate-300 text-[10px]">
-                                        {ext.transactionTime || ext.transactionTimestamp || r.extractedTransactionTimestamp}
+                                        {formatOcrTxnTime(ext.transactionTimestamp || r.extractedTransactionTimestamp, ext.transactionTime)}
                                       </span>
                                     </div>
                                   )}
@@ -758,7 +759,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ adminUser, onLog
                               </span>
                               {r.reviewedAt && (
                                 <div className="text-[10px] text-slate-500 mt-1">
-                                  {r.reviewedAt}
+                                  {formatKolkataTime(r.reviewedAt)}
                                 </div>
                               )}
                             </td>

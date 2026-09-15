@@ -117,6 +117,29 @@ Object.defineProperty(config, "PAYMENT_SESSION_MINUTES", {
   configurable: true,
   enumerable: true
 });
+var overrideServiceRoleKey = void 0;
+Object.defineProperty(config, "SUPABASE_URL", {
+  get() {
+    return (process.env.SUPABASE_URL || "https://snwjfwlexevdpfbekqnc.supabase.co").trim();
+  },
+  set(val) {
+    process.env.SUPABASE_URL = val;
+  },
+  configurable: true,
+  enumerable: true
+});
+Object.defineProperty(config, "SUPABASE_SERVICE_ROLE_KEY", {
+  get() {
+    if (overrideServiceRoleKey !== void 0) return overrideServiceRoleKey;
+    return (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  },
+  set(val) {
+    overrideServiceRoleKey = val;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = val;
+  },
+  configurable: true,
+  enumerable: true
+});
 function isAnonKey(key) {
   if (!key) return false;
   const trimmed = key.trim();
@@ -739,9 +762,17 @@ var MemoryDB = class {
       );
       const validCoupons = Array.from(this.coupons.values()).filter((c) => c.status === "valid");
       const totalRevenuePaise = confirmedBookings.reduce((sum, b) => sum + (b.total_amount_paise || 0), 0);
-      const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-      const bookingsToday = confirmedBookings.filter((b) => (b.paid_at || b.verified_at || b.created_at)?.startsWith(today)).length;
-      const couponsToday = validCoupons.filter((c) => c.issued_at?.startsWith(today)).length;
+      const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(/* @__PURE__ */ new Date());
+      const isDateToday = (dStr) => {
+        if (!dStr) return false;
+        try {
+          return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date(dStr)) === today;
+        } catch {
+          return false;
+        }
+      };
+      const bookingsToday = confirmedBookings.filter((b) => isDateToday(b.paid_at || b.verified_at || b.created_at)).length;
+      const couponsToday = validCoupons.filter((c) => isDateToday(c.issued_at)).length;
       const submissions = Array.from(this.paymentSubmissions.values());
       const failedCount = submissions.filter((s) => s.status === "verification_failed" || s.status === "ai_check_failed" || s.status === "admin_rejected").length;
       const awaitingReviewCount = submissions.filter((s) => s.status === "awaiting_admin_review" || s.status === "proof_submitted" || s.status === "ai_checking").length;
@@ -1223,8 +1254,8 @@ function checkSuspiciousFilename(filename) {
   return suspiciousRegex.test(lower);
 }
 function getSupabaseStorageClient() {
-  const url = (config.SUPABASE_URL || "").trim();
-  const key = (config.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  const url = (process.env.SUPABASE_URL || config.SUPABASE_URL || "").trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || "").trim();
   if (!url || !key) {
     throw new Error("STORAGE_NOT_CONFIGURED: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing.");
   }
@@ -1281,29 +1312,35 @@ async function computePerceptualHash(buffer) {
   }
 }
 async function uploadToSupabaseStorage(buffer, objectPath, mimeType, bookingId) {
-  const isProduction = config.NODE_ENV === "production";
-  if (!config.SUPABASE_URL || !config.SUPABASE_SERVICE_ROLE_KEY || config.PAYMENT_PROOF_BUCKET !== "payment-proofs") {
-    if (isProduction) {
-      console.error(`Payment proof storage failed:
+  const isProduction = isProductionEnvironment();
+  const supabaseUrl = (process.env.SUPABASE_URL || config.SUPABASE_URL || "").trim();
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  if (!supabaseUrl || !serviceRoleKey || config.PAYMENT_PROOF_BUCKET !== "payment-proofs") {
+    const diagnostic = `Payment proof storage failed:
 provider=supabase
 bucket=${config.PAYMENT_PROOF_BUCKET || "missing"}
 status=config_missing
 message=SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY or PAYMENT_PROOF_BUCKET missing in production
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || "undefined"}, VERCEL=${process.env.VERCEL || "undefined"}, VERCEL_ENV=${process.env.VERCEL_ENV || "undefined"}`;
+    if (isProduction) {
+      console.error(diagnostic);
       throw new Error("STORAGE_NOT_CONFIGURED: Supabase storage credentials or bucket are not configured in production.");
     }
     return false;
   }
-  if (isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY)) {
-    if (isProduction) {
-      console.error(`Payment proof storage failed:
+  if (isAnonKey(serviceRoleKey)) {
+    const diagnostic = `Payment proof storage failed:
 provider=supabase
 bucket=${config.PAYMENT_PROOF_BUCKET}
 status=401
 message=Anon key supplied as SUPABASE_SERVICE_ROLE_KEY
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || "undefined"}, VERCEL=${process.env.VERCEL || "undefined"}, VERCEL_ENV=${process.env.VERCEL_ENV || "undefined"}`;
+    if (isProduction) {
+      console.error(diagnostic);
       throw new Error("STORAGE_NOT_CONFIGURED: Anon key cannot be used as SUPABASE_SERVICE_ROLE_KEY.");
     }
     return false;
@@ -1312,7 +1349,7 @@ bookingId=${bookingId}`);
     const supabase = getSupabaseStorageClient();
     const { data, error } = await supabase.storage.from(config.PAYMENT_PROOF_BUCKET).upload(objectPath, buffer, {
       contentType: mimeType,
-      upsert: false
+      upsert: true
     });
     if (!error && data) {
       return true;
@@ -1325,7 +1362,8 @@ bucket=${config.PAYMENT_PROOF_BUCKET}
 status=${statusCode}
 message=${safeErrorMessage}
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || "undefined"}, VERCEL=${process.env.VERCEL || "undefined"}, VERCEL_ENV=${process.env.VERCEL_ENV || "undefined"}`);
     if (isProduction) {
       throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Supabase upload failed with status ${statusCode}: ${safeErrorMessage}`);
     }
@@ -1340,7 +1378,8 @@ bucket=${config.PAYMENT_PROOF_BUCKET}
 status=network_error
 message=${err?.message || "Network exception connecting to Supabase"}
 objectPath=${objectPath}
-bookingId=${bookingId}`);
+bookingId=${bookingId}
+runtime: NODE_ENV=${process.env.NODE_ENV || "undefined"}, VERCEL=${process.env.VERCEL || "undefined"}, VERCEL_ENV=${process.env.VERCEL_ENV || "undefined"}`);
     if (isProduction) {
       throw new Error(`PAYMENT_PROOF_STORAGE_FAILED: Network error during Supabase upload: ${err?.message || "Network error"}`);
     }
@@ -1348,8 +1387,10 @@ bookingId=${bookingId}`);
   }
 }
 async function checkStorageHealth() {
+  const url = (process.env.SUPABASE_URL || config.SUPABASE_URL || "").trim();
+  const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || config.SUPABASE_SERVICE_ROLE_KEY || "").trim();
   const isConfigured = Boolean(
-    config.SUPABASE_URL && config.SUPABASE_SERVICE_ROLE_KEY && !isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY) && config.PAYMENT_PROOF_BUCKET === "payment-proofs"
+    url && key && !isAnonKey(key) && config.PAYMENT_PROOF_BUCKET === "payment-proofs"
   );
   if (!isConfigured) {
     return {
@@ -1357,7 +1398,7 @@ async function checkStorageHealth() {
       provider: "supabase",
       bucket: config.PAYMENT_PROOF_BUCKET || "payment-proofs",
       ready: false,
-      error: isAnonKey(config.SUPABASE_SERVICE_ROLE_KEY) ? "Anon key supplied as SUPABASE_SERVICE_ROLE_KEY" : "Supabase storage credentials or bucket are not configured"
+      error: !key ? "SUPABASE_SERVICE_ROLE_KEY is missing" : isAnonKey(key) ? "Anon key supplied as SUPABASE_SERVICE_ROLE_KEY" : "Supabase storage credentials or bucket are not configured"
     };
   }
   try {
@@ -2565,16 +2606,23 @@ function formatTicketDate(isoString) {
     return "19-09-2026";
   }
 }
-function formatKolkataTime(isoString) {
+function formatKolkataTime(value) {
+  if (!value) return "-";
   try {
-    const d = isoString ? new Date(isoString) : new Date(config.EVENT_DRAW_AT);
+    const date = new Date(value);
+    if (isNaN(date.getTime())) return typeof value === "string" ? value : "-";
     return new Intl.DateTimeFormat("en-IN", {
-      timeZone: config.EVENT_TIMEZONE || "Asia/Kolkata",
-      dateStyle: "medium",
-      timeStyle: "short"
-    }).format(d);
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    }).format(date);
   } catch {
-    return "19th Sunday Evening, 6:30 PM IST";
+    return "-";
   }
 }
 function escapeXml(unsafe) {
@@ -3098,8 +3146,8 @@ router.get("/dashboard", requireAdminAuth, async (req, res) => {
           (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "confirmedBookingsCount",
           (SELECT COUNT(*) FROM coupons WHERE status = 'valid')::int as "validCouponsCount",
           (SELECT COALESCE(SUM(total_amount_paise), 0) / 100 FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "totalRevenueInr",
-          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= CURRENT_DATE)::int as "bookingsToday",
-          (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= CURRENT_DATE)::int as "couponsToday",
+          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'))::int as "bookingsToday",
+          (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'))::int as "couponsToday",
           (SELECT COUNT(*) FROM payment_submissions WHERE status IN ('verification_failed', 'ocr_check_failed', 'ocr_processing_error', 'ai_check_failed', 'admin_rejected', 'awaiting_admin_review', 'proof_submitted', 'ocr_checking', 'ai_checking'))::int as "failedOrPendingAttempts"
       `);
       data = metricsRes.rows[0];

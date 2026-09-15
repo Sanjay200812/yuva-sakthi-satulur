@@ -44,16 +44,23 @@ export function formatTicketDate(isoString?: string): string {
   }
 }
 
-export function formatKolkataTime(isoString?: string): string {
+export function formatKolkataTime(value?: any): string {
+  if (!value) return '-';
   try {
-    const d = isoString ? new Date(isoString) : new Date(config.EVENT_DRAW_AT);
+    const date = new Date(value);
+    if (isNaN(date.getTime())) return typeof value === 'string' ? value : '-';
     return new Intl.DateTimeFormat('en-IN', {
-      timeZone: config.EVENT_TIMEZONE || 'Asia/Kolkata',
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    }).format(d);
+      timeZone: 'Asia/Kolkata',
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }).format(date);
   } catch {
-    return '19th Sunday Evening, 6:30 PM IST';
+    return '-';
   }
 }
 

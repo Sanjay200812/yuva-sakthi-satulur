@@ -123,8 +123,8 @@ router.get('/dashboard', requireAdminAuth, async (req: Request, res: Response) =
           (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "confirmedBookingsCount",
           (SELECT COUNT(*) FROM coupons WHERE status = 'valid')::int as "validCouponsCount",
           (SELECT COALESCE(SUM(total_amount_paise), 0) / 100 FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified'))::int as "totalRevenueInr",
-          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= CURRENT_DATE)::int as "bookingsToday",
-          (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= CURRENT_DATE)::int as "couponsToday",
+          (SELECT COUNT(*) FROM bookings WHERE status IN ('payment_confirmed', 'proof_verified') AND created_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'))::int as "bookingsToday",
+          (SELECT COUNT(*) FROM coupons WHERE status = 'valid' AND issued_at >= (date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'))::int as "couponsToday",
           (SELECT COUNT(*) FROM payment_submissions WHERE status IN ('verification_failed', 'ocr_check_failed', 'ocr_processing_error', 'ai_check_failed', 'admin_rejected', 'awaiting_admin_review', 'proof_submitted', 'ocr_checking', 'ai_checking'))::int as "failedOrPendingAttempts"
       `);
       data = metricsRes.rows[0];

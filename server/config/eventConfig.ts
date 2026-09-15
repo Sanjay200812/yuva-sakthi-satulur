@@ -129,6 +129,32 @@ Object.defineProperty(config, 'PAYMENT_SESSION_MINUTES', {
   enumerable: true,
 });
 
+let overrideServiceRoleKey: string | undefined = undefined;
+
+Object.defineProperty(config, 'SUPABASE_URL', {
+  get() {
+    return (process.env.SUPABASE_URL || 'https://snwjfwlexevdpfbekqnc.supabase.co').trim();
+  },
+  set(val: string) {
+    process.env.SUPABASE_URL = val;
+  },
+  configurable: true,
+  enumerable: true,
+});
+
+Object.defineProperty(config, 'SUPABASE_SERVICE_ROLE_KEY', {
+  get() {
+    if (overrideServiceRoleKey !== undefined) return overrideServiceRoleKey;
+    return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  },
+  set(val: string) {
+    overrideServiceRoleKey = val;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = val;
+  },
+  configurable: true,
+  enumerable: true,
+});
+
 export function isAnonKey(key: string): boolean {
   if (!key) return false;
   const trimmed = key.trim();

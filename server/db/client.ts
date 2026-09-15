@@ -619,9 +619,17 @@ class MemoryDB implements TransactionalDB {
       const validCoupons = Array.from(this.coupons.values()).filter((c) => c.status === 'valid');
       const totalRevenuePaise = confirmedBookings.reduce((sum, b) => sum + (b.total_amount_paise || 0), 0);
 
-      const today = new Date().toISOString().slice(0, 10);
-      const bookingsToday = confirmedBookings.filter((b) => (b.paid_at || b.verified_at || b.created_at)?.startsWith(today)).length;
-      const couponsToday = validCoupons.filter((c) => c.issued_at?.startsWith(today)).length;
+      const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+      const isDateToday = (dStr?: string) => {
+        if (!dStr) return false;
+        try {
+          return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(dStr)) === today;
+        } catch {
+          return false;
+        }
+      };
+      const bookingsToday = confirmedBookings.filter((b) => isDateToday(b.paid_at || b.verified_at || b.created_at)).length;
+      const couponsToday = validCoupons.filter((c) => isDateToday(c.issued_at)).length;
 
       const submissions = Array.from(this.paymentSubmissions.values());
       const failedCount = submissions.filter((s) => s.status === 'verification_failed' || s.status === 'ai_check_failed' || s.status === 'admin_rejected').length;
